@@ -2663,6 +2663,26 @@ gb_internal x64Value x64_emit_conv(x64Procedure *p, x64Value src, Type *from, Ty
 		return x64v_mem(x64_typed(to), x64_rbp_mem(dst_off));
 	}
 
+	// Scalar → matrix (scaled identity): `m: matrix[R,C]T = s` puts the (converted) scalar on the main
+	// diagonal, zeros elsewhere. Mirrors lb_emit_conv's is_type_matrix(dst) path. Without it the scalar
+	// fell through to a reinterpret and `mat = 1` produced an ALL-ZERO matrix (cbor matrix round-trip).
+	// Diagonal element [i,i] lives at (i + stride*i)*esz — same layout as MatrixIndexExpr (col-major +
+	// stride); the diagonal offset is identical row- or column-major, so no orientation special-case.
+	if (dst_base->kind == Type_Matrix && (src_base == nullptr || src_base->kind != Type_Matrix)) {
+		Type *elem = base_type(dst_base->Matrix.elem);
+		i64 esz    = type_size_of(elem); if (esz <= 0) esz = 1;
+		i64 stride = matrix_type_stride_in_elems(dst_base);
+		i64 diag   = gb_min(dst_base->Matrix.row_count, dst_base->Matrix.column_count);
+		x64Value ev = x64_spill_value(p, x64_emit_conv(p, src, from, elem), elem);
+		i32 dst_off = x64_alloc_local(p, type_size_of(to), type_align_of(to));
+		x64_zero_mem(p, x64_rbp_mem(dst_off), type_size_of(to));
+		for (i64 i = 0; i < diag; i++) {
+			i64 eoff = i * (1 + stride) * esz;
+			x64_store_value(p, x64addr(x64_rbp_mem(dst_off + (i32)eoff), elem), ev);
+		}
+		return x64v_mem(x64_typed(to), x64_rbp_mem(dst_off));
+	}
+
 	if (dst_base->kind == Type_Union && from != nullptr && union_is_variant_of(dst_base, from)) {
 		i32 off = x64_alloc_local(p, type_size_of(to), type_align_of(to));
 		x64_store_union_variant(p, x64_rbp_mem(off), src, x64_typed(to));
@@ -2698,6 +2718,14 @@ gb_internal x64Value x64_emit_conv(x64Procedure *p, x64Value src, Type *from, Ty
 	// temp: low = the (extended) source, high = sign-extension (signed) or 0 (unsigned).
 	if (is_type_integer(dst_base) && type_size_of(dst_base) == 16 &&
 	    from != nullptr && is_type_integer(src_base) && type_size_of(src_base) <= 8) {
+		// A big-endian source stores its bytes reversed, so normalize it to native first (value_to_reg
+		// reads raw bytes) — else the widened magnitude is wrong.
+		if (is_type_different_to_arch_endianness(src_base)) {
+			Type *src_plat = integer_endian_type_to_platform_type(x64_typed(from));
+			src = x64_emit_conv(p, src, from, src_plat);
+			from = src_plat;
+			src_base = base_type(src_plat);
+		}
 		bool src_signed = x64_is_signed_integer(src_base);
 		x64_value_to_reg(p, src, X64Reg_RAX); // loads + extends to 64-bit per the source type
 		i32 off = x64_alloc_local(p, 16, 16);
@@ -2705,6 +2733,19 @@ gb_internal x64Value x64_emit_conv(x64Procedure *p, x64Value src, Type *from, Ty
 		if (src_signed) { x64_emit_mov_rr(&p->asm_, X64OpSize_64, X64Reg_RDX, X64Reg_RAX); x64_emit_sar_ri(&p->asm_, X64OpSize_64, X64Reg_RDX, 63); }
 		else            { x64_emit_xor_rr(&p->asm_, X64OpSize_32, X64Reg_RDX, X64Reg_RDX); }
 		x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(off + 8), X64Reg_RDX);
+		// Native little-endian 128-bit value now at [off]. A big-endian DESTINATION (u128be) needs all
+		// 16 bytes reversed: bswap each half + swap the halves. Was cast(u128be)i64 storing native bytes
+		// → every later be op read garbage (uuid generate_v6's timestamp was all-but-one-byte zero).
+		if (is_type_different_to_arch_endianness(dst_base)) {
+			i32 doff = x64_alloc_local(p, 16, 16);
+			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(off));
+			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RCX, x64_rbp_mem(off + 8));
+			x64_emit_bswap_r(&p->asm_, X64OpSize_64, X64Reg_RAX);
+			x64_emit_bswap_r(&p->asm_, X64OpSize_64, X64Reg_RCX);
+			x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(doff),     X64Reg_RCX);
+			x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(doff + 8), X64Reg_RAX);
+			return x64v_mem(x64_typed(to), x64_rbp_mem(doff));
+		}
 		return x64v_mem(x64_typed(to), x64_rbp_mem(off));
 	}
 
@@ -2723,6 +2764,23 @@ gb_internal x64Value x64_emit_conv(x64Procedure *p, x64Value src, Type *from, Ty
 		x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(doff),     X64Reg_RCX); // dst low  = swap(src high)
 		x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(doff + 8), X64Reg_RAX); // dst high = swap(src low)
 		return x64v_mem(x64_typed(to), x64_rbp_mem(doff));
+	}
+
+	// Narrow a 128-bit big-endian integer to a ≤8-byte integer: a be value stores its bytes reversed, so
+	// its LOW bits live in the HIGH (last) bytes. The ≤8-endian path below can't reach a 16-byte source
+	// and the fallback reinterpret would take the first 8 (most-significant, here all-zero) bytes — THE
+	// uuid raw_time_v7 bug where `cast(u64)(u128be >> 80)` returned 0. Normalize the source to native
+	// (byte-swap all 16 via the 128↔128 path), then narrow through the platform type so a be DESTINATION
+	// still gets its own byte-swap (mirrors lb_emit_conv's endian-then-truncate order).
+	if (src_base != nullptr && is_type_integer(src_base) && is_type_integer(dst_base) &&
+	    type_size_of(src_base) == 16 && type_size_of(dst_base) <= 8 &&
+	    is_type_different_to_arch_endianness(src_base)) {
+		Type *src_plat = integer_endian_type_to_platform_type(x64_typed(from));           // native u128
+		Type *dst_plat = is_type_different_to_arch_endianness(dst_base)
+		               ? integer_endian_type_to_platform_type(x64_typed(to)) : x64_typed(to);
+		src = x64_emit_conv(p, src, from, src_plat);        // be128 → native u128 (16-byte bswap)
+		x64Value narrowed = x64_emit_conv(p, src, src_plat, dst_plat); // native u128 → native ≤8 (low bytes)
+		return x64_emit_conv(p, narrowed, dst_plat, to);    // native ≤8 → dst (byte-swap if dst is be)
 	}
 
 	// Endian integer conversions: u16be/u32be/u64be (and *le on a BE arch) store bytes in the non-native
@@ -3380,6 +3438,19 @@ gb_internal x64Value x64_emit_arith(x64Procedure *p, TokenKind op, x64Value lhs,
 		}
 	}
 
+	// Big-endian integer arithmetic: operands are stored byte-REVERSED, so operating on the raw bytes
+	// as native produces garbage (u128be `&`/`<<`/`|` in uuid generate_v6 → an all-zero timestamp).
+	// Convert both operands to the platform-endian type, operate, then byte-swap the result back.
+	// Bitwise ops are byte-order-invariant so the round-trip is redundant for them, but applying it
+	// uniformly is still correct and simpler. Mirrors LLVM lb_emit_arith's arch-endianness path.
+	if (is_type_integer(result_type) && is_type_different_to_arch_endianness(result_type)) {
+		Type *plat = integer_endian_type_to_platform_type(result_type);
+		x64Value la = x64_spill_value(p, x64_emit_conv(p, lhs, lt, plat), plat);
+		x64Value ra = x64_spill_value(p, x64_emit_conv(p, rhs, rhs.type ? rhs.type : lt, plat), plat);
+		x64Value r  = x64_emit_arith(p, op, la, ra, plat);
+		return x64_emit_conv(p, r, plat, result_type);
+	}
+
 	// 128-bit integer / 16-byte bit_set: no single GP register can hold it — use two-register lowering.
 	{
 		Type *lbt0 = base_type(lt);
@@ -3755,6 +3826,19 @@ gb_internal x64Value x64_emit_comp(x64Procedure *p, TokenKind op, x64Value lhs, 
 		}
 		x64_emit_movzx_rr(&p->asm_, X64OpSize_8, X64Reg_RAX, X64Reg_RAX);
 		return x64v_reg(t_bool, X64Reg_RAX);
+	}
+
+	// Big-endian integer comparison: the operands are stored byte-REVERSED, so comparing them as
+	// native little-endian gives the wrong ordering (u128be 1 < 2^64 read false, so sorting a
+	// []u128be — the uuid v6 UUID sort — came out wrong). Convert both to the platform-endian type
+	// (x64_emit_conv byte-swaps) and compare there. Mirrors LLVM lb_emit_comp's arch-endianness path.
+	if (is_type_integer(lbt) && is_type_different_to_arch_endianness(lt)) {
+		Type *plat = integer_endian_type_to_platform_type(lt);
+		x64Value lx = x64_emit_conv(p, lhs, lt, plat);
+		lx = x64_spill_value(p, lx, plat); // stabilize: converting rhs may reuse RAX
+		x64Value rx = x64_emit_conv(p, rhs, rhs.type ? rhs.type : lt, plat);
+		rx = x64_spill_value(p, rx, plat);
+		return x64_emit_comp(p, op, lx, rx);
 	}
 
 	// 128-bit integer comparison (two-register); also 16-byte bit_set == / !=. The scalar path below
@@ -4558,14 +4642,12 @@ gb_internal x64Value x64_emit_or_return(x64Procedure *p, Ast *expr) {
 				Entity *last_res = res_tup->variables[nres - 1];
 				i32 *loff = x64_var_get(&p->var_offsets, last_res);
 				if (loff != nullptr) {
-					if (type_size_of(rhs_t) > 8) { // aggregate (union) error: copy the FULL value
-						x64_store_value(p, x64addr(x64_rbp_mem(*loff), last_res->type), rhs_mem);
-					} else {
-						x64_emit_mov_rm(&p->asm_, rhs_opsz, X64Reg_RAX,
-						                x64_rbp_mem(rhs_spill));
-						x64_emit_mov_mr(&p->asm_, x64_op_size_of(last_res->type),
-						                x64_rbp_mem(*loff), X64Reg_RAX);
-					}
+					// Store via x64_store_value so a DIFFERING error type is CONVERTED, not copied raw: () or_return
+					// may propagate a small error (enum/pointer) into a result of a different error type (e.g. a
+					// compiler.Error enum -> a #shared_nil regex.Error union), which must be boxed (variant data +
+					// tag). A raw <=8B mov skipped the boxing -> the propagated union stayed nil (regex
+					// Program_Too_Big never surfaced). No-op conversion when the types already match.
+					x64_store_value(p, x64addr(x64_rbp_mem(*loff), last_res->type), rhs_mem);
 				}
 			}
 			x64_emit_named_returns(p);
@@ -4586,18 +4668,13 @@ gb_internal x64Value x64_emit_or_return(x64Procedure *p, Ast *expr) {
 				Entity *last_res = res_tup->variables[nres - 1];
 				i64 al = type_align_of(last_res->type);
 				last_off = (last_off + al - 1) & ~(al - 1);
-				if (type_size_of(rhs_t) > 8) { // aggregate (union) error: copy the FULL value
+					// Same conversion rule as the named-results path above: box/convert the error into the hidden
+					// return struct's last field via x64_store_value, not a raw mov.
 					i32 dptr = x64_alloc_local(p, 8, 8);
 					x64_emit_lea(&p->asm_, X64Reg_RAX, x64_mem(X64Reg_RAX, (i32)last_off));
 					x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(dptr), X64Reg_RAX);
 					x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(dptr));
 					x64_store_value(p, x64addr(x64_mem(X64Reg_RAX, 0), last_res->type), rhs_mem);
-				} else {
-					x64_emit_mov_rm(&p->asm_, rhs_opsz, X64Reg_RCX,
-					                x64_rbp_mem(rhs_spill));
-					x64_emit_mov_mr(&p->asm_, x64_op_size_of(last_res->type),
-					                x64_mem(X64Reg_RAX, (i32)last_off), X64Reg_RCX);
-				}
 			}
 		} else {
 			// Single register return: load rhs into RAX (extended to the full register).
@@ -6228,9 +6305,13 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 		// type and broadcast to every lane via x64_emit_conv (mirrors lb_const_value's array path). Was:
 		// fell through to the integer fallback → exact_value_to_i64(0.5)=0 → all lanes 0. THE blick
 		// all-text-at-origin bug: glyph center_position = (placement_p0+placement_p1)*0.5 → {0,0}.
-		if ((ct->kind == Type_Array || ct->kind == Type_SimdVector) &&
+		if ((ct->kind == Type_Array || ct->kind == Type_SimdVector || ct->kind == Type_Matrix) &&
 		    (ev.kind == ExactValue_Float || ev.kind == ExactValue_Integer)) {
-			Type *elem = (ct->kind == Type_Array) ? base_array_type(tav.type) : ct->SimdVector.elem;
+			// Matrix: emit_conv scalar→matrix puts the value on the diagonal (scaled identity), NOT every
+			// lane — `m: matrix[R,C]T = 1` is identity. Was an all-zero matrix (const `mat = 1`).
+			Type *elem = (ct->kind == Type_Array)      ? base_array_type(tav.type) :
+			             (ct->kind == Type_SimdVector) ? ct->SimdVector.elem :
+			                                             ct->Matrix.elem;
 			Type *ebt  = base_type(elem);
 			f64   fv   = (ev.kind == ExactValue_Float) ? ev.value_float : (f64)big_int_to_i64(&ev.value_integer);
 			x64Value sc;

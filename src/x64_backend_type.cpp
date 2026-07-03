@@ -491,8 +491,13 @@ gb_internal x64Value x64_load_addr(x64Procedure *p, x64Addr addr) {
 	}
 
 	i64 tsz = t ? type_size_of(x64_typed(t)) : 8;
-	if (tsz > 8) {
-		return x64v_mem(t, addr.mem); // multi-word: keep in memory, don't truncate to a reg
+	// Only a clean register width (1/2/4/8) can round-trip through a GP register. A 3/5/6/7-byte
+	// aggregate (e.g. Maybe([6]u8), struct{[6]u8,bool}) loaded into RAX would be stored back with an
+	// 8-byte mov (x64_op_size_of rounds the size up) and clobber the adjacent stack slot — THE
+	// small-aggregate-arg bug where a spilled 7-byte value overwrote the sret pointer's low byte. Keep
+	// any non-{1,2,4,8} size in memory (mirrors the Win64 indirect-aggregate rule, x64_arg_is_indirect).
+	if (tsz != 1 && tsz != 2 && tsz != 4 && tsz != 8) {
+		return x64v_mem(t, addr.mem); // multi-word / odd-width: keep in memory, don't truncate to a reg
 	}
 
 	X64OpSize sz = x64_op_size_of(t);

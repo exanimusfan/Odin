@@ -98,6 +98,7 @@ struct x64Module {
 	CoffSection   *xdata;   // .xdata — UNWIND_INFO
 	CoffSection   *tls;     // .tls$ — thread-local storage template (created lazily)
 	i16            tls_secnum; // 1-based COFF section number of `tls` (0 until created)
+	CoffSection   *drectve; // .drectve — linker directives (/INCLUDE, /EXPORT), created lazily
 
 	// CodeView type records: Type* → CV type index (>= 0x1000); builtins < 0x1000.
 	PtrMap<Type *, u32> cv_types;

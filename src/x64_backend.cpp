@@ -447,6 +447,18 @@ gb_internal void x64_emit_global_static(x64Module *m, Entity *e, DeclInfo *d) {
 	x64_emit_global_static_value(m, e, d->init_expr);
 }
 
+// Append a linker directive (e.g. " /INCLUDE:_tls_used", " /EXPORT:app_init") to this module's
+// `.drectve` section, creating it lazily. `.drectve` is link-only metadata (IMAGE_SCN_LNK_INFO |
+// IMAGE_SCN_LNK_REMOVE) that link.exe reads and drops from the image; multiple objects' contents
+// are concatenated. Directives must be space-separated.
+gb_internal void x64_module_add_drectve(x64Module *m, String directive) {
+	if (m->drectve == nullptr) {
+		m->drectve = coff_section_add(&m->coff, str_lit(".drectve"),
+		    0x00000200u | 0x00000800u); // IMAGE_SCN_LNK_INFO | IMAGE_SCN_LNK_REMOVE
+	}
+	coff_section_write(m->drectve, directive.text, directive.len);
+}
+
 // Lazily create this module's `.tls$` section (the thread-local template the OS copies per
 // thread). Name mirrors LLVM's COFF TLSDataSection so it sorts between the CRT's `_tls_start`
 // (.tls) and `_tls_end` (.tls$ZZZ) markers bounding the TLS directory.
@@ -459,12 +471,9 @@ gb_internal CoffSection *x64_module_tls_section(x64Module *m) {
 		// Force the linker to build the PE TLS directory by pulling in `_tls_used`
 		// (IMAGE_TLS_DIRECTORY, from the CRT's tlssup); without it the OS never copies the
 		// template per-thread nor fills `_tls_index`. LLVM emits this /INCLUDE automatically.
-		// `.drectve` is link-only metadata (not in the image). Skip for -no-crt (no _tls_used).
+		// Skip for -no-crt (no _tls_used).
 		if (!build_context.no_crt) {
-			CoffSection *dr = coff_section_add(&m->coff, str_lit(".drectve"),
-			    0x00000200u | 0x00000800u); // IMAGE_SCN_LNK_INFO | IMAGE_SCN_LNK_REMOVE
-			String d = str_lit(" /INCLUDE:_tls_used");
-			coff_section_write(dr, d.text, d.len);
+			x64_module_add_drectve(m, str_lit(" /INCLUDE:_tls_used"));
 		}
 	}
 	return m->tls;
@@ -1722,6 +1731,18 @@ gb_internal x64Generator *x64_generate_code(Checker *c) {
 				if (te != nullptr && te->kind == Entity_Procedure) array_add(&roots, te);
 			}
 		}
+		// -build-mode:dll: @(export) procs are reached only externally (via GetProcAddress /
+		// dynlib), so min_dep_count is 0 and the loop above skipped them → the DLL would be empty
+		// of app_init/app_loop/app_fini and the /EXPORT directives would dangle. Force them in
+		// (min_dep!=0 ones are already added above; skip those to avoid a duplicate root).
+		if (build_context.build_mode == BuildMode_DynamicLibrary) {
+			for (Entity *e : info->entities) {
+				if (e->kind != Entity_Procedure || !e->Procedure.is_export || e->Procedure.is_foreign) continue;
+				if (e->min_dep_count.load(std::memory_order_relaxed) != 0) continue;
+				Scope *s = e->scope;
+				if (s != nullptr && (s->flags & ScopeFlag_File)) array_add(&roots, e);
+			}
+		}
 		// Distribute roots to their owning module (token-pos order → deterministic
 		// per-module COFF output regardless of thread scheduling).
 		array_sort(roots, x64_proc_entity_cmp);
@@ -1786,6 +1807,29 @@ gb_internal x64Generator *x64_generate_code(Checker *c) {
 	// The type table's map variants generate Map_Info globals for reflection-only map types, which
 	// enqueue their synth hasher/equal procs. Drain so those symbols get defined before the write.
 	x64_generate_pending(gen, global_thread_pool.threads.count > 1);
+
+	// @(export) entities → PE export table. link.exe builds the export directory from `/EXPORT:name`
+	// directives in `.drectve` — this is what LLVM's DLLExport storage class lowers to. Without it a
+	// -build-mode:dll output has NO exports, so `dynlib.initialize_symbols` finds nothing (blick's
+	// hot-reload spun forever in _load_dll_code's retry loop). DLL-only for now (matches the reported
+	// need; an exe's @(export) would also want this but changes exe output — deferred).
+	if (build_context.build_mode == BuildMode_DynamicLibrary) {
+		for (Entity *e : info->entities) {
+			bool is_exp = (e->kind == Entity_Procedure) ? e->Procedure.is_export
+			            : (e->kind == Entity_Variable)  ? e->Variable.is_export : false;
+			if (!is_exp) continue;
+			x64Module *m = x64_module_of_entity(gen, e);
+			if (m == nullptr) continue;
+			String nm = x64_get_entity_name(e);
+			if (nm.len == 0) continue;
+			String pfx = str_lit(" /EXPORT:");
+			isize len = pfx.len + nm.len;
+			u8 *buf = gb_alloc_array(m->alloc, u8, len);
+			gb_memmove(buf, pfx.text, pfx.len);
+			gb_memmove(buf + pfx.len, nm.text, nm.len);
+			x64_module_add_drectve(m, make_string(buf, len));
+		}
+	}
 
 	// Serialize + write one COFF object per module in parallel (independent files).
 	{
