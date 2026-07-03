@@ -598,6 +598,19 @@ gb_internal x64Value x64_emit_select(x64Procedure *p, x64Value cond, x64Value x,
 	return x64v_reg(t, X64Reg_RAX);
 }
 
+// base += index*esz. A power-of-two element size that is a valid SIB scale (2/4/8) folds into a single
+// `lea base,[base+index*esz]` instead of imul+add; other sizes keep imul+add. Unlike a memory-operand
+// ALU fold, LEA is an address calc (no load on a reuse critical path), so it's a pure win. The index
+// register may be clobbered.
+gb_internal void x64_emit_scaled_ptr_add(x64Procedure *p, X64Reg base, X64Reg index, i64 esz) {
+	if (esz == 2 || esz == 4 || esz == 8) {
+		x64_emit_lea(&p->asm_, base, x64_mem_idx(base, index, (u8)esz, 0));
+	} else {
+		if (esz > 1) x64_emit_imul_rri(&p->asm_, X64OpSize_64, index, index, (i32)esz);
+		x64_emit_add_rr(&p->asm_, X64OpSize_64, base, index);
+	}
+}
+
 // ptr + index*size_of(elem) as a pointer value (mirrors lb_emit_ptr_offset); esz from ptr's element
 // type. Caller must pass STABLE (spilled) operands — x64 has no SSA, so a register-held ptr would be
 // clobbered while building index. (The IndexExpr path uses the hand-optimised x64_index_elem_addr.)
@@ -608,9 +621,8 @@ gb_internal x64Value x64_emit_ptr_offset(x64Procedure *p, x64Value ptr, x64Value
 	             (pbt && pbt->kind == Type_Pointer)       ? pbt->Pointer.elem : nullptr;
 	i64 esz = elem ? type_size_of(elem) : 1; if (esz <= 0) esz = 1;
 	x64_value_to_reg(p, index, X64Reg_RCX);
-	if (esz > 1) x64_emit_imul_rri(&p->asm_, X64OpSize_64, X64Reg_RCX, X64Reg_RCX, (i32)esz);
 	x64_value_to_reg(p, ptr, X64Reg_RAX);
-	x64_emit_add_rr(&p->asm_, X64OpSize_64, X64Reg_RAX, X64Reg_RCX);
+	x64_emit_scaled_ptr_add(p, X64Reg_RAX, X64Reg_RCX, esz);
 	return x64v_reg(pt, X64Reg_RAX);
 }
 
@@ -1162,8 +1174,7 @@ gb_internal void x64_index_base_to_rax(x64Procedure *p, Ast *agg, bool via_ptr, 
 gb_internal x64Addr x64_index_elem_addr(x64Procedure *p, x64Value idx_mem, i64 esz, i64 sub, Type *elem_t) {
 	x64_value_to_reg(p, idx_mem, X64Reg_RCX);
 	if (sub != 0)  x64_emit_sub_ri (&p->asm_, X64OpSize_64, X64Reg_RCX, (i32)sub);
-	if (esz > 1)   x64_emit_imul_rri(&p->asm_, X64OpSize_64, X64Reg_RCX, X64Reg_RCX, (i32)esz);
-	x64_emit_add_rr(&p->asm_, X64OpSize_64, X64Reg_RAX, X64Reg_RCX);
+	x64_emit_scaled_ptr_add(p, X64Reg_RAX, X64Reg_RCX, esz);
 	return x64addr(x64_mem(X64Reg_RAX, 0), elem_t);
 }
 
