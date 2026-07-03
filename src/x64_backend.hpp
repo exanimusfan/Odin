@@ -509,6 +509,7 @@ gb_internal String   x64_gen_map_info_ptr     (x64Module *m, Type *map_type);
 // hasher/equal synthetic-proc symbol name + enqueue for body emission (the type_*_proc intrinsics).
 gb_internal String   x64_synth_proc_name(x64Module *m, X64SynthKind kind, Type *type);
 gb_internal void     x64_enqueue_synth  (x64Module *m, X64SynthKind kind, Type *type);
+gb_internal Entity  *x64_anon_proc_entity(x64Module *m, Ast *expr);
 gb_internal x64Value x64_map_len  (x64Procedure *p, x64Value map_value);
 gb_internal x64Value x64_map_cap  (x64Procedure *p, x64Value map_value);
 gb_internal x64Value x64_map_data_uintptr(x64Procedure *p, x64Value map_value);

@@ -285,12 +285,18 @@ gb_internal void x64_const_value(x64Module *m, CoffSection *sec, u32 off, Type *
 	}
 
 	case ExactValue_Procedure: {
-		Ast *pa = value.value_procedure;
-		Entity *pe = (pa != nullptr) ? entity_of_node(unparen_expr(pa)) : nullptr;
+		Ast *pa = (value.value_procedure != nullptr) ? unparen_expr(value.value_procedure) : nullptr;
+		Entity *pe = (pa != nullptr) ? entity_of_node(pa) : nullptr;
 		if (pe != nullptr && pe->kind == Entity_Procedure) {
 			coff_reloc_add(sec, off, x64_get_entity_name(pe), COFF_REL_ADDR64);
+		} else if (pa != nullptr && pa->kind == Ast_ProcLit) {
+			// Anonymous `proc(){…}` literal as a compile-time-const global initializer (e.g. a
+			// package-global dispatch var like bufio._read_writer_procedure). Generate the anon proc
+			// + reloc the global to it. Was left 0 → the global proc pointer stayed nil (io.query
+			// returned an empty Stream_Mode_Set because s.procedure was nil).
+			Entity *ae = x64_anon_proc_entity(m, pa);
+			if (ae != nullptr) coff_reloc_add(sec, off, x64_get_entity_name(ae), COFF_REL_ADDR64);
 		}
-		// anonymous proc-lit constants in static data unsupported (rare); leave 0.
 		return;
 	}
 

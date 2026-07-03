@@ -1296,6 +1296,18 @@ gb_internal x64Addr x64_build_addr_index_expr(x64Procedure *p, Ast *expr) {
 		i64 use_esz = (arr_t->kind == Type_Basic) ? 1 : esz;
 		return x64_index_elem_addr(p, idx_mem, use_esz, /*sub*/0, t);
 	}
+	if (arr_t->kind == Type_Map) {
+		// A map index used as an lvalue BASE — the inner `m[k1]` of a chained `m[k1][k2]` read, or
+		// `m[k1].field`. Materialize the map VALUE (zero/nil map if the key is absent, which
+		// __dynamic_map_get handles safely) into a temp and return its address; the outer op then
+		// operates on that addressable copy. Mirrors LLVM's lb_addr_load(lbAddr_Map) for the inner
+		// index. (Using &m[k1]'s element pointer would be nil for an absent key → deref crash.) Was:
+		// this fell to the garbage-temp fallback below → `m["LOG"]["level"]` read a bogus inner map →
+		// segfault (core:encoding/ini parse_ini). Chained map STORE still prefers the &m[k] path.
+		x64Value v = x64_build_map_index_load(p, idx->expr, idx->index, t);
+		if (v.kind != x64Value_Mem) v = x64_spill_value(p, v, t);
+		return x64addr(v.mem, t);
+	}
 	// Fallback: materialise to a temp
 	i64 fsz = t ? x64_type_size(t) : 8;
 	i64 fal = t ? x64_type_align(t) : 8;
@@ -3591,6 +3603,26 @@ gb_internal x64Value x64_emit_comp(x64Procedure *p, TokenKind op, x64Value lhs, 
 // `-` (negate; float = XOR sign bit), `~` (bitwise not), `!` (logical not → bool). Address-of (`&`) is
 // NOT here — it needs the lvalue and is handled in the UnaryExpr case via x64_build_addr.
 gb_internal x64Value x64_emit_unary_arith(x64Procedure *p, TokenKind op, x64Value val, Type *t) {
+	// Aggregate unary op (array / #simd): apply the scalar op element-wise. Without this, `-v` on a
+	// [3]f32 fell to the scalar path below → value_to_reg loaded only the low 8 of 12 bytes into RAX
+	// and integer-negated float bits → garbage (THE core:math/noise 3D bug: `a0 := f_sign * -ri` with
+	// ri:[3]f32; 2D/[2] and 4D/[4] "worked" only because power-of-2 sizes hid it less). Binary arith
+	// already has x64_emit_arith_array; this is its unary counterpart.
+	Type *ubt = (t != nullptr) ? base_type(t) : nullptr;
+	if (ubt != nullptr && (ubt->kind == Type_Array || ubt->kind == Type_SimdVector)) {
+		Type *et = (ubt->kind == Type_Array) ? ubt->Array.elem : ubt->SimdVector.elem;
+		i64   n  = (ubt->kind == Type_Array) ? ubt->Array.count : ubt->SimdVector.count;
+		i64  esz = type_size_of(et); if (esz <= 0) esz = 1;
+		x64Value src = x64_spill_value(p, val, t);       // stable rbp base for the elements
+		i32 ro = x64_alloc_local(p, type_size_of(t), type_align_of(t));
+		for (i64 i = 0; i < n; i++) {
+			X64Mem em = src.mem; em.disp += (i32)(i * esz);
+			x64Value nv = x64_emit_unary_arith(p, op, x64v_mem(et, em), et); // scalar elem (no re-entry)
+			X64Mem rm = x64_rbp_mem(ro); rm.disp += (i32)(i * esz);
+			x64_store_value(p, x64addr(rm, et), nv);
+		}
+		return x64v_mem(t, x64_rbp_mem(ro));
+	}
 	// 128-bit integer unary negate / bitwise-not (two-register; the single-register path below only
 	// touches the low 64 bits). Needed e.g. for strconv's negative-i128 formatting.
 	if (t != nullptr && type_size_of(t) == 16 && is_type_integer(t) && (op == Token_Sub || op == Token_Xor)) {
@@ -4110,9 +4142,11 @@ gb_internal x64Value x64_build_unary_and(x64Procedure *p, Ast *expr) {
 // Anonymous proc literal used as a value (mirrors lb_generate_anonymous_proc_lit): generate the proc
 // on-demand (enqueue into the module proc-queue) and return its address. Without this a `proc(){…}`
 // value was none → a NULL fn pointer → DEP exec at 0 when called.
-gb_internal x64Value x64_generate_anonymous_proc_lit(x64Procedure *p, Ast *expr) {
+// Materialize an anonymous `proc(){…}` literal as a real proc entity (deterministic name, enqueued
+// into the module's proc-queue for compilation) and return it. Shared by the expr path (value use)
+// and the const path (a proc-lit as a global-variable initializer). Idempotent via pl->decl->entity.
+gb_internal Entity *x64_anon_proc_entity(x64Module *m, Ast *expr) {
 	ast_node(pl, ProcLit, expr);
-	TypeAndValue tav = expr->tav;
 	Entity *e = (pl->decl != nullptr) ? pl->decl->entity.load() : nullptr;
 	if (e == nullptr && pl->decl != nullptr) {
 		static std::atomic<i32> x64_anon_proc_id;
@@ -4132,11 +4166,17 @@ gb_internal x64Value x64_generate_anonymous_proc_lit(x64Procedure *p, Ast *expr)
 		Entity *expected = nullptr;
 		if (pl->decl->entity.compare_exchange_strong(expected, ne)) {
 			e = ne;
-			mpsc_enqueue(&p->module->proc_queue, e); // compiled by the module's proc-queue drain
+			mpsc_enqueue(&m->proc_queue, e); // compiled by the module's proc-queue drain
 		} else {
 			e = expected; // another thread generated it first
 		}
 	}
+	return e;
+}
+
+gb_internal x64Value x64_generate_anonymous_proc_lit(x64Procedure *p, Ast *expr) {
+	TypeAndValue tav = expr->tav;
+	Entity *e = x64_anon_proc_entity(p->module, expr);
 	if (e == nullptr) return x64v_none();
 	x64_emit_lea_sym(&p->asm_, X64Reg_RAX, x64_get_entity_name(e));
 	return x64v_reg(x64_typed(tav.type ? tav.type : e->type), X64Reg_RAX);
