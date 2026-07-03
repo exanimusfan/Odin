@@ -937,7 +937,7 @@ gb_internal void x64_emit_type_table(x64Generator *gen) {
 		Type *bt = base_type(t);
 		bool emit = false;
 		if      (bt->kind == Type_Basic)  emit = !(bt->Basic.flags & BasicFlag_Untyped);
-		else if (bt->kind == Type_Struct) emit = bt->Struct.soa_kind == StructSoa_None; // incl. #raw_union
+		else if (bt->kind == Type_Struct) emit = true; // incl. #raw_union and #soa (fields = the [^]T component arrays + len/cap/allocator; reserve_soa/append reflect on them)
 		else if (bt->kind == Type_BitField) emit = true;
 		else if (bt->kind == Type_Pointer || bt->kind == Type_MultiPointer ||
 		         bt->kind == Type_Slice   || bt->kind == Type_DynamicArray  ||

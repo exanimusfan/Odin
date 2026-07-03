@@ -47,6 +47,44 @@ gb_internal x64Value x64_const_string(x64Procedure *p, String sv, i64 elem_size 
 	return x64v_mem(t_string, x64_rbp_mem(str_off));
 }
 
+// A constant string used where a cstring/cstring16 is expected: a bare NUL-terminated data
+// POINTER (8 bytes), NOT a {data,len} header. `wide` UTF-16-encodes the bytes (cstring16, e.g.
+// passing "en-US" to a Win32 LPCWSTR param). Mirrors LLVM lb_emit_conv string->cstring and the
+// constant_utf16_cstring builtin. Without this a const string arg to a cstring16 param was built
+// as a 16-byte string struct → the callee read UTF-8 bytes as UTF-16 (Win32 LocaleNameToLCID → 0).
+gb_internal x64Value x64_const_cstring_ptr(x64Procedure *p, String sv, bool wide, Type *result_type) {
+	x64Module *m = p->module;
+	if (sv.len == 0 && !wide) {
+		x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RAX, 0); // empty cstring → null pointer
+		return x64v_reg(result_type, X64Reg_RAX);
+	}
+	String sym;
+	if (wide) {
+		u16  *buf = gb_alloc_array(temporary_allocator(), u16, sv.len + 2);
+		isize n = 0; u8 const *text = sv.text; isize len = sv.len;
+		while (len > 0) {
+			Rune  r = 0;
+			isize w = gb_utf8_decode(text, len, &r);
+			text += w; len -= w;
+			if ((0 <= r && r < 0xd800) || (0xe000 <= r && r < 0x10000)) {
+				buf[n++] = (u16)r;
+			} else if (0x10000 <= r && r <= 0x10ffff) {
+				Rune rr = r - 0x10000;
+				buf[n++] = (u16)(0xd800 + ((rr >> 10) & 0x3ff));
+				buf[n++] = (u16)(0xdc00 + (rr & 0x3ff));
+			} else {
+				buf[n++] = 0xfffd;
+			}
+		}
+		buf[n++] = 0; // NUL terminator
+		sym = x64_const_intern_string(m, make_string((u8 const *)buf, n * 2));
+	} else {
+		sym = x64_const_intern_string(m, sv);
+	}
+	x64_emit_lea_sym(&p->asm_, X64Reg_RAX, sym);
+	return x64v_reg(result_type, X64Reg_RAX);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Context (Odin's implicit `context`)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -207,6 +245,19 @@ gb_internal void x64_emit_bswap16(x64Procedure *p, X64Reg r) {
 
 gb_internal x64Value x64_build_compound_lit(x64Procedure *p, Ast *lit, Type *type); // defined below
 
+// A compile-time integer constant of a BIG-ENDIAN type (u16be/u32be/u64be) is materialised as a
+// host-order immediate; pre-swap to the type's byte width so the little-endian store lays the bytes
+// out big-endian (mirrors x64_const_int_bytes' static path). e.g. net's IP6_Address = [8]u16be, whose
+// `{0x2620, …}` literals compared unequal to DNS-parsed addresses because the constants weren't swapped.
+gb_internal i64 x64_endian_fix_const_int(Type *type, i64 v) {
+	Type *bt = type ? base_type(x64_typed(type)) : nullptr;
+	if (bt == nullptr || !is_type_integer(bt) || is_type_endian_little(bt)) return v;
+	i64 n = type_size_of(bt); if (n <= 1 || n > 8) return v;
+	u64 in = (u64)v, out = 0;
+	for (i64 i = 0; i < n; i++) { out = (out << 8) | (in & 0xff); in >>= 8; }
+	return (i64)out;
+}
+
 // Value for an omitted default parameter (mirrors lb_handle_param_value). For
 // ParameterValue_Constant, materialise the stored ExactValue directly rather than
 // re-evaluating original_ast_expr — that AST node often lacks a usable tav/entity
@@ -224,11 +275,13 @@ gb_internal x64Value x64_handle_param_value(x64Procedure *p, Type *ptype,
 		case ExactValue_Bool:
 			return x64v_imm(t, ev.value_bool ? 1 : 0);
 		case ExactValue_Integer:
-			return x64v_imm(t, big_int_to_i64(&ev.value_integer));
+			return x64v_imm(t, x64_endian_fix_const_int(ptype, big_int_to_i64(&ev.value_integer)));
 		case ExactValue_Float:
 			x64_emit_float_const(p, bt, ev.value_float, (f32)ev.value_float);
 			return x64v_xmm(t, X64XmmReg_XMM0);
 		case ExactValue_String:
+			if (is_type_cstring(bt))   return x64_const_cstring_ptr(p, ev.value_string, false, t);
+			if (is_type_cstring16(bt)) return x64_const_cstring_ptr(p, ev.value_string, true,  t);
 			return x64_const_string(p, ev.value_string);
 		case ExactValue_Procedure: {
 			Entity *pe = entity_from_expr(ev.value_procedure);
@@ -1395,6 +1448,80 @@ gb_internal x64Addr x64_build_soa_index_field(x64Procedure *p, Ast *ie_expr, Ast
 	return x64addr(x64_mem(X64Reg_RAX, 0), field_type);
 }
 
+// Copy `csz` bytes between the pointer held in stack slot `ptr_slot` (points at the component's [idx]
+// element) and the RBP-relative `elem_comp`. Unrolled 8/4/2/1-byte chunks (SOA components are small),
+// clobber-safe: the component address stays in RAX, values pass through RDX. `store`: elem→[ptr].
+gb_internal void x64_soa_copy_component(x64Procedure *p, i32 ptr_slot, X64Mem elem_comp, i64 csz, bool store) {
+	x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(ptr_slot)); // RAX = &component[idx]
+	for (i64 o = 0; o < csz; ) {
+		i64 chunk = (csz - o >= 8) ? 8 : (csz - o >= 4) ? 4 : (csz - o >= 2) ? 2 : 1;
+		X64OpSize os = (chunk == 8) ? X64OpSize_64 : (chunk == 4) ? X64OpSize_32 : (chunk == 2) ? X64OpSize_16 : X64OpSize_8;
+		X64Mem ec = elem_comp; ec.disp += (i32)o;
+		X64Mem cm = x64_mem(X64Reg_RAX, (i32)o);
+		if (store) { x64_emit_mov_rm(&p->asm_, os, X64Reg_RDX, ec); x64_emit_mov_mr(&p->asm_, os, cm, X64Reg_RDX); }
+		else       { x64_emit_mov_rm(&p->asm_, os, X64Reg_RDX, cm); x64_emit_mov_mr(&p->asm_, os, ec, X64Reg_RDX); }
+		o += chunk;
+	}
+}
+
+// Whole-element access to a #soa array element (`soa[idx]` gather / `soa[idx] = v` scatter). x64 has no
+// Addressing_SoaVariable, so the AoS element is gathered into / scattered from a stack buffer. Component
+// k of the element lives in the k-th SOA field: a [^]Ck (slice/dynamic — load the ptr @field-offset) or
+// an inline [N]Ck (fixed); its [idx] address = that base + idx*size(Ck). In the AoS element, component k
+// is at sub-offset `coff` (array elem: k*size(elem); struct: field k's offset). Mirrors lb_addr_soa_variable.
+gb_internal x64Value x64_soa_index_element(x64Procedure *p, Ast *ie_expr, Type *elem_type, bool store, x64Value src) {
+	ast_node(ie, IndexExpr, ie_expr);
+	Type *soa_ptr_t = ie->expr->tav.type;
+	bool  deref     = is_type_pointer(soa_ptr_t);
+	Type *soa       = base_type(type_deref(soa_ptr_t));
+	Type *ebt       = base_type(elem_type);
+	GB_ASSERT(soa != nullptr && soa->kind == Type_Struct && soa->Struct.soa_kind != StructSoa_None);
+	type_set_offsets(soa);
+
+	int ncomp = 0;
+	if      (ebt->kind == Type_Struct) { ncomp = (int)ebt->Struct.fields.count; type_set_offsets(ebt); }
+	else if (ebt->kind == Type_Array)  ncomp = (int)ebt->Array.count;
+
+	// soa base ptr + idx → slots (calls below clobber regs)
+	if (deref) x64_value_to_reg(p, x64_build_expr(p, ie->expr), X64Reg_RAX);
+	else       x64_emit_lea(&p->asm_, X64Reg_RAX, x64_build_addr(p, ie->expr).mem);
+	i32 sb = x64_alloc_local(p, 8, 8);
+	x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(sb), X64Reg_RAX);
+	x64_value_to_reg(p, x64_build_expr(p, ie->index), X64Reg_RCX);
+	i32 ib = x64_alloc_local(p, 8, 8);
+	x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(ib), X64Reg_RCX);
+
+	// element buffer (rbp-relative): the source for scatter, or the gather destination. Gather zeroes
+	// first so a padded element (e.g. struct{x:int, y:u8}) has zero padding bytes, matching a normally
+	// constructed value — else a memory-wise struct compare sees garbage in the padding.
+	X64Mem ebuf;
+	if (store) { x64Value sv = x64_spill_value(p, src, elem_type); ebuf = sv.mem; }
+	else       { i64 esz = gb_max(type_size_of(elem_type), (i64)1); i32 e_off = x64_alloc_local(p, esz, gb_max(type_align_of(elem_type), (i64)1)); ebuf = x64_rbp_mem(e_off); x64_zero_mem(p, ebuf, esz); }
+
+	for (int k = 0; k < ncomp; k++) {
+		Type *comp_t; i64 coff;
+		if (ebt->kind == Type_Struct) { comp_t = ebt->Struct.fields[k]->type; coff = ebt->Struct.offsets[k]; }
+		else                          { comp_t = ebt->Array.elem;             coff = (i64)k * type_size_of(ebt->Array.elem); }
+		i64 csz  = type_size_of(comp_t); if (csz <= 0) csz = 1;
+		i64 foff = soa->Struct.offsets[k];
+
+		// &component[idx] → RAX, pin to a slot
+		x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(sb));
+		if (soa->Struct.soa_kind == StructSoa_Fixed) { if (foff != 0) x64_emit_add_ri(&p->asm_, X64OpSize_64, X64Reg_RAX, (i32)foff); }
+		else                                          x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_mem(X64Reg_RAX, (i32)foff)); // load [^] ptr
+		x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RCX, x64_rbp_mem(ib));
+		x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RDX, csz);
+		x64_emit_imul_rr(&p->asm_, X64OpSize_64, X64Reg_RCX, X64Reg_RDX);
+		x64_emit_add_rr(&p->asm_, X64OpSize_64, X64Reg_RAX, X64Reg_RCX);
+		i32 caddr = x64_alloc_local(p, 8, 8);
+		x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(caddr), X64Reg_RAX);
+
+		X64Mem ecomp = ebuf; ecomp.disp += (i32)coff;
+		x64_soa_copy_component(p, caddr, ecomp, csz, store);
+	}
+	return store ? x64v_none() : x64v_mem(elem_type, ebuf);
+}
+
 gb_internal x64Addr x64_build_addr(x64Procedure *p, Ast *expr) {
 	expr = unparen_expr(expr);
 	Type *t = expr->tav.type;
@@ -1596,6 +1723,7 @@ gb_internal x64Addr x64_build_addr(x64Procedure *p, Ast *expr) {
 		if (al <= 0) al = 8;
 		i32 off = x64_alloc_local(p, sz, al);
 		p->named_seq++;
+		if (p->local_size > p->escape_floor) p->escape_floor = p->local_size; // slot outlives its block (LLVM hoists)
 		x64Value v = x64_build_expr(p, expr);
 		x64_store_value(p, x64addr(x64_rbp_mem(off), t), v);
 		return x64addr(x64_rbp_mem(off), t);
@@ -6141,6 +6269,8 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 		}
 
 		if (ev.kind == ExactValue_String) {
+			if (is_type_cstring(ct))   return x64_const_cstring_ptr(p, ev.value_string, false, x64_typed(tav.type));
+			if (is_type_cstring16(ct)) return x64_const_cstring_ptr(p, ev.value_string, true,  x64_typed(tav.type));
 			i64 esz = is_type_slice(ct) ? type_size_of(ct->Slice.elem) : 1;
 			return x64_const_string(p, ev.value_string, esz);
 		}
@@ -6157,6 +6287,19 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 		// Addressing_Constant w/ ExactValue_Procedure, so they land here, not the Ident
 		// Entity_Procedure case — emit lea_sym.
 		if (ev.kind == ExactValue_Procedure) {
+			// An ANONYMOUS proc literal folded to a constant — e.g. a struct-field value in a
+			// compound literal (`{procedure = proc(){…}}`), which the named-proc walk below can't
+			// resolve (proc_e is a Constant, not an Entity_Procedure) → it returned 0. Generate the
+			// anon proc on-demand + lea, like x64_generate_anonymous_proc_lit. Was crypto.random_generator's
+			// `procedure` field → nil → uuid generate_v7 CSPRNG assert (then the runner hung).
+			Ast *plast = ev.value_procedure ? unparen_expr(ev.value_procedure) : unparen_expr(expr);
+			if (plast != nullptr && plast->kind == Ast_ProcLit) {
+				Entity *ae = x64_anon_proc_entity(p->module, plast);
+				if (ae != nullptr) {
+					x64_emit_lea_sym(&p->asm_, X64Reg_RAX, x64_get_entity_name(ae));
+					return x64v_reg(x64_typed(tav.type), X64Reg_RAX);
+				}
+			}
 			Entity *proc_e = entity_of_node(expr);
 			while (proc_e != nullptr && proc_e->kind == Entity_Constant &&
 			       proc_e->Constant.value.kind == ExactValue_Procedure) {
@@ -6176,7 +6319,7 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 		i64 iv = 0;
 		switch (ev.kind) {
 		case ExactValue_Bool:    iv = ev.value_bool ? 1 : 0; break;
-		case ExactValue_Integer: iv = big_int_to_i64(&ev.value_integer); break;
+		case ExactValue_Integer: iv = x64_endian_fix_const_int(tav.type, big_int_to_i64(&ev.value_integer)); break;
 		case ExactValue_Float:   iv = (i64)ev.value_float; break;
 		case ExactValue_Pointer: iv = ev.value_pointer; break;
 		default: break;
@@ -6414,6 +6557,10 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 		Type *ibt = base_type(type_deref(ie->expr->tav.type));
 		if (ibt != nullptr && ibt->kind == Type_Map) {
 			return x64_build_map_index_load(p, ie->expr, ie->index, tav.type);
+		}
+		// `soa[idx]` whole-element read → gather each component array's [idx] into an AoS element.
+		if (ibt != nullptr && ibt->kind == Type_Struct && ibt->Struct.soa_kind != StructSoa_None) {
+			return x64_soa_index_element(p, expr, x64_typed(tav.type), /*store*/false, x64v_none());
 		}
 		x64Addr addr = x64_build_addr(p, expr);
 		return x64_load_addr(p, addr);
@@ -6731,8 +6878,14 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 							x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RAX, (i64)at->Struct.soa_count);
 							return x64v_reg(t_int, X64Reg_RAX);
 						}
+						// SOA component count = struct field count, OR array length for an array element
+						// (`#soa[dynamic][2]int` → 2 component arrays); __$len follows them, __$cap follows __$len.
 						Type *ebt = base_type(at->Struct.soa_elem);
-						int nmem = (ebt != nullptr && ebt->kind == Type_Struct) ? (int)ebt->Struct.fields.count : 0;
+						int nmem = 0;
+						if (ebt != nullptr) {
+							if (ebt->kind == Type_Struct)     nmem = (int)ebt->Struct.fields.count;
+							else if (ebt->kind == Type_Array) nmem = (int)ebt->Array.count;
+						}
 						type_set_offsets(at);
 						int fi = nmem;
 						if (be->Builtin.id == BuiltinProc_cap && at->Struct.soa_kind == StructSoa_Dynamic) fi = nmem + 1;
@@ -6852,6 +7005,27 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 					x64_emit_mov_ri(&p->asm_, X64OpSize_32, X64Reg_RCX, (i64)(be ? 0xFF7F : 0x7FFF));
 					x64_emit_and_rr(&p->asm_, X64OpSize_16, X64Reg_RAX, X64Reg_RCX);
 					x64_emit_mov_mr(&p->asm_, X64OpSize_16, x64_rbp_mem(off), X64Reg_RAX);
+					return x64v_mem(rt, x64_rbp_mem(off));
+				}
+				// 128-bit signed abs: the single-register path below only touches the low 64 bits, so
+				// abs(i128) returned garbage high bits (u128(abs(i128)) in strconv → fmt of any negative
+				// i128 printed the raw two's-complement magnitude, e.g. -5 as -(2^128-5); the cbor
+				// test_decode_negative -2^64 mismatch). Negate both halves (0-x with borrow) then select
+				// on the sign of the HIGH word.
+				if (type_size_of(rt) == 16 && x64_is_integer(rt)) {
+					i32 vo  = x64_i128_operand(p, xv, rt, true);
+					i32 off = x64_alloc_local(p, 16, 16);
+					x64_emit_xor_rr(&p->asm_, X64OpSize_32, X64Reg_RAX, X64Reg_RAX);
+					x64_emit_xor_rr(&p->asm_, X64OpSize_32, X64Reg_RDX, X64Reg_RDX);
+					x64_emit_sub_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(vo));     // RAX = -x.lo
+					x64_emit_sbb_rm(&p->asm_, X64OpSize_64, X64Reg_RDX, x64_rbp_mem(vo + 8)); // RDX = -x.hi
+					x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RCX, x64_rbp_mem(vo));      // RCX = x.lo
+					x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_R8,  x64_rbp_mem(vo + 8));  // R8  = x.hi
+					x64_emit_test_rr(&p->asm_, X64OpSize_64, X64Reg_R8, X64Reg_R8);            // sign of x
+					x64_emit_cmov_rr(&p->asm_, X64Cc_S, X64OpSize_64, X64Reg_RCX, X64Reg_RAX); // x<0 → -x.lo
+					x64_emit_cmov_rr(&p->asm_, X64Cc_S, X64OpSize_64, X64Reg_R8,  X64Reg_RDX); // x<0 → -x.hi
+					x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(off),     X64Reg_RCX);
+					x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(off + 8), X64Reg_R8);
 					return x64v_mem(rt, x64_rbp_mem(off));
 				}
 				X64OpSize osz = x64_op_size_of(rt);

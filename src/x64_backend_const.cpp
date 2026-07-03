@@ -274,6 +274,31 @@ gb_internal void x64_const_value(x64Module *m, CoffSection *sec, u32 off, Type *
 			coff_reloc_add(sec, off, x64_const_intern_string(m, s), COFF_REL_ADDR64);
 			return;
 		}
+		if (is_type_cstring16(bt)) {
+			// wide C string pointer (8 bytes, NOT a {data,len} header): UTF-16 encode + NUL-terminate,
+			// intern, emit ONLY the pointer. Mirrors the constant_utf16_cstring builtin. Without this,
+			// a `cstring16` const global fell to the 16-byte string path → wrote len past its 8-byte
+			// reservation (sys/windows package globals). Was the x64_const_patch off+n>data.count assert.
+			u16  *buf = gb_alloc_array(temporary_allocator(), u16, s.len + 2);
+			isize n = 0; u8 const *text = s.text; isize len = s.len;
+			while (len > 0) {
+				Rune  r = 0;
+				isize w = gb_utf8_decode(text, len, &r);
+				text += w; len -= w;
+				if ((0 <= r && r < 0xd800) || (0xe000 <= r && r < 0x10000)) {
+					buf[n++] = (u16)r;
+				} else if (0x10000 <= r && r <= 0x10ffff) {
+					Rune rr = r - 0x10000;
+					buf[n++] = (u16)(0xd800 + ((rr >> 10) & 0x3ff));
+					buf[n++] = (u16)(0xdc00 + (rr & 0x3ff));
+				} else {
+					buf[n++] = 0xfffd;
+				}
+			}
+			buf[n++] = 0; // NUL terminator
+			coff_reloc_add(sec, off, x64_const_intern_string(m, make_string((u8 const *)buf, n * 2)), COFF_REL_ADDR64);
+			return;
+		}
 		// string / []T are {data, len}; data via ADDR64 reloc to interned bytes. For a non-u8
 		// slice (#load to []u32 etc.) len is the ELEMENT count = bytes / elem size (mirrors
 		// lb_find_or_add_entity_string_byte_slice_with_type).

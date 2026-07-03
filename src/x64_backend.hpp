@@ -237,6 +237,10 @@ struct x64Procedure {
 	i32   frame_max;          // peak local_size ever reached → drives the prologue SUB RSP.
 	                          // Lets callers reset local_size to reuse stack slots (e.g.
 	                          // the per-global startup init loop) without under-reserving.
+	i32   escape_floor;       // slots below this hold address-escaped temporaries (`&T{}` whose
+	                          // pointer outlives the block) → statement- and block-scope reclaim
+	                          // must never drop local_size below it (LLVM hoists these allocas to
+	                          // function entry; x64 emulates by permanently reserving the slot).
 	i32   max_outgoing_bytes; // peak outgoing stack-arg bytes over all calls (args beyond the
 	                          // 4 register slots, ×8). Sizes the reserved outgoing area in the
 	                          // frame; a hardcoded 64 under-reserved for calls with >12 args.
@@ -489,6 +493,7 @@ gb_internal bool      x64_try_inline_call(x64Procedure *p, AstCallExpr *ce, Enti
 gb_internal bool      x64_type_is_pointer_free(Type *t);
 gb_internal x64Value  x64_build_expr(x64Procedure *p, Ast *expr);
 gb_internal x64Addr   x64_build_addr(x64Procedure *p, Ast *expr);
+gb_internal x64Value  x64_soa_index_element(x64Procedure *p, Ast *ie_expr, Type *elem_type, bool store, x64Value src); // #soa whole-element gather/scatter
 gb_internal x64Value  x64_emit_logical_binary_expr(x64Procedure *p, TokenKind op, Ast *left, Ast *right, Type *type);
 gb_internal i64       x64_fca_len_offset(Type *fca); // len-field offset of a [dynamic;N]E (NOT type_size-8 when E is over-aligned)
 // CallExpr lowering, split out of x64_build_expr (mirrors lb_build_call_expr). Mutually

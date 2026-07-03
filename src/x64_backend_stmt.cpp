@@ -1411,6 +1411,20 @@ gb_internal void x64_build_assign_stmt(x64Procedure *p, Ast *node) {
 						return;
 					}
 				}
+				// `soa[idx] = v` whole-element write → scatter v's components into the field arrays
+				// (no single lvalue address exists; x64 has no Addressing_SoaVariable).
+				{
+					Ast *lhs0 = unparen_expr(as->lhs[0]);
+					if (lhs0->kind == Ast_IndexExpr) {
+						Type *lbt = base_type(type_deref(lhs0->IndexExpr.expr->tav.type));
+						if (lbt != nullptr && lbt->kind == Type_Struct && lbt->Struct.soa_kind != StructSoa_None) {
+							Type *et = x64_typed(as->lhs[0]->tav.type);
+							x64Value rv = x64_emit_conv(p, x64_build_expr(p, as->rhs[0]), as->rhs[0]->tav.type, et);
+							x64_soa_index_element(p, lhs0, et, /*store*/true, rv);
+							return;
+						}
+					}
+				}
 				x64Addr lhs_addr = x64_build_addr(p, as->lhs[0]);
 				// `lhs = {}` → zero the destination in place (no full-size temp+copy). No RHS
 				// build means the (possibly register-based) lhs address isn't clobbered; zero_mem
@@ -1902,7 +1916,11 @@ gb_internal void x64_build_if_stmt(x64Procedure *p, Ast *node) {
 	// Run+pop the if-scope's defers (init/condition) on the merged path — both branches reach here.
 	// A non-local exit (return/break) inside a branch already ran these via x64_run_deferred_from.
 	x64_scope_end(p, defer_base);
-	p->local_size      = frame_save;
+	// Never reclaim below escape_floor: a `p = &Foo{}` in a branch (with p in an outer scope)
+	// keeps its slot alive past the if (mirrors the BlockStmt reclaim). Was: this reset dropped
+	// the escaped Parser in odin/parser parse_package's `if p==nil { p = &Parser{} }` → a later
+	// make() reused the slot and corrupted the pointee.
+	p->local_size      = gb_max(frame_save, p->escape_floor);
 	p->ctx_override_off = ctx_save;
 }
 
@@ -2068,10 +2086,11 @@ gb_internal void x64_build_stmt(x64Procedure *p, Ast *stmt) {
 			x64_label_bind(&p->asm_, lbl_done);
 		}
 		// Lexical scope exit: everything declared in the block is now dead (Odin scope lifetime),
-		// so a sibling/later scope can reuse the slots. Safe regardless of escaping pointers —
-		// a cross-scope escape is use-after-scope (invalid Odin). frame_max keeps the prologue peak.
+		// so a sibling/later scope can reuse the slots. frame_max keeps the prologue peak.
+		// EXCEPT address-escaped temporaries (`p = &Foo{}` with p in an outer scope): their storage
+		// outlives the block, so never reclaim below escape_floor (mirrors LLVM entry-hoisted allocas).
 		// (Debug: sibling scopes alias slots until S_BLOCK32 lexical-scope records are emitted.)
-		p->local_size      = frame_save;
+		p->local_size      = gb_max(frame_save, p->escape_floor);
 		p->ctx_override_off = ctx_save; // a context.field=X inside this block doesn't leak out
 	} case_end;
 
