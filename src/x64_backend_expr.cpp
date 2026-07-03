@@ -1182,6 +1182,32 @@ gb_internal x64Addr x64_emit_struct_ep(x64Procedure *p, x64Addr base, AstSelecto
 // slot; file-scope global variable → LEA [RIP+sym]; non-addressable kinds (import/library/type) and a
 // variable that is neither local nor file-scope (a struct field reached via SelectorExpr) → a dummy
 // local; anything else with no storage symbol → materialise into a local. `e` may be nullptr.
+// Address of a `using`-promoted field referenced as a BARE identifier (mirrors lb_get_using_variable):
+// e.g. `using params` where params: ^Filter_Params, then a bare `channels`/`dest` means params^.channels.
+// The field entity has no storage of its own — compute it every time from the using_parent's address +
+// the field offset. Handles a pointer parent (`using p: ^T`) by dereferencing. Returns {type==nullptr}
+// when it can't (unknown parent) so the caller falls through. Was core:image/png emitting bare `width`/
+// `channels`/`dest`/`depth` as unresolved external symbols (fell to the global LEA [RIP+name] path).
+gb_internal x64Addr x64_get_using_variable(x64Procedure *p, Entity *e) {
+	Entity *parent = e->using_parent;
+	if (parent == nullptr) return x64addr(X64Mem{}, nullptr);
+	X64Mem base = {};
+	if (x64_entity_is_local(p, parent)) {
+		base = x64_entity_addr(p, parent).mem;
+	} else if (e->using_expr != nullptr) {
+		base = x64_build_addr(p, e->using_expr).mem; // address of the using_expr lvalue
+	} else {
+		return x64addr(X64Mem{}, nullptr);
+	}
+	Type *pt = parent->type;
+	if (is_type_pointer(pt)) { // `using p: ^T` → load the pointer, index off the pointee
+		x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, base);
+		base = x64_mem(X64Reg_RAX, 0);
+		pt = type_deref(pt);
+	}
+	return x64_emit_deep_field_gep(p, base, base_type(pt), entity_interned_name(e), /*allow_deref*/true);
+}
+
 gb_internal x64Addr x64_build_addr_from_entity(x64Procedure *p, Entity *e, Ast *expr) {
 	Type *t = expr->tav.type;
 	if (e == nullptr) {
@@ -1198,6 +1224,12 @@ gb_internal x64Addr x64_build_addr_from_entity(x64Procedure *p, Entity *e, Ast *
 		i64 al  = t ? x64_type_align(t) : 8;
 		i32 off = x64_alloc_local(p, sz, al);
 		return x64addr(x64_rbp_mem(off), t ? t : t_int);
+	}
+	// `using`-promoted field referenced by bare name → compute params^.field (mirrors LLVM's
+	// lb_build_addr_from_entity EntityFlag_Using branch). Must precede the dummy/global fallbacks.
+	if (e->kind == Entity_Variable && (e->flags & EntityFlag_Using) && !x64_entity_is_local(p, e)) {
+		x64Addr ua = x64_get_using_variable(p, e);
+		if (ua.type != nullptr) return ua;
 	}
 	// Variables neither local nor file-scope are struct fields etc. — accessed via
 	// SelectorExpr, not global symbols; return a dummy not LEA [RIP+name]. EXCEPTION:
@@ -3369,6 +3401,19 @@ gb_internal x64Value x64_emit_comp(x64Procedure *p, TokenKind op, x64Value lhs, 
 	Type *lt  = x64_typed(lhs.type ? lhs.type : t_int);
 	Type *lbt = base_type(lt);
 
+	// f16 comparison: f16 is moved as a raw 2-byte integer (x64_is_float excludes size-2), so it would
+	// fall to the INTEGER compare path below and compare raw BITS — wrong for floats: neg-zero(0x8000)
+	// != 0, NaN==NaN reads true, and </>/<=/>= treat the sign bit as an unsigned magnitude. Convert both
+	// operands to f32 and compare as floats (NaN-correct). Was math.classify_f16 returning Inf for
+	// Neg_Zero / NaN / Neg_Inf (x==0, x*0.25==x, x<0 all mis-evaluated).
+	if (x64_is_f16(lbt)) {
+		x64Value lf = x64_emit_conv(p, lhs, lt, t_f32);
+		lf = x64_spill_value(p, lf, t_f32); // stabilize: the rhs conversion below reuses XMM0
+		x64Value rf = x64_emit_conv(p, rhs, rhs.type ? rhs.type : lt, t_f32);
+		rf = x64_spill_value(p, rf, t_f32); // both must be in memory: the float compare loads lhs into XMM0 first, which would clobber rf if it were still a live register
+		return x64_emit_comp(p, op, lf, rf);
+	}
+
 	// String comparison → runtime helpers string_eq/ne/lt/gt/le/ge (compare content, not the data
 	// ptr). A `string`/`string16` arg is 16B → indirect, so pass the ADDRESS of each spilled operand.
 	// EXCLUDE cstring/cstring16: those are 8B POINTERS (BasicFlag_String is set on them too), NOT
@@ -3645,6 +3690,14 @@ gb_internal x64Value x64_emit_unary_arith(x64Procedure *p, TokenKind op, x64Valu
 	case Token_Add:
 		return val; // unary + is a no-op
 	case Token_Sub: {
+		if (x64_is_f16(base_type(t))) {
+			// f16 is moved as a raw 2-byte integer, so x64_is_float is false — but negate must flip the
+			// SIGN BIT (XOR 0x8000), not two's-complement the bits. Was math.trunc_f16 wrong for every
+			// negative input (trunc uses -trunc_internal(-f)): NEG turned e.g. -8.07 into +Inf-ish garbage.
+			x64_value_to_reg(p, val, X64Reg_RAX);
+			x64_emit_xor_ri(&p->asm_, X64OpSize_16, X64Reg_RAX, 0x8000);
+			return x64v_reg(t, X64Reg_RAX);
+		}
 		if (x64_is_float(t)) {
 			x64_value_to_xmm(p, val, X64XmmReg_XMM0);
 			// XOR with sign bit to negate
@@ -3962,7 +4015,11 @@ gb_internal x64Value x64_emit_logical_binary_expr(x64Procedure *p, TokenKind op,
 // (not pre-built values like lb): x64 must build+spill the SET after the elem — keeping the set live in
 // a register made value_to_reg a no-op, degenerating the test to `mask & mask` (every elem read "in").
 gb_internal x64Value x64_build_binary_in(x64Procedure *p, Ast *left, Ast *right, TokenKind op) {
-	Type *rt = base_type(x64_typed(right->tav.type));
+	// type_deref: `k in m` also accepts a POINTER to the map/bit_set (auto-deref), e.g. `k in section`
+	// where `section := &m[k1]` is a ^map. base_type alone leaves rt as Type_Pointer → the Type_Map check
+	// below misses → the "unknown type" fallback returned false → duplicate keys never detected (was
+	// core:text/i18n's Duplicate_Key never firing). x64_map_addr_of handles the pointer operand itself.
+	Type *rt = base_type(x64_typed(type_deref(right->tav.type)));
 	if (rt != nullptr && rt->kind == Type_BitSet) {
 		Type     *it = bit_set_to_int(rt);
 		X64OpSize sz = x64_op_size_of(it);
@@ -6093,6 +6150,11 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 			return x64v_imm(e->type, iv);
 		}
 		case Entity_Variable: {
+			// bare `using`-promoted field as an rvalue (`channels * width`) → params^.field, not a global.
+			if (!x64_entity_is_local(p, e) && (e->flags & EntityFlag_Using)) {
+				x64Addr ua = x64_get_using_variable(p, e);
+				if (ua.type != nullptr) return x64_load_addr(p, ua);
+			}
 			x64Addr addr = x64_entity_is_local(p, e)
 			             ? x64_entity_addr(p, e)
 			             : x64addr(x64_global_mem(p, e), e->type);
@@ -7261,6 +7323,17 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 				}
 			}
 
+			// #optional_ok / #optional_allocator_error used as a SINGLE value (`!m[k]`, `x := f()`,
+			// `assertf(!get(...))`): the proc returns a tuple but expr->tav.type is just the first
+			// result. Reduce to field 0 here so EVERY consumer (unary/binary/arg/decl) sees the value,
+			// not the tuple. Was core:flags: `!bit_array.get(...)` read field 1 (ok=true) → `!true`=false
+			// → the "pos already assigned" assert fired. (A genuine multi-value use keeps tav.type a
+			// tuple — e.g. `a, b := f()` or a spread arg — so this doesn't fire there.)
+			if (ct->Proc.result_count > 1 && tav.type != nullptr && !is_type_tuple(tav.type) &&
+			    call_result.kind == x64Value_Mem) {
+				x64Addr f0 = x64_emit_tuple_ep(p, call_result, 0);
+				call_result = x64v_mem(f0.type, f0.mem);
+			}
 			return call_result;
 		}
 
@@ -7289,5 +7362,11 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 				                             : x64v_reg(ret_t, X64Reg_RAX);
 			}
 		}
-		return x64_reconstruct_call_result(p, ct, npartial, last_rt, needs_rbp, ret_local_off, partial_off, ind_rv);
+		x64Value ind_result = x64_reconstruct_call_result(p, ct, npartial, last_rt, needs_rbp, ret_local_off, partial_off, ind_rv);
+		if (ct->Proc.result_count > 1 && tav.type != nullptr && !is_type_tuple(tav.type) &&
+		    ind_result.kind == x64Value_Mem) {
+			x64Addr f0 = x64_emit_tuple_ep(p, ind_result, 0);
+			ind_result = x64v_mem(f0.type, f0.mem);
+		}
+		return ind_result;
 }

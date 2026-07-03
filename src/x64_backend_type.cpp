@@ -359,6 +359,21 @@ gb_internal void x64_box_any(x64Procedure *p, X64Mem dst, x64Value src, Type *sr
 		x64_emit_mov_mr(a, X64OpSize_64, idm0, X64Reg_RAX);    // id @8
 		return;
 	}
+	// If src is already an addressable lvalue (a Mem), point any.data at ITS address rather than
+	// copying into a fresh temp (mirrors LLVM lb_address_from_load_or_generate_local: reuse the load's
+	// pointer). This is REQUIRED for reflection that MUTATES through the any — reflect.set_union_variant_*
+	// writes the union tag via any.data; a copy would drop the write. Was core:crypto/hash panicking
+	// "uninitialized algorithm": init sets ctx._impl's tag through the boxed any, but the copy left the
+	// real union's tag 0 → update's `switch in` hit default. Only reuse a same-typed Mem (no conversion
+	// needed); a differing type still needs the store below to convert.
+	if (src.kind == x64Value_Mem && src.type != nullptr && are_types_identical(x64_typed(src.type), at)) {
+		x64_emit_lea(a, X64Reg_RAX, src.mem);
+		x64_emit_mov_mr(a, X64OpSize_64, dst, X64Reg_RAX);      // data @0 = &lvalue
+		X64Mem idm2 = dst; idm2.disp += 8;
+		x64_emit_mov_ri(a, X64OpSize_64, X64Reg_RAX, (i64)type_hash_canonical_type(at));
+		x64_emit_mov_mr(a, X64OpSize_64, idm2, X64Reg_RAX);     // id @8
+		return;
+	}
 	i32 val_off = x64_alloc_local(p, asz, aal);
 	// The `any` holds a POINTER to this boxed value, so the temp must outlive the statement —
 	// mark scope-lived (named_seq) so the per-statement temp reclaimer never reuses its slot.

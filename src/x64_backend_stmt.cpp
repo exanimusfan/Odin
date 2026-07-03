@@ -1255,11 +1255,18 @@ gb_internal void x64_build_type_switch_stmt(x64Procedure *p, Ast *node) {
 			for_array(ti, cc->list) {
 				Type *case_type = type_of_expr(cc->list[ti]);
 				if (case_type == nullptr) continue;
-				case_type = x64_typed(case_type);
+				// `case nil:` — check the RAW type: x64_typed maps untyped_nil→rawptr, which would make
+				// is_type_untyped_nil false, so the nil case fell to the union branch below and got
+				// `continue`d (no comparison emitted) → a nil union/any never matched `case nil`. Was
+				// core:flags set_option: `switch &e in error { case nil: register_field() }` never ran on
+				// a successful (nil) parse → positional tracking bit never set → positionals misassigned.
 				if (is_type_untyped_nil(case_type)) {
 					x64_emit_test_rr(&p->asm_, X64OpSize_64, X64Reg_RAX, X64Reg_RAX);
 					x64_emit_jcc(&p->asm_, X64Cc_E, case_lbls[ci]);
-				} else if (switch_kind == TypeSwitch_Any) {
+					continue;
+				}
+				case_type = x64_typed(case_type);
+				if (switch_kind == TypeSwitch_Any) {
 					u64 expected_id = type_hash_canonical_type(case_type);
 					x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RCX, (i64)expected_id);
 					x64_emit_cmp_rr(&p->asm_, X64OpSize_64, X64Reg_RAX, X64Reg_RCX);
