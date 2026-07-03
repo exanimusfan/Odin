@@ -539,6 +539,79 @@ gb_internal void x64_emit_equal_body(x64Procedure *p, Type *type, i32 res_off) {
 	x64_emit_jmp(&p->asm_, end);
 	x64_label_bind(&p->asm_, diff);
 
+	if (is_type_union(t) && !is_type_union_maybe_pointer(t)) {
+		// Compare the tags; if they differ the unions are unequal. If equal and nil (tag 0) they are
+		// equal. Otherwise dispatch on the tag and compare the active variant BY CONTENT — a flat byte
+		// compare would compare e.g. string headers (data pointers) instead of the string bytes.
+		bool no_nil = t->Union.kind == UnionType_no_nil;
+		i64 tag_sz = union_tag_size(t);
+		X64OpSize tsz = tag_sz <= 1 ? X64OpSize_8 : (tag_sz == 2 ? X64OpSize_16 : (tag_sz == 4 ? X64OpSize_32 : X64OpSize_64));
+		i32 tag_off = cast(i32)t->Union.variant_block_size;
+
+		x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_rbp_off(0)));
+		if (tsz == X64OpSize_64) {
+			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_R8, x64_mem(X64Reg_RAX, tag_off));
+		} else if (tsz == X64OpSize_32) {
+			x64_emit_mov_rm(&p->asm_, X64OpSize_32, X64Reg_R8, x64_mem(X64Reg_RAX, tag_off));
+		} else {
+			x64_emit_movzx_rm(&p->asm_, tsz, X64Reg_R8, x64_mem(X64Reg_RAX, tag_off));
+		}
+		i32 ltag = x64_alloc_local(p, 8, 8);
+		x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(ltag), X64Reg_R8);
+
+		x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_rbp_off(1)));
+		if (tsz == X64OpSize_64) {
+			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_R9, x64_mem(X64Reg_RAX, tag_off));
+		} else if (tsz == X64OpSize_32) {
+			x64_emit_mov_rm(&p->asm_, X64OpSize_32, X64Reg_R9, x64_mem(X64Reg_RAX, tag_off));
+		} else {
+			x64_emit_movzx_rm(&p->asm_, tsz, X64Reg_R9, x64_mem(X64Reg_RAX, tag_off));
+		}
+		x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_R8, x64_rbp_mem(ltag));
+		x64_emit_cmp_rr(&p->asm_, X64OpSize_64, X64Reg_R8, X64Reg_R9);
+		isize tags_ne = x64_label_alloc(&p->asm_);
+		x64_emit_jcc(&p->asm_, X64Cc_NE, tags_ne);
+
+		// tags equal → default equal (also the nil-tag answer).
+		x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RAX, 1);
+		x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(res_off), X64Reg_RAX);
+		if (!no_nil) {
+			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_R8, x64_rbp_mem(ltag));
+			x64_emit_test_rr(&p->asm_, X64OpSize_64, X64Reg_R8, X64Reg_R8);
+			x64_emit_jcc(&p->asm_, X64Cc_E, end);
+		}
+
+		for_array(i, t->Union.variants) {
+			Type *vt = t->Union.variants[i];
+			i64 tagv = no_nil ? i : (i + 1);
+			i64 vsz = type_size_of(vt); if (vsz <= 0) vsz = 1;
+			i64 val = type_align_of(vt); if (val <= 0) val = 1;
+			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_R8, x64_rbp_mem(ltag));
+			x64_emit_cmp_ri(&p->asm_, X64OpSize_64, X64Reg_R8, cast(i32)tagv);
+			isize nxt = x64_label_alloc(&p->asm_);
+			x64_emit_jcc(&p->asm_, X64Cc_NE, nxt);
+			i32 lv = x64_alloc_local(p, vsz, val);
+			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_rbp_off(0)));
+			x64_copy_mem(p, x64_rbp_mem(lv), x64_mem(X64Reg_RAX, 0), vsz);
+			i32 rv = x64_alloc_local(p, vsz, val);
+			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_rbp_off(1)));
+			x64_copy_mem(p, x64_rbp_mem(rv), x64_mem(X64Reg_RAX, 0), vsz);
+			x64Value eq = x64_emit_comp(p, Token_CmpEq, x64v_mem(vt, x64_rbp_mem(lv)), x64v_mem(vt, x64_rbp_mem(rv)));
+			x64_value_to_reg(p, eq, X64Reg_RAX);
+			x64_emit_movzx_rr(&p->asm_, X64OpSize_8, X64Reg_RAX, X64Reg_RAX);
+			x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(res_off), X64Reg_RAX);
+			x64_emit_jmp(&p->asm_, end);
+			x64_label_bind(&p->asm_, nxt);
+		}
+		x64_emit_jmp(&p->asm_, end);
+
+		x64_label_bind(&p->asm_, tags_ne);
+		x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RAX, 0);
+		x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(res_off), X64Reg_RAX);
+		x64_label_bind(&p->asm_, end);
+		return;
+	}
+
 	if (is_type_struct(t)) {
 		type_set_offsets(t);
 		// result = 1; for each field: if !equal → result = 0, jump end.

@@ -249,8 +249,11 @@ gb_internal x64Value x64_build_compound_lit(x64Procedure *p, Ast *lit, Type *typ
 // host-order immediate; pre-swap to the type's byte width so the little-endian store lays the bytes
 // out big-endian (mirrors x64_const_int_bytes' static path). e.g. net's IP6_Address = [8]u16be, whose
 // `{0x2620, …}` literals compared unequal to DNS-parsed addresses because the constants weren't swapped.
+// Uses core_type (not base_type) so an ENUM backed by a be integer is unwrapped to its backing type —
+// base_type leaves a Type_Enum (not is_type_integer) and the swap was skipped. Was png's
+// `Signature :: enum u64be` constant `.PNG` emitted native-order → every PNG failed Invalid_Signature.
 gb_internal i64 x64_endian_fix_const_int(Type *type, i64 v) {
-	Type *bt = type ? base_type(x64_typed(type)) : nullptr;
+	Type *bt = type ? core_type(x64_typed(type)) : nullptr;
 	if (bt == nullptr || !is_type_integer(bt) || is_type_endian_little(bt)) return v;
 	i64 n = type_size_of(bt); if (n <= 1 || n > 8) return v;
 	u64 in = (u64)v, out = 0;
@@ -788,8 +791,13 @@ gb_internal x64Value x64_build_compound_lit(x64Procedure *p, Ast *lit, Type *typ
 		i64   n   = gb_max((i64)cl->elems.count, (i64)cl->max_count);
 		i32 arr_off = x64_alloc_local(p, n * esz, eal);
 		// The slice header points INTO this backing (.data = &arr), so it must outlive the
-		// statement — mark scope-lived (named_seq) so the temp reclaimer never reuses it.
+		// statement — mark scope-lived (named_seq) so the temp reclaimer never reuses it. The header
+		// can also escape the ENCLOSING BLOCK (`key: []u8; if … { key = []u8{…} }; use key` — png
+		// truecolor tRNS keying), which named_seq does NOT guard: bump escape_floor so the block/if-scope
+		// reclaim leaves the backing alive too (mirrors the &local / tmp[:] escape fixes). Was tbrn2c08's
+		// tRNS key backing reclaimed at the if-exit → garbage key → every pixel mis-keyed.
 		p->named_seq++;
+		if (p->local_size > p->escape_floor) p->escape_floor = p->local_size;
 		x64_zero_mem(p, x64_rbp_mem(arr_off), n * esz);
 		x64_store_compound_elems(p, cl->elems, bt, et, esz, arr_off, 0);
 		if (p->is_startup) {
@@ -1702,7 +1710,22 @@ gb_internal x64Addr x64_build_addr(x64Procedure *p, Ast *expr) {
 		Type *dst_type = (ta->type != nullptr && !maybe_unwrap) ? type_of_expr(ta->type) : t;
 		if (dst_type == nullptr) dst_type = t ? t : t_int;
 		Type *dt = x64_typed(dst_type);
-		Type *src_bt = base_type(x64_typed(ta->expr->tav.type));
+		Type *expr_bt = base_type(x64_typed(ta->expr->tav.type));
+		// `ptr.(T)` auto-derefs: the union/any lives at *ptr, so its address is the pointer VALUE
+		// (x64_build_expr), not &ptr — x64_build_addr on a pointer variable returns the address of the
+		// pointer slot itself. Writing a >8B variant there overflows the stack. Was aes/ct64's
+		// init_impl `&ctx.(ct64.Context)` with ctx:^union → the 968-byte key schedule written to the
+		// wrong slot → stack smash → crypto test_aead SEGV. (Value operand keeps the &union path below.)
+		if (expr_bt != nullptr && expr_bt->kind == Type_Pointer) {
+			Type *pointee_bt = base_type(x64_typed(expr_bt->Pointer.elem));
+			x64Value pv = x64_build_expr(p, ta->expr);                // pointer value = &union / &any
+			x64_value_to_reg(p, pv, X64Reg_RAX);
+			if (pointee_bt != nullptr && is_type_any(pointee_bt)) {
+				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_mem(X64Reg_RAX, 0)); // any.data
+			}
+			return x64addr(x64_mem(X64Reg_RAX, 0), dt);
+		}
+		Type *src_bt = expr_bt;
 		if (src_bt != nullptr && is_type_any(src_bt)) {
 			x64Addr any_addr = x64_build_addr(p, ta->expr);           // &any
 			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, any_addr.mem); // RAX = any.data ptr
@@ -2275,7 +2298,13 @@ gb_internal x64Value x64_build_value_builtin(x64Procedure *p, Ast *expr, i32 id)
 
 	if (id == BuiltinProc_real || id == BuiltinProc_imag || id == BuiltinProc_jmag || id == BuiltinProc_kmag) {
 		Type *vt = base_type(x64_typed(ce->args[0]->tav.type));
-		Type *ft = x64_typed(expr->tav.type);
+		// The component ALWAYS has the operand's element float type (f64 for complex128). Do NOT use
+		// expr->tav.type: when the checker types `real(z)` in a wider target context (e.g. boxed into a
+		// union like cbor.Value, or converted to f32) tav.type is that target — labelling the raw float
+		// bytes as it skips the real conversion (union boxing → wrong tag; f32 cast → no truncation). Let
+		// the caller's emit_conv handle any further conversion. Was cbor's complex encode: real(z) boxed
+		// into cbor.Value got a garbage variant tag → the [2]Value array encoded to nothing.
+		Type *ft = x64_typed(base_complex_elem_type(vt));
 		i64 esz = type_size_of(base_complex_elem_type(vt));
 		bool cplx = is_type_complex(vt);
 		i32 idx = (id == BuiltinProc_real) ? (cplx ? 0 : 3) :  // complex: {real@0, imag@1}; quaternion @QuaternionLayout {x/imag@0,y/jmag@1,z/kmag@2,w/real@3}
@@ -2564,6 +2593,16 @@ gb_internal x64Value x64_emit_conv(x64Procedure *p, x64Value src, Type *from, Ty
 	}
 	if (x64_is_float(dst_base) && src_base != nullptr && x64_is_integer(src_base)) {
 		x64_value_to_reg(p, src, X64Reg_RAX);
+		// A big-endian integer source (u32be/i16be/…) is stored byte-reversed, so the raw load into RAX
+		// holds the swapped value — normalize to native BEFORE the width-extend + cvtsi2s*. The int→int
+		// path already did this; the float path did not → `f32(u32be)` reinterpreted the reversed bytes
+		// (THE png cHRM/gAMA garbage: f32(u32be 31270) → 6.455296e8 = 0x267A0000 = bswap of 0x00007A26).
+		if (is_type_different_to_arch_endianness(src_base)) {
+			i64 bsz = type_size_of(src_base);
+			if      (bsz == 2) x64_emit_bswap16(p, X64Reg_RAX);
+			else if (bsz == 4) x64_emit_bswap_r(&p->asm_, X64OpSize_32, X64Reg_RAX);
+			else if (bsz == 8) x64_emit_bswap_r(&p->asm_, X64OpSize_64, X64Reg_RAX);
+		}
 		// Re-extend RAX to a full 64 bits from the SOURCE integer width before cvtsi2s*, which reads
 		// the whole 64-bit reg. An upstream sub-64-bit op can leave stale high bits — e.g. `i8 & 15`
 		// compiles to `and al, 15`, masking AL but leaving the sign-extended upper bytes → for i8 -128
@@ -3653,6 +3692,23 @@ gb_internal x64Value x64_emit_matrix_transpose(x64Procedure *p, x64Value m, Type
 // (runtime string_*), aggregates (array/struct/union memory compare), and float/int/bit_set
 // scalar comparisons. Nil comparison is handled by the caller (AST-based, before this). Returns bool.
 gb_internal x64Value x64_emit_comp(x64Procedure *p, TokenKind op, x64Value lhs, x64Value rhs) {
+	// Operand coercion for `variant == union` / `union == variant` (e.g. `err == .EOF`, where `.EOF` is
+	// an enum variant of the union `err`): box the bare variant INTO the union so the union-equality path
+	// below compares two matching unions rather than reading a raw variant as a union (garbage tag).
+	// Mirrors lb_emit_comp's size heuristic, narrowed to the variant-of-union case (the only differing-
+	// type compare x64 needs to fix up; untyped-nil is handled by the caller).
+	if (lhs.type != nullptr && rhs.type != nullptr) {
+		Type *lb2 = base_type(lhs.type);
+		Type *rb2 = base_type(rhs.type);
+		if (lb2 != nullptr && rb2 != nullptr && lb2->kind != rb2->kind) {
+			if (lb2->kind == Type_Union && rb2->kind != Type_Union && union_is_variant_of(lb2, x64_typed(rhs.type))) {
+				rhs = x64_emit_conv(p, rhs, rhs.type, lhs.type);
+			} else if (rb2->kind == Type_Union && lb2->kind != Type_Union && union_is_variant_of(rb2, x64_typed(lhs.type))) {
+				lhs = x64_emit_conv(p, lhs, lhs.type, rhs.type);
+			}
+		}
+	}
+
 	Type *lt  = x64_typed(lhs.type ? lhs.type : t_int);
 	Type *lbt = base_type(lt);
 
@@ -3771,13 +3827,13 @@ gb_internal x64Value x64_emit_comp(x64Procedure *p, TokenKind op, x64Value lhs, 
 			x64_label_bind(&p->asm_, lbl_done);
 			return x64v_reg(t_bool, X64Reg_RAX);
 		}
-		// Non-simple comparable struct (string / other deep-compare fields): the bitwise path above
-		// can't be used — it would compare string HEADERS (ptr,len) not content. Call the per-type
-		// synth equal proc `__$equal$<hash>(&lhs, &rhs) -> bool` (field-wise; strings by content,
-		// mirrors lb's generated record-equality proc). Was json unmarshal_json's `product == original`
-		// comparing only the first field's bytes (a==b false, a==d true). Arrays/unions with
-		// deep-compare elems still fall through (rare; would need element-loop in x64_emit_equal_body).
-		if (lbt != nullptr && lbt->kind == Type_Struct && is_type_comparable(lt)) {
+		// Non-simple comparable struct/union (string / other deep-compare members): the bitwise path
+		// above can't be used — it would compare string HEADERS (ptr,len) not content. Call the per-type
+		// synth equal proc `__$equal$<hash>(&lhs, &rhs) -> bool` (field-wise / tag-then-variant; strings
+		// by content, mirrors lb's generated record-equality proc). Was json unmarshal_json's
+		// `product == original` comparing only the first field's bytes, and cbor's unmarshalled union
+		// `dest == src` comparing the variant's string pointer instead of its bytes.
+		if (lbt != nullptr && (lbt->kind == Type_Struct || lbt->kind == Type_Union) && is_type_comparable(lt)) {
 			if (lhs.kind != x64Value_Mem) lhs = x64_spill_value(p, lhs, lt);
 			if (rhs.kind != x64Value_Mem) rhs = x64_spill_value(p, rhs, lt);
 			i32 la = x64_alloc_local(p, 8, 8);
@@ -4159,6 +4215,17 @@ gb_internal x64Value x64_build_slice_expr(x64Procedure *p, Ast *expr) {
 			x64Addr src_addr = x64_build_addr(p, se->expr);
 			x64_emit_lea(&p->asm_, X64Reg_RAX, src_addr.mem);
 			x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(src_ea_off), X64Reg_RAX);
+			// Slicing an INLINE-storage aggregate (array/FCA) that lives in a stack slot yields a slice
+			// whose .data points INTO that slot. If the slice escapes the block it was made in (e.g.
+			// bound to an outer-scope var), the slot must outlive the block — mark scope-lived so
+			// block/if reclamation never reuses it (mirrors LLVM's entry-hoisted allocas, same as the
+			// `&Foo{}` escape). Slice/DA sources point at heap `.data`, not the slot, so they're exempt.
+			// Was aes/ghash's partial-block `tmp:[16]byte; src=tmp[:]`: tmp reclaimed at else-block exit
+			// → the following unaligned_load's temp reused the slot → 16-byte load read duplicated bytes.
+			if ((src_bt->kind == Type_Array || src_bt->kind == Type_FixedCapacityDynamicArray) &&
+			    src_addr.mem.base == X64Reg_RBP && !src_addr.mem.rip_rel) {
+				if (p->local_size > p->escape_floor) p->escape_floor = p->local_size;
+			}
 		}
 
 		Type *elem_t = t_u8;
@@ -4461,6 +4528,15 @@ gb_internal x64Value x64_build_unary_and(x64Procedure *p, Ast *expr) {
 	}
 	x64Addr addr = x64_build_addr(p, ue->expr);
 	x64_emit_lea(&p->asm_, X64Reg_RAX, addr.mem);
+	// The address of a stack-local lvalue may escape the block it was taken in (e.g. `p = &tmp` with p
+	// bound in an outer scope), so the slot must outlive that block — mark scope-lived so block/if
+	// reclamation never reuses it (mirrors the `&Foo{}` and `local[:]` escapes; LLVM hoists all allocas
+	// to entry so it never has this problem). Was crypto/blake2's final(finalize_clone=true): a local
+	// `tmp_ctx: T; clone(&tmp_ctx,ctx); ctx=&tmp_ctx` in an if-block, used after → tmp_ctx reclaimed →
+	// its slot reused → ctx.size read as garbage (136) → "slice 0:136 out of range 0..<32" + wrong hash.
+	if (addr.mem.base == X64Reg_RBP && !addr.mem.rip_rel) {
+		if (p->local_size > p->escape_floor) p->escape_floor = p->local_size;
+	}
 	return x64v_reg(alloc_type_pointer(addr.type), X64Reg_RAX);
 }
 
@@ -4771,6 +4847,90 @@ gb_internal x64Value x64_try_llvm_f16_intrinsic(x64Procedure *p, AstCallExpr *ce
 	Type *ftype = alloc_type_proc_from_types(ptypes, (unsigned)argc, t_f32, false, ProcCC_CDecl);
 	x64Value r = x64_emit_call(p, f32sym, ftype, fargs, argc); // f32 in XMM0
 	return x64_emit_conv(p, r, t_f32, result_type);            // f32 → f16
+}
+
+gb_internal bool x64_str_eq_c(String s, char const *c) {
+	String l = make_string_c(c);
+	return s.len == l.len && gb_strncmp((char const *)s.text, c, s.len) == 0;
+}
+
+// Direct x86 SIMD intrinsics that LLVM lowers to hardware instructions (foreign llvm.x86.* procs). The
+// x64 backend has no LLVM, so an un-mapped foreign call no-ops to 0 (→ zeroed crypto output). Emit the
+// real instruction instead. Covers the AES-GCM hardware path (core:crypto/_aes/hw): AES-NI, PCLMULQDQ,
+// PSHUFB, and the 64-bit-lane immediate shifts of the GHASH reduction. Each operand is a 16-byte
+// __m128i in a stack slot: spill args, load into XMM, emit, store the XMM0 result. None = not ours.
+gb_internal x64Value x64_try_x86_simd_intrinsic(x64Procedure *p, AstCallExpr *ce, String fl, Type *result_type) {
+	X64Assembler *a = &p->asm_;
+	enum { S_RR=1, S_R, S_RRI, S_KEYGEN, S_SHL, S_SHR, S_RNDS2 };
+	enum { W_AESENC=1, W_AESENCLAST, W_AESDEC, W_AESDECLAST, W_PSHUFB, W_SHA256MSG1, W_SHA256MSG2 };
+	int shape = 0, which = 0;
+
+	if      (x64_str_eq_c(fl, "llvm.x86.aesni.aesenc"))          { shape = S_RR; which = W_AESENC; }
+	else if (x64_str_eq_c(fl, "llvm.x86.aesni.aesenclast"))      { shape = S_RR; which = W_AESENCLAST; }
+	else if (x64_str_eq_c(fl, "llvm.x86.aesni.aesdec"))          { shape = S_RR; which = W_AESDEC; }
+	else if (x64_str_eq_c(fl, "llvm.x86.aesni.aesdeclast"))      { shape = S_RR; which = W_AESDECLAST; }
+	else if (x64_str_eq_c(fl, "llvm.x86.ssse3.pshuf.b.128"))     { shape = S_RR; which = W_PSHUFB; }
+	else if (x64_str_eq_c(fl, "llvm.x86.sha256msg1"))            { shape = S_RR; which = W_SHA256MSG1; }
+	else if (x64_str_eq_c(fl, "llvm.x86.sha256msg2"))            { shape = S_RR; which = W_SHA256MSG2; }
+	else if (x64_str_eq_c(fl, "llvm.x86.aesni.aesimc"))          { shape = S_R; }
+	else if (x64_str_eq_c(fl, "llvm.x86.aesni.aeskeygenassist")) { shape = S_KEYGEN; }
+	else if (x64_str_eq_c(fl, "llvm.x86.pclmulqdq"))             { shape = S_RRI; }
+	else if (x64_str_eq_c(fl, "llvm.x86.sha256rnds2"))           { shape = S_RNDS2; }
+	else if (x64_str_eq_c(fl, "llvm.x86.sse2.pslli.q"))          { shape = S_SHL; }
+	else if (x64_str_eq_c(fl, "llvm.x86.sse2.psrli.q"))          { shape = S_SHR; }
+	else return x64v_none();
+
+	Type *rt  = x64_typed(result_type);
+	i32   res = x64_alloc_local(p, gb_max(type_size_of(rt), (i64)16), gb_max(type_align_of(rt), (i64)16));
+	x64Value a0 = x64_spill_value(p, x64_build_expr(p, ce->args[0]), x64_typed(ce->args[0]->tav.type));
+
+	switch (shape) {
+	case S_RR:
+	case S_RRI: {
+		x64Value a1 = x64_spill_value(p, x64_build_expr(p, ce->args[1]), x64_typed(ce->args[1]->tav.type));
+		x64_emit_movups_rm(a, X64XmmReg_XMM0, a0.mem);
+		x64_emit_movups_rm(a, X64XmmReg_XMM1, a1.mem);
+		if (shape == S_RRI) {
+			x64_emit_pclmulqdq(a, X64XmmReg_XMM0, X64XmmReg_XMM1, (u8)exact_value_to_i64(ce->args[2]->tav.value));
+		} else switch (which) {
+		case W_AESENC:      x64_emit_aesenc    (a, X64XmmReg_XMM0, X64XmmReg_XMM1); break;
+		case W_AESENCLAST:  x64_emit_aesenclast(a, X64XmmReg_XMM0, X64XmmReg_XMM1); break;
+		case W_AESDEC:      x64_emit_aesdec    (a, X64XmmReg_XMM0, X64XmmReg_XMM1); break;
+		case W_AESDECLAST:  x64_emit_aesdeclast(a, X64XmmReg_XMM0, X64XmmReg_XMM1); break;
+		case W_PSHUFB:      x64_emit_pshufb    (a, X64XmmReg_XMM0, X64XmmReg_XMM1); break;
+		case W_SHA256MSG1:  x64_emit_sha256msg1(a, X64XmmReg_XMM0, X64XmmReg_XMM1); break;
+		case W_SHA256MSG2:  x64_emit_sha256msg2(a, X64XmmReg_XMM0, X64XmmReg_XMM1); break;
+		}
+		break;
+	}
+	case S_RNDS2: { // SHA256RNDS2 XMM1 = f(XMM1=a, XMM2=b, XMM0=k); the msg operand k is IMPLICIT XMM0
+		x64Value a1 = x64_spill_value(p, x64_build_expr(p, ce->args[1]), x64_typed(ce->args[1]->tav.type));
+		x64Value a2 = x64_spill_value(p, x64_build_expr(p, ce->args[2]), x64_typed(ce->args[2]->tav.type));
+		x64_emit_movups_rm(a, X64XmmReg_XMM1, a0.mem);
+		x64_emit_movups_rm(a, X64XmmReg_XMM2, a1.mem);
+		x64_emit_movups_rm(a, X64XmmReg_XMM0, a2.mem);
+		x64_emit_sha256rnds2(a, X64XmmReg_XMM1, X64XmmReg_XMM2);
+		x64_emit_movups_mr(a, x64_rbp_mem(res), X64XmmReg_XMM1);
+		return x64v_mem(rt, x64_rbp_mem(res));
+	}
+	case S_R: // AESIMC XMM0 = f(XMM1); dst fully overwritten
+		x64_emit_movups_rm(a, X64XmmReg_XMM1, a0.mem);
+		x64_emit_aesimc(a, X64XmmReg_XMM0, X64XmmReg_XMM1);
+		break;
+	case S_KEYGEN: // AESKEYGENASSIST XMM0 = f(XMM1, imm)
+		x64_emit_movups_rm(a, X64XmmReg_XMM1, a0.mem);
+		x64_emit_aeskeygenassist(a, X64XmmReg_XMM0, X64XmmReg_XMM1, (u8)exact_value_to_i64(ce->args[1]->tav.value));
+		break;
+	case S_SHL:
+	case S_SHR: // PSLLQ/PSRLQ XMM0 by imm, per 64-bit lane
+		x64_emit_movups_rm(a, X64XmmReg_XMM0, a0.mem);
+		if (shape == S_SHL) x64_emit_psllq_i(a, X64XmmReg_XMM0, (u8)exact_value_to_i64(ce->args[1]->tav.value));
+		else                x64_emit_psrlq_i(a, X64XmmReg_XMM0, (u8)exact_value_to_i64(ce->args[1]->tav.value));
+		break;
+	}
+
+	x64_emit_movups_mr(a, x64_rbp_mem(res), X64XmmReg_XMM0);
+	return x64v_mem(rt, x64_rbp_mem(res));
 }
 
 // AVX2 (256-bit YMM) SIMD codegen is gated on the SAME target-feature query the LLVM backend uses
@@ -6243,6 +6403,18 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 	}
 
 	// ── Compile-time constants ──────────────────────────────────────────
+	// A constant type-conversion call `T(x)` (e.g. `My_Distinct("hi")`) must NOT be folded here: the
+	// generic const path only sees tav.type (which the checker widens to the assignment target, e.g. a
+	// union), losing the NAMED cast type → a distinct/named constant boxed into a union picked the wrong
+	// variant tag. Route it to x64_build_call_expr, which converts to the explicit ce->proc type so the
+	// outer store boxes the right variant. Scalar conversions (int(5)) build to the identical value.
+	{
+		Ast *ue = unparen_expr(expr);
+		if (tav.mode == Addressing_Constant && ue->kind == Ast_CallExpr &&
+		    ue->CallExpr.proc != nullptr && ue->CallExpr.proc->tav.mode == Addressing_Type) {
+			return x64_build_call_expr(p, expr);
+		}
+	}
 	if (tav.mode == Addressing_Constant && tav.type != nullptr) {
 		Type    *ct = base_type(tav.type);
 		ExactValue ev = tav.value;
@@ -6792,7 +6964,12 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 		if (ce->proc->tav.mode == Addressing_Type) {
 			if (ce->args.count >= 1) {
 				x64Value cv = x64_build_expr(p, ce->args[0]);
-				return x64_emit_conv(p, cv, ce->args[0]->tav.type, tav.type);
+				// Convert to the EXPLICITLY NAMED cast type (ce->proc), NOT expr->tav.type: the checker
+				// widens the call's type to the assignment target, so a `Distinct(x)` boxed into a union
+				// (e.g. `My_Union = My_Distinct("hi")`) had tav.type = the union → it converted string→union
+				// directly and boxed the value as the WRONG variant (string, not My_Distinct → tag off by
+				// one). Producing the named type here lets the outer store box it with the right variant.
+				return x64_emit_conv(p, cv, ce->args[0]->tav.type, ce->proc->tav.type);
 			}
 			return x64v_none();
 		}
@@ -6887,6 +7064,33 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 				for (Entity *ie : cinfo->init_procedures) x64_call_no_arg(p, ie);
 				x64_call_no_arg(p, cinfo->entry_point);
 				return x64v_none();
+			}
+			// `#location()` / `#location(entity)`: a BuiltinProc_DIRECTIVE whose proc is a BasicDirective
+			// named "location" — returns a runtime.Source_Code_Location of the CALL SITE (or the arg
+			// entity's decl). x64 had no case → fell through to a zeroed location {file="",line=0,col=0,
+			// proc=""}. Was every core:testing expect_assert_from failing (location never matched). Mirrors
+			// LLVM lb_build_builtin_proc DIRECTIVE name=="location". x64_build_source_code_location already
+			// exists (the #caller_location default-param fix).
+			{
+				Ast *proc_ast = (ce->proc != nullptr) ? unparen_expr(ce->proc) : nullptr;
+				if (proc_ast != nullptr && proc_ast->kind == Ast_BasicDirective &&
+				    proc_ast->BasicDirective.name.string == str_lit("location")) {
+					String proc_name = (p->entity != nullptr) ? p->entity->token.string : str_lit("");
+					TokenPos pos = ast_token(ce->proc).pos;
+					if (ce->args.count > 0) {
+						Ast *ident = unselector_expr(ce->args[0]);
+						if (ident != nullptr && ident->kind == Ast_Ident) {
+							Entity *e = entity_of_node(ident);
+							if (e != nullptr) {
+								DeclInfo *parent_proc_decl = e->parent_proc_decl.load(std::memory_order_relaxed);
+								proc_name = (parent_proc_decl != nullptr && parent_proc_decl->entity != nullptr)
+								          ? parent_proc_decl->entity.load()->token.string : str_lit("");
+								pos = e->token.pos;
+							}
+						}
+					}
+					return x64_build_source_code_location(p, proc_name, pos);
+				}
 			}
 			if (be != nullptr && be->kind == Entity_Builtin &&
 			    be->Builtin.id == BuiltinProc_type_info_of && ce->args.count >= 1) {
@@ -7275,6 +7479,10 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 			if (callee_ent->Procedure.is_foreign) {
 				String fl = callee_ent->Procedure.link_name;
 				if (fl.len >= 5 && gb_strncmp((char const *)fl.text, "llvm.", 5) == 0) {
+					// Direct x86 SIMD intrinsics (llvm.x86.*: AES-NI, PCLMULQDQ, PSHUFB, lane shifts) →
+					// emit the hardware instruction (was: no-op → 0, zeroed hardware crypto output).
+					x64Value xr = x64_try_x86_simd_intrinsic(p, ce, fl, x64_typed(tav.type));
+					if (xr.kind != x64Value_None) return xr;
 					// LLVM math intrinsics → C-runtime symbol (sin/cos/pow/exp/fma/…). f16 variants
 					// have no ucrt symbol → compute via f32 promotion; other unmapped llvm.* no-op (0).
 					callee_sym = x64_map_llvm_math_intrinsic(fl);

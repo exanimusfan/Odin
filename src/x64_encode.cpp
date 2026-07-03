@@ -1158,6 +1158,50 @@ gb_internal void x64_emit_psrldq(X64Assembler *a, X64XmmReg d, u8 imm) {
 	x64_enc_b(a, imm);
 }
 
+// PSLLQ/PSRLQ xmm, imm8 — shift each 64-bit lane left/right by imm bits (zero-fill). 66 0F 73 /6 ib
+// (shl) and /2 ib (shr). Used by the AES-GCM GHASH GF(2^128) reduction (llvm.x86.sse2.pslli.q/psrli.q).
+gb_internal void x64_emit_psllq_i(X64Assembler *a, X64XmmReg d, u8 imm) {
+	x64_enc_b(a, 0x66u);
+	if (d >= 8) x64_enc_b(a, 0x41u);
+	x64_enc_b(a, 0x0Fu); x64_enc_b(a, 0x73u);
+	x64_enc_b(a, cast(u8)(0xC0u | (6u << 3) | (d & 7u))); // /6
+	x64_enc_b(a, imm);
+}
+gb_internal void x64_emit_psrlq_i(X64Assembler *a, X64XmmReg d, u8 imm) {
+	x64_enc_b(a, 0x66u);
+	if (d >= 8) x64_enc_b(a, 0x41u);
+	x64_enc_b(a, 0x0Fu); x64_enc_b(a, 0x73u);
+	x64_enc_b(a, cast(u8)(0xC0u | (2u << 3) | (d & 7u))); // /2
+	x64_enc_b(a, imm);
+}
+
+// AES-NI + PSHUFB (66 0F 38 /r): AESENC DC, AESENCLAST DD, AESDEC DE, AESDECLAST DF, AESIMC DB,
+// PSHUFB 00. dst = f(dst, src). Direct legacy encodings (target features are sse..aes, no AVX).
+gb_internal void x64_emit_aesenc     (X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse38_rr(a, 0x66u, 0xDCu, d, s); }
+gb_internal void x64_emit_aesenclast (X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse38_rr(a, 0x66u, 0xDDu, d, s); }
+gb_internal void x64_emit_aesdec     (X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse38_rr(a, 0x66u, 0xDEu, d, s); }
+gb_internal void x64_emit_aesdeclast (X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse38_rr(a, 0x66u, 0xDFu, d, s); }
+gb_internal void x64_emit_aesimc     (X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse38_rr(a, 0x66u, 0xDBu, d, s); }
+gb_internal void x64_emit_pshufb     (X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse38_rr(a, 0x66u, 0x00u, d, s); }
+
+// 3-byte (66 0F 3A op /r ib) with immediate: AESKEYGENASSIST DF, PCLMULQDQ 44. dst = f(src, imm).
+gb_internal void x64_enc_sse3a_rr_i(X64Assembler *a, u8 op, X64XmmReg dst, X64XmmReg src, u8 imm) {
+	x64_enc_b(a, 0x66u);
+	bool R = (dst >= 8), B = (src >= 8);
+	if (R || B) x64_enc_b(a, cast(u8)(0x40u | (R ? 0x04u : 0u) | (B ? 0x01u : 0u)));
+	x64_enc_b(a, 0x0Fu); x64_enc_b(a, 0x3Au); x64_enc_b(a, op);
+	x64_enc_b(a, cast(u8)(0xC0u | ((dst & 7u) << 3) | (src & 7u)));
+	x64_enc_b(a, imm);
+}
+gb_internal void x64_emit_aeskeygenassist(X64Assembler *a, X64XmmReg d, X64XmmReg s, u8 imm) { x64_enc_sse3a_rr_i(a, 0xDFu, d, s, imm); }
+gb_internal void x64_emit_pclmulqdq      (X64Assembler *a, X64XmmReg d, X64XmmReg s, u8 imm) { x64_enc_sse3a_rr_i(a, 0x44u, d, s, imm); }
+
+// SHA-NI (NP 0F 38 /r — NO 66 prefix): SHA256RNDS2 CB (msg operand is IMPLICIT XMM0), SHA256MSG1 CC,
+// SHA256MSG2 CD. dst = f(dst, src[, XMM0]).
+gb_internal void x64_emit_sha256rnds2(X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse38_rr(a, 0x00u, 0xCBu, d, s); }
+gb_internal void x64_emit_sha256msg1 (X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse38_rr(a, 0x00u, 0xCCu, d, s); }
+gb_internal void x64_emit_sha256msg2 (X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse38_rr(a, 0x00u, 0xCDu, d, s); }
+
 gb_internal void x64_emit_addsd(X64Assembler *a, X64XmmReg dst, X64XmmReg src)  { x64_enc_sse_rr(a, 0xF2u, 0x58u, dst, src); }
 gb_internal void x64_emit_subsd(X64Assembler *a, X64XmmReg dst, X64XmmReg src)  { x64_enc_sse_rr(a, 0xF2u, 0x5Cu, dst, src); }
 gb_internal void x64_emit_mulsd(X64Assembler *a, X64XmmReg dst, X64XmmReg src)  { x64_enc_sse_rr(a, 0xF2u, 0x59u, dst, src); }

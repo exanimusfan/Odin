@@ -730,10 +730,20 @@ gb_internal void x64_build_range_string(x64Procedure *p, X64RangeStmt *c) {
 	AstPackage *rt = p->module->gen->info->runtime_package;
 	Entity *de = (rt != nullptr) ? scope_lookup_current(rt->scope, string_interner_insert(decode)) : nullptr;
 
-	x64Addr str_addr = x64_build_addr(p, c->iter_expr);
+	// A `^string` operand (`for r in ps`, ps: ^string) ranges over the pointee: the string header's
+	// address is the pointer VALUE, not &pointer (mirrors x64_range_base_to_rax's via_ptr path). Was
+	// core:strings.fields_iterator's `for r,offset in s` (s: ^string) reading {data,len} from &s →
+	// garbage len → runaway loop + out-of-bounds field slices. THE core:image/netpbm PBM/PFM load bug.
+	Type *iter_raw = c->iter_expr->tav.type ? base_type(x64_typed(c->iter_expr->tav.type)) : nullptr;
+	bool via_ptr = iter_raw != nullptr && iter_raw->kind == Type_Pointer;
 	i32 data_off  = x64_alloc_local(p, 8, 8);
 	i32 len_off   = x64_alloc_local(p, 8, 8);
-	x64_emit_lea(&p->asm_, X64Reg_RAX, str_addr.mem);
+	if (via_ptr) {
+		x64_value_to_reg(p, x64_build_expr(p, c->iter_expr), X64Reg_RAX); // RAX = pointer value = &string
+	} else {
+		x64Addr str_addr = x64_build_addr(p, c->iter_expr);
+		x64_emit_lea(&p->asm_, X64Reg_RAX, str_addr.mem);
+	}
 	x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RCX, x64_mem(X64Reg_RAX, 0));
 	x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(data_off), X64Reg_RCX);
 	x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RCX, x64_mem(X64Reg_RAX, 8));
@@ -866,7 +876,12 @@ gb_internal void x64_range_base_to_rax(x64Procedure *p, Ast *iter_expr, Type *it
 
 gb_internal void x64_build_range_stmt(x64Procedure *p, Ast *stmt) {
 	ast_node(rs, RangeStmt, stmt);
-		Ast  *iter_expr = rs->expr;
+		// Strip parens: a `ParenExpr` node carries NO tav.type (the checker records the type on the
+		// inner operand), so reading `rs->expr->tav.type` on `for x in (s)` / `for x in ([]T{…})` gave
+		// nullptr → iter_type nullptr → the body was SKIPPED entirely (0 iterations, for BOTH slices and
+		// arrays). The value/addr builders unparen internally; the TYPE reads below did not. Mirrors LLVM
+		// lb_build_range_stmt using type_of_expr(expr) (which sees through parens).
+		Ast  *iter_expr = unparen_expr(rs->expr);
 		// A pointer source (`for x in p`, p: ^[]T/^[N]T/^map) ranges over the pointee: deref for the
 		// kind dispatch, remember via_ptr so the base address is the pointer VALUE (mirrors LLVM's
 		// base_type(type_deref(expr_type)) + is_type_pointer load).
