@@ -1311,7 +1311,8 @@ gb_internal void x64_emit_type_table(x64Generator *gen) {
 		}
 
 		// Struct variant: patch the five array pointers (vd+sf_*) with ADDR64 relocs.
-		if (bt->kind == Type_Struct) {
+		// !is_named: a Named-over-struct slot holds the Named variant, not these arrays (see the Map note).
+		if (!is_named && bt->kind == Type_Struct) {
 			u32 vbase = rdata_off + (u32)off_var;
 			if (a_types.len)   coff_reloc_add(rm->rdata, vbase + (u32)sf_types,   a_types,   COFF_REL_ADDR64);
 			if (a_names.len)   coff_reloc_add(rm->rdata, vbase + (u32)sf_names,   a_names,   COFF_REL_ADDR64);
@@ -1336,7 +1337,7 @@ gb_internal void x64_emit_type_table(x64Generator *gen) {
 		}
 
 		// Enum variant: base (@off_var+0) → underlying int type; names/values data ptrs.
-		if (bt->kind == Type_Enum) {
+		if (!is_named && bt->kind == Type_Enum) {
 			i64 en_off = 8, ev_off = 24;
 			if (t_type_info_enum != nullptr) {
 				Type *tie = base_type(t_type_info_enum);
@@ -1356,7 +1357,8 @@ gb_internal void x64_emit_type_table(x64Generator *gen) {
 		}
 
 		// Union variant: variants.data ptr + tag_type ptr.
-		if (bt->kind == Type_Union) {
+		// !is_named: the tag_type reloc reads bt directly and would land on the Named pkg@24.
+		if (!is_named && bt->kind == Type_Union) {
 			i64 ov = 0, ott = 24;
 			if (t_type_info_union != nullptr) {
 				Type *tiu = base_type(t_type_info_union);
@@ -1378,7 +1380,8 @@ gb_internal void x64_emit_type_table(x64Generator *gen) {
 		}
 
 		// Bit_Field variant: backing_type (@+0) + names/types/bit_sizes/bit_offsets/tags ptrs.
-		if (bt->kind == Type_BitField) {
+		// !is_named: the backing reloc reads bt directly and would land on the Named name.data@0.
+		if (!is_named && bt->kind == Type_BitField) {
 			i64 o_nm=8, o_ty=16, o_bs=24, o_bo=32, o_tg=40;
 			if (t_type_info_bit_field != nullptr) {
 				Type *tibf = base_type(t_type_info_bit_field);
@@ -1407,7 +1410,11 @@ gb_internal void x64_emit_type_table(x64Generator *gen) {
 		// DOES use it — core:flags calls `type_info.map_info.key_hasher(...)` through the reflected
 		// type_info → null-call segfault (map[cstring]cstring test hung). Point it at the same
 		// {ks,vs,key_hasher,key_equal} Map_Info global the compiled map ops use.
-		if (bt->kind == Type_Map) {
+		// !is_named: a `distinct map` (json.Object) emits the Named variant (name/base/pkg); running
+		// this block on that slot would write map key/value/map_info OVER the Named fields — map_info@16
+		// collides with Named base@16 → a garbage base → type_info_base loops onto null → SEGV. The
+		// underlying map has its OWN slot (pointed to by Named base) with these fields. Was test_issue_2694.
+		if (!is_named && bt->kind == Type_Map) {
 			i64 ok2 = 0, ov2 = 8, om2 = 16;
 			if (t_type_info_map != nullptr) {
 				Type *tim = base_type(t_type_info_map);

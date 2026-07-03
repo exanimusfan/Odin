@@ -85,6 +85,42 @@ gb_internal x64Value x64_const_cstring_ptr(x64Procedure *p, String sv, bool wide
 	return x64v_reg(result_type, X64Reg_RAX);
 }
 
+// A constant `string16` ({data: [^]u16, len: int}, len in UTF-16 UNITS). UTF-16-encode the UTF-8
+// source, intern the u16 bytes, and build a 16-byte header — vs x64_const_string which would emit the
+// raw UTF-8 bytes with len in bytes (the string16 constant would then read UTF-8 as UTF-16). Was
+// test_issue_6101: `string16("猫")` gave len=3 / u[0]=0x8CE7 (UTF-8 E7 8C) not len=1 / 0x732B.
+gb_internal x64Value x64_const_string16(x64Procedure *p, String sv) {
+	x64Module *m = p->module;
+	i32 str_off = x64_alloc_local(p, 16, 8);
+	isize n = 0;
+	if (sv.len > 0) {
+		u16 *buf = gb_alloc_array(temporary_allocator(), u16, sv.len + 1);
+		u8 const *text = sv.text; isize len = sv.len;
+		while (len > 0) {
+			Rune  r = 0;
+			isize w = gb_utf8_decode(text, len, &r);
+			text += w; len -= w;
+			if ((0 <= r && r < 0xd800) || (0xe000 <= r && r < 0x10000)) {
+				buf[n++] = (u16)r;
+			} else if (0x10000 <= r && r <= 0x10ffff) {
+				Rune rr = r - 0x10000;
+				buf[n++] = (u16)(0xd800 + ((rr >> 10) & 0x3ff));
+				buf[n++] = (u16)(0xdc00 + (rr & 0x3ff));
+			} else {
+				buf[n++] = 0xfffd;
+			}
+		}
+		String sym = x64_const_intern_string(m, make_string((u8 const *)buf, n * 2));
+		x64_emit_lea_sym(&p->asm_, X64Reg_RAX, sym);
+	} else {
+		x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RAX, 0);
+	}
+	x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(str_off), X64Reg_RAX);
+	x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RAX, (i64)n);
+	x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(str_off + 8), X64Reg_RAX);
+	return x64v_mem(t_string16, x64_rbp_mem(str_off));
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Context (Odin's implicit `context`)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -285,10 +321,12 @@ gb_internal x64Value x64_handle_param_value(x64Procedure *p, Type *ptype,
 		case ExactValue_String:
 			if (is_type_cstring(bt))   return x64_const_cstring_ptr(p, ev.value_string, false, t);
 			if (is_type_cstring16(bt)) return x64_const_cstring_ptr(p, ev.value_string, true,  t);
+			if (is_type_string16(bt))  return x64_const_string16(p, ev.value_string);
 			return x64_const_string(p, ev.value_string);
 		case ExactValue_Procedure: {
 			Entity *pe = entity_from_expr(ev.value_procedure);
 			if (pe != nullptr && pe->kind == Entity_Procedure) {
+				if (!pe->Procedure.is_foreign && pe->min_dep_count.load(std::memory_order_relaxed) == 0) x64_enqueue_oncall(p, pe);
 				x64_emit_lea_sym(&p->asm_, X64Reg_RAX, x64_get_entity_name(pe));
 				return x64v_reg(t, X64Reg_RAX);
 			}
@@ -754,13 +792,30 @@ gb_internal x64Value x64_build_compound_lit(x64Procedure *p, Ast *lit, Type *typ
 				x64_store_compound_field(p, x64_mem(X64Reg_RBP, res_off + (i32)foff), ftype, fval, fv->value->tav.type);
 			}
 		} else {
-			isize n = gb_min((isize)cl->elems.count, (isize)bt->Struct.fields.count);
-			for (isize ei = 0; ei < n; ei++) {
-				if (cl->elems[ei] == nullptr) continue;
-				Entity *fe   = bt->Struct.fields[ei];
-				i64    foff  = bt->Struct.offsets[ei];
+			// Positional. A multi-return call element (`S{f(), x}`, f → N values) SPREADS across N
+			// consecutive fields, so advance a field cursor by the element's value count — not 1 per
+			// element. Was test_issue_6853: `test_s{case0(), 3, 4, 5}` (case0→(1,2)) wrote a=1 then
+			// b,c,d=3,4,5 and e=0 (one field per element) instead of a,b=1,2 / c,d,e=3,4,5. Mirrors LLVM's
+			// multi-value spread in compound literals.
+			isize fc = 0;
+			for (isize ei = 0; ei < cl->elems.count && fc < bt->Struct.fields.count; ei++) {
+				if (cl->elems[ei] == nullptr) { fc++; continue; }
+				Type *et = cl->elems[ei]->tav.type ? base_type(x64_typed(cl->elems[ei]->tav.type)) : nullptr;
 				x64Value fval = x64_build_expr(p, cl->elems[ei]);
-				x64_store_compound_field(p, x64_mem(X64Reg_RBP, res_off + (i32)foff), fe->type, fval, cl->elems[ei]->tav.type);
+				if (et != nullptr && et->kind == Type_Tuple) {
+					x64Value tup = x64_spill_value(p, fval, x64_typed(cl->elems[ei]->tav.type));
+					for (isize ti = 0; ti < et->Tuple.variables.count && fc < bt->Struct.fields.count; ti++, fc++) {
+						Entity *fe  = bt->Struct.fields[fc];
+						x64Addr src = x64_emit_tuple_ep(p, tup, (i32)ti);
+						x64_store_compound_field(p, x64_mem(X64Reg_RBP, res_off + (i32)bt->Struct.offsets[fc]),
+						                         fe->type, x64v_mem(src.type, src.mem), et->Tuple.variables[ti]->type);
+					}
+				} else {
+					Entity *fe = bt->Struct.fields[fc];
+					x64_store_compound_field(p, x64_mem(X64Reg_RBP, res_off + (i32)bt->Struct.offsets[fc]),
+					                         fe->type, fval, cl->elems[ei]->tav.type);
+					fc++;
+				}
 			}
 		}
 	} else if (bt->kind == Type_Array) {
@@ -2239,6 +2294,7 @@ gb_internal bool x64_is_value_builtin(i32 id) {
 	case BuiltinProc_real: case BuiltinProc_imag: case BuiltinProc_jmag: case BuiltinProc_kmag:
 	case BuiltinProc_conj: case BuiltinProc_swizzle: case BuiltinProc_expand_values:
 	case BuiltinProc_transpose: case BuiltinProc_hadamard_product:
+	case BuiltinProc_matrix_flatten:
 		return true;
 	}
 	return false;
@@ -2269,6 +2325,19 @@ gb_internal x64Value x64_build_value_builtin(x64Procedure *p, Ast *expr, i32 id)
 		x64Value a = x64_build_expr(p, ce->args[0]);
 		x64Value b = x64_build_expr(p, ce->args[1]);
 		return x64_emit_arith_matrix(p, Token_Mul, a, b, x64_typed(expr->tav.type), /*component_wise*/true);
+	}
+	// matrix_flatten(m) → the matrix's raw internal storage reinterpreted as a [R*C]T array (same byte
+	// size, incl. any column padding); a straight copy (mirrors lb_emit_matrix_flatten memcpy). Was
+	// unimplemented → 0 (test_issue_4210 flatten reads all zero; the literal store itself was correct).
+	if (id == BuiltinProc_matrix_flatten) {
+		Type *rt = x64_typed(expr->tav.type);
+		x64Value m = x64_build_expr(p, ce->args[0]);
+		i64 sz = x64_type_size(rt); if (sz <= 0) sz = 8;
+		i64 al = x64_type_align(rt); if (al <= 0) al = 8;
+		x64Value ms = x64_spill_value(p, m, m.type ? m.type : rt);
+		i32 off = x64_alloc_local(p, sz, al);
+		x64_copy_fixed(p, x64_rbp_mem(off), ms.mem, sz);
+		return x64v_mem(rt, x64_rbp_mem(off));
 	}
 
 	if (id == BuiltinProc_complex) {
@@ -6424,6 +6493,26 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 		// shares the builder with the non-constant CompoundLit case).
 		if (ev.kind == ExactValue_Compound) {
 			if (ev.value_compound == nullptr) return x64v_none();
+			// AGGREGATE array broadcast: `[N]E : E{…}` — the constant value is a single ELEMENT compound
+			// (its type is E, not [N]E), so replicate it to every lane. The scalar broadcast below
+			// (Float/Integer) doesn't fire for a struct element, and build_compound_lit would treat the
+			// struct's fields as array[0]'s elements → only lane 0 set. Was test_issue_4364 (`[4]Struct :
+			// Struct{MAGIC}` → {MAGIC},{0},{0},{0}). (Scalar `[4]int : 7` already broadcasts below.)
+			if (ct->kind == Type_Array) {
+				Type *elem = base_array_type(tav.type);
+				Type *vct  = ev.value_compound->tav.type ? base_type(x64_typed(ev.value_compound->tav.type)) : nullptr;
+				if (vct != nullptr && elem != nullptr && are_types_identical(vct, base_type(x64_typed(elem)))) {
+					i64 n   = ct->Array.count;
+					i64 esz = type_size_of(elem); if (esz <= 0) esz = 1;
+					i64 al  = x64_type_align(x64_typed(tav.type)); if (al <= 0) al = 8;
+					i32 off = x64_alloc_local(p, x64_type_size(x64_typed(tav.type)), al);
+					x64Value e0 = x64_build_compound_lit(p, ev.value_compound, x64_typed(elem));
+					for (i64 i = 0; i < n; i++) {
+						x64_store_value(p, x64addr(x64_rbp_mem(off + (i32)(i*esz)), elem), e0);
+					}
+					return x64v_mem(x64_typed(tav.type), x64_rbp_mem(off));
+				}
+			}
 			return x64_build_compound_lit(p, ev.value_compound, x64_typed(tav.type));
 		}
 
@@ -6524,6 +6613,7 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 		if (ev.kind == ExactValue_String) {
 			if (is_type_cstring(ct))   return x64_const_cstring_ptr(p, ev.value_string, false, x64_typed(tav.type));
 			if (is_type_cstring16(ct)) return x64_const_cstring_ptr(p, ev.value_string, true,  x64_typed(tav.type));
+			if (is_type_string16(ct))  return x64_const_string16(p, ev.value_string);
 			i64 esz = is_type_slice(ct) ? type_size_of(ct->Slice.elem) : 1;
 			return x64_const_string(p, ev.value_string, esz);
 		}
@@ -6563,6 +6653,10 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 				proc_e = pe;
 			}
 			if (proc_e != nullptr && proc_e->kind == Entity_Procedure) {
+				// A top-level proc stored as data (stream vtable, default handler) references it — enqueue
+				// if min_dep==0 so its body is emitted (see the Ident Entity_Procedure note). This is THE
+				// path for `s.procedure = _writer_proc`; without it → unresolved external at link.
+				if (!proc_e->Procedure.is_foreign && proc_e->min_dep_count.load(std::memory_order_relaxed) == 0) x64_enqueue_oncall(p, proc_e);
 				x64_emit_lea_sym(&p->asm_, X64Reg_RAX, x64_get_entity_name(proc_e));
 				return x64v_reg(x64_typed(tav.type), X64Reg_RAX);
 			}
@@ -6605,6 +6699,11 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 
 		switch (e->kind) {
 		case Entity_Procedure: {
+			// Taking a proc's ADDRESS (as a proc value) references it just like a call — a min_dep==0
+			// proc reached only this way (e.g. bufio._writer_proc assigned into a stream vtable) must be
+			// enqueued for on-demand compilation, else it's an unresolved external. The call path already
+			// does this; the address path did not. Was tests/documentation link failure.
+			if (!e->Procedure.is_foreign && e->min_dep_count.load(std::memory_order_relaxed) == 0) x64_enqueue_oncall(p, e);
 			x64_emit_lea_sym(&p->asm_, X64Reg_RAX, x64_get_entity_name(e));
 			return x64v_reg(e->type, X64Reg_RAX);
 		}
@@ -6632,6 +6731,7 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 					pv = pe->Constant.value;
 				}
 				if (proc_e != nullptr && proc_e->kind == Entity_Procedure) {
+					if (!proc_e->Procedure.is_foreign && proc_e->min_dep_count.load(std::memory_order_relaxed) == 0) x64_enqueue_oncall(p, proc_e);
 					x64_emit_lea_sym(&p->asm_, X64Reg_RAX, x64_get_entity_name(proc_e));
 					return x64v_reg(e->type, X64Reg_RAX);
 				}
@@ -6757,6 +6857,8 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 			if (ent == nullptr) return x64v_none();
 			switch (ent->kind) {
 			case Entity_Procedure:
+				// pkg.proc used as a VALUE — enqueue if on-demand (see the Entity_Procedure note above).
+				if (!ent->Procedure.is_foreign && ent->min_dep_count.load(std::memory_order_relaxed) == 0) x64_enqueue_oncall(p, ent);
 				x64_emit_lea_sym(&p->asm_, X64Reg_RAX, x64_get_entity_name(ent));
 				return x64v_reg(ent->type, X64Reg_RAX);
 			case Entity_Variable: {
@@ -6815,6 +6917,15 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 		if (ibt != nullptr && ibt->kind == Type_Struct && ibt->Struct.soa_kind != StructSoa_None) {
 			return x64_soa_index_element(p, expr, x64_typed(tav.type), /*store*/false, x64v_none());
 		}
+		x64Addr addr = x64_build_addr(p, expr);
+		return x64_load_addr(p, addr);
+	} case_end;
+
+	// ── MatrixIndexExpr (m[row,col]) ─────────────────────────────────────
+	// Value context (`return m[i,j]`, `x := m[i,j]`): compute the element address then load.
+	// Without this case build_expr fell to the default and yielded 0 — masked because every
+	// "working" use (any/vararg boxing) took the ADDRESS via build_addr, never the value.
+	case_ast_node(mie, MatrixIndexExpr, expr); {
 		x64Addr addr = x64_build_addr(p, expr);
 		return x64_load_addr(p, addr);
 	} case_end;
@@ -6958,6 +7069,16 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 	expr = unparen_expr(expr);
 	ast_node(ce, CallExpr, expr);
 	TypeAndValue tav = expr->tav;
+	// @(disabled=true) proc: the call is a compile-time no-op (mirrors lb_build_call_expr's
+	// EntityFlag_Disabled early-return). The body is never emitted, so emitting the call leaves an
+	// unresolved external — esp. for polymorphic instantiations (the flag propagates to them).
+	// Disabled procs may not have return values, so nothing consumes a result. Was test_issue_2666.
+	{
+		Entity *disabled_e = entity_of_node(unparen_expr(ce->proc));
+		if (disabled_e != nullptr && (disabled_e->flags & EntityFlag_Disabled)) {
+			return x64v_none();
+		}
+	}
 		// Type-conversion call form (int(x), f64(x), etc.) — actually convert, same as
 		// cast(T)x (mirrors lb_emit_conv via x64_emit_conv). Returning the operand untouched
 		// skipped width/sign/float conversions and left the result mistyped.

@@ -1440,6 +1440,35 @@ gb_internal void x64_build_assign_stmt(x64Procedure *p, Ast *node) {
 						}
 					}
 				}
+				// `v.xy = rhs` multi-component swizzle LVALUE: no single contiguous address — SCATTER each
+				// rhs element into v[swizzle_indices[i]] (mirrors lb_addr_store lbAddr_Swizzle). Single-comp
+				// `.y` (swizzle_count==0) keeps the addressable build_addr path below. Was test_issue_1730:
+				// `out.yz = ll.yz` fell through to build_addr → &out (offset 0) → wrote [2,3,0,0] not [0,2,3,0].
+				{
+					Ast *lhs0 = unparen_expr(as->lhs[0]);
+					if (lhs0->kind == Ast_SelectorExpr && lhs0->SelectorExpr.swizzle_count > 0) {
+						AstSelectorExpr *se = &lhs0->SelectorExpr;
+						bool  via_ptr = is_type_pointer(se->expr->tav.type);
+						Type *dst_t   = base_type(via_ptr ? type_deref(se->expr->tav.type) : se->expr->tav.type);
+						Type *elem    = (dst_t->kind == Type_SimdVector) ? dst_t->SimdVector.elem : dst_t->Array.elem;
+						i64       esz = type_size_of(elem);
+						X64OpSize osz = x64_op_size_of(elem);
+						Type *rt  = x64_typed(as->lhs[0]->tav.type);
+						x64Value src = x64_spill_value(p, x64_emit_conv(p, x64_build_expr(p, as->rhs[0]), as->rhs[0]->tav.type, rt), rt);
+						i32 base_off = x64_alloc_local(p, 8, 8);
+						if (via_ptr) { x64_value_to_reg(p, x64_build_expr(p, se->expr), X64Reg_RAX); }
+						else         { x64_emit_lea(&p->asm_, X64Reg_RAX, x64_build_addr(p, se->expr).mem); }
+						x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(base_off), X64Reg_RAX);
+						for (u8 i = 0; i < se->swizzle_count; i++) {
+							u8 idx = (se->swizzle_indices >> (i*2)) & 3;
+							X64Mem sm = src.mem; sm.disp += (i32)(i*esz);
+							x64_emit_mov_rm(&p->asm_, osz, X64Reg_RAX, sm);                       // RAX = rhs[i]
+							x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RCX, x64_rbp_mem(base_off)); // RCX = &dst
+							x64_emit_mov_mr(&p->asm_, osz, x64_mem(X64Reg_RCX, (i32)(idx*esz)), X64Reg_RAX); // dst[idx]=rhs[i]
+						}
+						return;
+					}
+				}
 				x64Addr lhs_addr = x64_build_addr(p, as->lhs[0]);
 				// `lhs = {}` → zero the destination in place (no full-size temp+copy). No RHS
 				// build means the (possibly register-based) lhs address isn't clobbered; zero_mem
