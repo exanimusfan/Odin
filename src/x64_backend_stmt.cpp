@@ -851,10 +851,28 @@ gb_internal x64Addr x64_range_source_addr(x64Procedure *p, Ast *iter_expr, Type 
 	return x64addr(x64_spill_value(p, sv, iter_type).mem, iter_type);
 }
 
+// Puts the ADDRESS of the aggregate to range over into RAX. `via_ptr`: the source expr is a POINTER
+// to the aggregate (`for x in p`, p: ^[]T/^[N]T) — its VALUE is the address, so load it; otherwise
+// LEA the aggregate's own storage. Mirrors LLVM lb_build_addr_ptr + the is_type_pointer(type_deref)
+// load in lb_build_range_stmt.
+gb_internal void x64_range_base_to_rax(x64Procedure *p, Ast *iter_expr, Type *iter_type, bool via_ptr) {
+	if (via_ptr) {
+		x64_value_to_reg(p, x64_build_expr(p, iter_expr), X64Reg_RAX);
+		return;
+	}
+	x64Addr a = x64_range_source_addr(p, iter_expr, iter_type);
+	x64_emit_lea(&p->asm_, X64Reg_RAX, a.mem);
+}
+
 gb_internal void x64_build_range_stmt(x64Procedure *p, Ast *stmt) {
 	ast_node(rs, RangeStmt, stmt);
 		Ast  *iter_expr = rs->expr;
-		Type *iter_type = iter_expr->tav.type ? base_type(x64_typed(iter_expr->tav.type)) : nullptr;
+		// A pointer source (`for x in p`, p: ^[]T/^[N]T/^map) ranges over the pointee: deref for the
+		// kind dispatch, remember via_ptr so the base address is the pointer VALUE (mirrors LLVM's
+		// base_type(type_deref(expr_type)) + is_type_pointer load).
+		Type *iter_raw  = iter_expr->tav.type ? base_type(x64_typed(iter_expr->tav.type)) : nullptr;
+		bool  iter_via_ptr = iter_raw != nullptr && iter_raw->kind == Type_Pointer;
+		Type *iter_type = iter_expr->tav.type ? base_type(type_deref(x64_typed(iter_expr->tav.type))) : nullptr;
 
 		isize lbl_loop = x64_label_alloc(&p->asm_);
 		isize lbl_post = x64_label_alloc(&p->asm_);
@@ -918,11 +936,10 @@ gb_internal void x64_build_range_stmt(x64Procedure *p, Ast *stmt) {
 			i64   idx_min = (is_enum && iter_type->EnumeratedArray.min_value)
 			              ? exact_value_to_i64(*iter_type->EnumeratedArray.min_value) : 0;
 			i64   elem_sz = type_size_of(elem_t);
-			x64Addr base_addr = x64_range_source_addr(p, iter_expr, iter_type);
-			// Pin the array base to a stack slot: base_addr.mem may be RAX-relative
+			// Pin the array base to a stack slot: the address may be RAX-relative
 			// (globals via LEA [RIP+sym]) and the in-loop index load clobbers RAX.
 			i32 arr_ptr_off = x64_alloc_local(p, 8, 8);
-			x64_emit_lea(&p->asm_, X64Reg_RAX, base_addr.mem);
+			x64_range_base_to_rax(p, iter_expr, iter_type, iter_via_ptr);
 			x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(arr_ptr_off), X64Reg_RAX);
 			x64_build_range_indexed(p, &c, arr_ptr_off, 0, arr_len, true, elem_sz, elem_t, idx_min);
 
@@ -934,15 +951,14 @@ gb_internal void x64_build_range_stmt(x64Procedure *p, Ast *stmt) {
 			              ? iter_type->Slice.elem
 			              : iter_type->DynamicArray.elem;
 			i64   elem_sz = type_size_of(elem_t);
-			x64Addr slice_addr = x64_range_source_addr(p, iter_expr, iter_type);
 
 			i32 data_off = x64_alloc_local(p, 8, 8);
 			i32 len_off  = x64_alloc_local(p, 8, 8);
 
 			// Pin the slice struct addr in RAX, read .data (off 0)/.len (off 8) via RCX.
-			// slice_addr.mem may be register-relative (e.g. `data.loggers`, `data` a ^T in
-			// RAX) — reading .data straight into RAX would clobber the base before .len@+8.
-			x64_emit_lea(&p->asm_, X64Reg_RAX, slice_addr.mem);
+			// The base may be register-relative (e.g. `data.loggers`, `data` a ^T in RAX) —
+			// reading .data straight into RAX would clobber the base before .len@+8.
+			x64_range_base_to_rax(p, iter_expr, iter_type, iter_via_ptr);
 			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RCX, x64_mem(X64Reg_RAX, 0));
 			x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(data_off), X64Reg_RCX);
 			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RCX, x64_mem(X64Reg_RAX, 8));
@@ -954,12 +970,11 @@ gb_internal void x64_build_range_stmt(x64Procedure *p, Ast *stmt) {
 			Type *elem_t  = iter_type->FixedCapacityDynamicArray.elem;
 			i64   elem_sz = type_size_of(elem_t);
 			i64   len_fld = x64_fca_len_offset(iter_type);
-			x64Addr fca_addr = x64_range_source_addr(p, iter_expr, iter_type);
 
 			i32 data_off = x64_alloc_local(p, 8, 8);
 			i32 len_off  = x64_alloc_local(p, 8, 8);
 
-			x64_emit_lea(&p->asm_, X64Reg_RAX, fca_addr.mem);
+			x64_range_base_to_rax(p, iter_expr, iter_type, iter_via_ptr);
 			x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(data_off), X64Reg_RAX);
 			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RCX, x64_mem(X64Reg_RAX, (i32)len_fld));
 			x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(len_off), X64Reg_RCX);

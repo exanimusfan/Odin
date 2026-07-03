@@ -2482,6 +2482,29 @@ gb_internal x64Value x64_emit_conv(x64Procedure *p, x64Value src, Type *from, Ty
 		return x64v_mem(x64_typed(to), x64_rbp_mem(dst_off));
 	}
 
+	// #simd[N]From → #simd[N]To lane-wise conversion (differing element types): lanes are contiguous in
+	// memory like an array, so convert each lane scalar-wise (mirrors the array→array case + LLVM's simd
+	// conv). Without this it fell to the reinterpret fallback — e.g. xxhash's `u64xW(u32xW(v))` (narrow
+	// each u64 lane to u32 then widen back) kept the full 64-bit lanes instead of zeroing the high 32.
+	if (dst_base->kind == Type_SimdVector && src_base != nullptr && src_base->kind == Type_SimdVector &&
+	    dst_base->SimdVector.count == src_base->SimdVector.count &&
+	    !are_types_identical(base_type(src_base->SimdVector.elem), base_type(dst_base->SimdVector.elem))) {
+		Type *se = src_base->SimdVector.elem;
+		Type *de = dst_base->SimdVector.elem;
+		i64 n   = dst_base->SimdVector.count;
+		i64 ssz = type_size_of(se); if (ssz <= 0) ssz = 1;
+		i64 dsz = type_size_of(de); if (dsz <= 0) dsz = 1;
+		i32 src_off = x64_alloc_local(p, type_size_of(from), type_align_of(from));
+		x64_store_value(p, x64addr(x64_rbp_mem(src_off), x64_typed(from)), src);
+		i32 dst_off = x64_alloc_local(p, type_size_of(to), type_align_of(to));
+		for (i64 i = 0; i < n; i++) {
+			x64Value ev = x64v_mem(se, x64_rbp_mem(src_off + (i32)(i * ssz)));
+			x64Value cv = x64_emit_conv(p, ev, se, de);
+			x64_store_value(p, x64addr(x64_rbp_mem(dst_off + (i32)(i * dsz)), de), cv);
+		}
+		return x64v_mem(x64_typed(to), x64_rbp_mem(dst_off));
+	}
+
 	// Scalar → array broadcast (`vec * scalar` reaches x64_emit_arith_array, which convs the scalar to
 	// the array type): convert the scalar to the element type and replicate into every element. Mirrors
 	// lb_emit_conv's is_type_array_like(dst) path. Must follow the array→array case above.
@@ -2598,8 +2621,12 @@ gb_internal x64Value x64_emit_conv(x64Procedure *p, x64Value src, Type *from, Ty
 		x64_value_to_reg(p, src, X64Reg_RAX);
 		if ((int)dst_sz > (int)src_sz && x64_is_signed_integer(src_base) && src_sz < X64OpSize_64) {
 			x64_emit_movsx_rr(&p->asm_, src_sz, X64Reg_RAX, X64Reg_RAX);
-		} else if ((int)dst_sz > (int)src_sz && src_sz <= X64OpSize_16) {
-			x64_emit_movzx_rr(&p->asm_, src_sz, X64Reg_RAX, X64Reg_RAX);
+		} else if ((int)dst_sz > (int)src_sz) {
+			// Unsigned widen = zero-extend. MOVZX encodes 8/16→N; there is no MOVZX r64,r/m32, so a
+			// 32→64 widen uses a 32-bit MOV (auto-zeroes the upper 32). Required because a prior
+			// truncating cast (u64→u32) leaves the upper bits dirty — `u64(u32(x))` must clear them.
+			if (src_sz <= X64OpSize_16) x64_emit_movzx_rr(&p->asm_, src_sz, X64Reg_RAX, X64Reg_RAX);
+			else                        x64_emit_mov_rr(&p->asm_, X64OpSize_32, X64Reg_RAX, X64Reg_RAX);
 		}
 		return x64v_reg(x64_typed(to), X64Reg_RAX);
 	}
@@ -3020,6 +3047,11 @@ gb_internal bool x64_try_inline_call(x64Procedure *p, AstCallExpr *ce, Entity *c
 // arith (bit_set: + → union/OR, - → difference/AND-NOT). `type` is the result type.
 gb_internal x64Value x64_emit_arith_array(x64Procedure *p, TokenKind op, x64Value lhs, x64Value rhs, Type *type);
 gb_internal x64Value x64_emit_arith_matrix(x64Procedure *p, TokenKind op, x64Value lhs, x64Value rhs, Type *type, bool component_wise);
+enum X64SimdBin { X64SimdBin_Add, X64SimdBin_Sub, X64SimdBin_Mul, X64SimdBin_Div,
+                  X64SimdBin_And, X64SimdBin_Or,  X64SimdBin_Xor, X64SimdBin_AndN,
+                  X64SimdBin_Min, X64SimdBin_Max };
+gb_internal bool     x64_simd_packed_ok(int op, Type *elem);
+gb_internal x64Value x64_simd_binop_vec(x64Procedure *p, int op, Type *vt, Type *rt, Type *elem, X64Mem amem, X64Mem bmem, bool swap);
 
 // Materialise a value as a stable 16-byte stack temp (lo@+0, hi@+8). A real 128-bit Mem is copied; a
 // narrower scalar is loaded and sign/zero-extended into the high half (so `u128_var + 1` etc. don't read
@@ -3172,6 +3204,30 @@ gb_internal x64Value x64_emit_arith(x64Procedure *p, TokenKind op, x64Value lhs,
 	Type *rbt = base_type(result_type);
 	if (rbt != nullptr && rbt->kind == Type_Array) {
 		return x64_emit_arith_array(p, op, lhs, rhs, result_type);
+	}
+	// #simd operator arithmetic (`v + w`, `v * w`, `v ~ w`, …): packed SSE/AVX per x64_simd_packed_ok,
+	// else scalar per-lane. Without this a #simd fell to the scalar/i128 path below — e.g. #simd[2]u64
+	// `+`/`*` did a 16-byte i128 op that carried/multiplied ACROSS lanes (xxhash hashLong accumulate).
+	if (rbt != nullptr && rbt->kind == Type_SimdVector) {
+		Type *elem = base_type(rbt->SimdVector.elem);
+		int bop = -1;
+		switch (op) {
+		case Token_Add: bop = X64SimdBin_Add;  break;
+		case Token_Sub: bop = X64SimdBin_Sub;  break;
+		case Token_Mul: bop = X64SimdBin_Mul;  break;
+		case Token_Quo: bop = X64SimdBin_Div;  break;
+		case Token_And: bop = X64SimdBin_And;  break;
+		case Token_Or:  bop = X64SimdBin_Or;   break;
+		case Token_Xor: bop = X64SimdBin_Xor;  break;
+		case Token_AndNot: bop = X64SimdBin_AndN; break;
+		}
+		if (bop >= 0 && x64_simd_packed_ok(bop, elem)) {
+			x64Value la = x64_spill_value(p, x64_emit_conv(p, lhs, lhs.type, result_type), result_type);
+			x64Value ra = x64_spill_value(p, x64_emit_conv(p, rhs, rhs.type ? rhs.type : result_type, result_type), result_type);
+			bool swap = (bop == X64SimdBin_AndN); // pandn = (~dst)&src → dst=b, src=a for a&~b
+			return x64_simd_binop_vec(p, bop, result_type, result_type, elem, la.mem, ra.mem, swap);
+		}
+		return x64_emit_arith_array(p, op, lhs, rhs, result_type); // no packed insn (u64 mul, rem, …) → scalar lanes
 	}
 
 	// f16 arithmetic via f32 promotion (x64 has no native f16 arith): a op b = f16(f32(a) op f32(b)).
@@ -4319,22 +4375,44 @@ gb_internal x64Value x64_emit_or_return(x64Procedure *p, Ast *expr) {
 		// x64_value_to_reg on x64v_none() will XOR-zero RAX → always fail path
 	}
 
-	// Load rhs into RAX; spill it so deferred stmts can't clobber it
-	Type *rhs_t = rhs.type ? rhs.type : t_bool;
-	x64_value_to_reg(p, rhs, X64Reg_RAX);
+	// Spill rhs to a stable stack slot (FULL size) so the failure path can return it and deferred stmts
+	// can't clobber it. The old code spilled only op_size (≤8) bytes via value_to_reg → a union/aggregate
+	// error was truncated AND value_to_reg loaded the wrong bytes.
+	Type *rhs_t  = rhs.type ? rhs.type : t_bool;
+	Type *rhs_bt = base_type(rhs_t);
 	X64OpSize rhs_opsz = x64_op_size_of(rhs_t);
-	i32 rhs_spill = x64_alloc_local(p, type_size_of(rhs_t), type_align_of(rhs_t));
-	x64_emit_mov_mr(&p->asm_, rhs_opsz, x64_rbp_mem(rhs_spill), X64Reg_RAX);
+	i32 rhs_spill = x64_alloc_local(p, gb_max(type_size_of(rhs_t), (i64)1), gb_max(type_align_of(rhs_t), (i64)1));
+	x64_store_value(p, x64addr(x64_rbp_mem(rhs_spill), rhs_t), rhs);
+	x64Value rhs_mem = x64v_mem(rhs_t, x64_rbp_mem(rhs_spill));
 
-	// Success condition depends on the indicator TYPE (mirrors lb_emit_try_has_value):
-	// a BOOLEAN ok-flag succeeds when TRUE; an ERROR / nil-able value when NIL. The old
-	// code only did the boolean direction, so `or_return` on an Error proc was INVERTED
-	// (continued on error, bailed on success — broke all of math/big).
-	x64_emit_test_rr(&p->asm_, rhs_opsz, X64Reg_RAX, X64Reg_RAX);
+	// Success condition depends on the indicator TYPE (mirrors lb_emit_try_has_value): a BOOLEAN ok-flag
+	// succeeds when TRUE; an ERROR / nil-able value when NIL. A tagged UNION error is nil ⟺ tag==0 — the
+	// tag lives AFTER the variant block, so testing the first word (the variant DATA) is wrong. Was THE
+	// core:flags `set_option() or_return` bug: a non-nil Parse_Error union read as nil → never propagated.
+	// #shared_nil: nil ⟺ variant block all-zero. Enum/pointer/maybe-pointer errors keep a discriminant @0.
 	isize lbl_continue = x64_label_alloc(&p->asm_);
 	if (is_type_boolean(rhs_t)) {
+		x64_value_to_reg(p, rhs_mem, X64Reg_RAX);
+		x64_emit_test_rr(&p->asm_, rhs_opsz, X64Reg_RAX, X64Reg_RAX);
 		x64_emit_jcc(&p->asm_, X64Cc_NE, lbl_continue); // bool true → success
+	} else if (rhs_bt != nullptr && rhs_bt->kind == Type_Union && !is_type_union_maybe_pointer(rhs_bt)) {
+		if (rhs_bt->Union.kind == UnionType_shared_nil) {
+			i64 vbs = rhs_bt->Union.variant_block_size; if (vbs <= 0) vbs = type_size_of(rhs_bt);
+			x64_emit_xor_rr(&p->asm_, X64OpSize_32, X64Reg_RCX, X64Reg_RCX);
+			i64 b = 0;
+			while (vbs - b >= 8) { x64_emit_or_chunk(p, rhs_mem, b, X64OpSize_64, false); b += 8; }
+			if (vbs - b >= 4)    { x64_emit_or_chunk(p, rhs_mem, b, X64OpSize_32, false); b += 4; }
+			if (vbs - b >= 2)    { x64_emit_or_chunk(p, rhs_mem, b, X64OpSize_16, true);  b += 2; }
+			if (vbs - b >= 1)    { x64_emit_or_chunk(p, rhs_mem, b, X64OpSize_8,  true); }
+			x64_emit_test_rr(&p->asm_, X64OpSize_64, X64Reg_RCX, X64Reg_RCX);
+		} else {
+			x64_emit_union_tag_value(p, rhs_mem.mem, rhs_bt, X64Reg_RCX);
+			x64_emit_test_rr(&p->asm_, X64OpSize_64, X64Reg_RCX, X64Reg_RCX);
+		}
+		x64_emit_jcc(&p->asm_, X64Cc_E, lbl_continue);  // tag/block == 0 → nil → success
 	} else {
+		x64_value_to_reg(p, rhs_mem, X64Reg_RAX);
+		x64_emit_test_rr(&p->asm_, rhs_opsz, X64Reg_RAX, X64Reg_RAX);
 		x64_emit_jcc(&p->asm_, X64Cc_E, lbl_continue);  // error == nil → success
 	}
 
@@ -4352,10 +4430,14 @@ gb_internal x64Value x64_emit_or_return(x64Procedure *p, Ast *expr) {
 				Entity *last_res = res_tup->variables[nres - 1];
 				i32 *loff = x64_var_get(&p->var_offsets, last_res);
 				if (loff != nullptr) {
-					x64_emit_mov_rm(&p->asm_, rhs_opsz, X64Reg_RAX,
-					                x64_rbp_mem(rhs_spill));
-					x64_emit_mov_mr(&p->asm_, x64_op_size_of(last_res->type),
-					                x64_rbp_mem(*loff), X64Reg_RAX);
+					if (type_size_of(rhs_t) > 8) { // aggregate (union) error: copy the FULL value
+						x64_store_value(p, x64addr(x64_rbp_mem(*loff), last_res->type), rhs_mem);
+					} else {
+						x64_emit_mov_rm(&p->asm_, rhs_opsz, X64Reg_RAX,
+						                x64_rbp_mem(rhs_spill));
+						x64_emit_mov_mr(&p->asm_, x64_op_size_of(last_res->type),
+						                x64_rbp_mem(*loff), X64Reg_RAX);
+					}
 				}
 			}
 			x64_emit_named_returns(p);
@@ -4376,10 +4458,18 @@ gb_internal x64Value x64_emit_or_return(x64Procedure *p, Ast *expr) {
 				Entity *last_res = res_tup->variables[nres - 1];
 				i64 al = type_align_of(last_res->type);
 				last_off = (last_off + al - 1) & ~(al - 1);
-				x64_emit_mov_rm(&p->asm_, rhs_opsz, X64Reg_RCX,
-				                x64_rbp_mem(rhs_spill));
-				x64_emit_mov_mr(&p->asm_, x64_op_size_of(last_res->type),
-				                x64_mem(X64Reg_RAX, (i32)last_off), X64Reg_RCX);
+				if (type_size_of(rhs_t) > 8) { // aggregate (union) error: copy the FULL value
+					i32 dptr = x64_alloc_local(p, 8, 8);
+					x64_emit_lea(&p->asm_, X64Reg_RAX, x64_mem(X64Reg_RAX, (i32)last_off));
+					x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(dptr), X64Reg_RAX);
+					x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(dptr));
+					x64_store_value(p, x64addr(x64_mem(X64Reg_RAX, 0), last_res->type), rhs_mem);
+				} else {
+					x64_emit_mov_rm(&p->asm_, rhs_opsz, X64Reg_RCX,
+					                x64_rbp_mem(rhs_spill));
+					x64_emit_mov_mr(&p->asm_, x64_op_size_of(last_res->type),
+					                x64_mem(X64Reg_RAX, (i32)last_off), X64Reg_RCX);
+				}
 			}
 		} else {
 			// Single register return: load rhs into RAX (extended to the full register).
@@ -4400,9 +4490,6 @@ gb_internal x64Value x64_emit_or_return(x64Procedure *p, Ast *expr) {
 }
 
 // Packed binary-op kinds for #simd lowering.
-enum X64SimdBin { X64SimdBin_Add, X64SimdBin_Sub, X64SimdBin_Mul, X64SimdBin_Div,
-                  X64SimdBin_And, X64SimdBin_Or,  X64SimdBin_Xor, X64SimdBin_AndN,
-                  X64SimdBin_Min, X64SimdBin_Max };
 
 // Does SSE have a SINGLE packed instruction for (op, elem)? (SSE lacks packed integer division and
 // 8/64-bit integer multiply; integer min/max only ≤32-bit.) Callers fall back to a scalar lane loop.
@@ -5939,6 +6026,15 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 	// typeid_of and the emitted Type_Info.id.
 	if (tav.mode == Addressing_Type && tav.type != nullptr) {
 		return x64_typeid(tav.type);
+	}
+	// A typeid CONSTANT whose mode is NOT Addressing_Type — e.g. a POINTER type `^T` used directly as a
+	// value (`x.id == ^os.File`): the checker folds it to an ExactValue_Typeid with mode Value/Constant,
+	// so the check above misses it and it fell through to a bogus AST path (UnaryExpr `^`) → typeid 0.
+	// (A plain named/struct type IS Addressing_Type and is handled above; only the folded forms land here.)
+	// Was core:flags `type_info.id == ^os.File` (and datetime/net) always false → Unsupported_Type.
+	if (tav.value.kind == ExactValue_Typeid) {
+		Type *tt = tav.value.value_typeid ? tav.value.value_typeid : tav.type;
+		if (tt != nullptr) return x64_typeid(tt);
 	}
 
 	// ── Compile-time constants ──────────────────────────────────────────
