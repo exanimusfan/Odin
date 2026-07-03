@@ -48,10 +48,8 @@ gb_internal x64Value x64_const_string(x64Procedure *p, String sv, i64 elem_size 
 }
 
 // A constant string used where a cstring/cstring16 is expected: a bare NUL-terminated data
-// POINTER (8 bytes), NOT a {data,len} header. `wide` UTF-16-encodes the bytes (cstring16, e.g.
-// passing "en-US" to a Win32 LPCWSTR param). Mirrors LLVM lb_emit_conv string->cstring and the
-// constant_utf16_cstring builtin. Without this a const string arg to a cstring16 param was built
-// as a 16-byte string struct → the callee read UTF-8 bytes as UTF-16 (Win32 LocaleNameToLCID → 0).
+// POINTER (8 bytes), NOT a {data,len} header. `wide` UTF-16-encodes the bytes (cstring16).
+// Mirrors LLVM lb_emit_conv string->cstring and the constant_utf16_cstring builtin.
 gb_internal x64Value x64_const_cstring_ptr(x64Procedure *p, String sv, bool wide, Type *result_type) {
 	x64Module *m = p->module;
 	if (sv.len == 0 && !wide) {
@@ -86,9 +84,7 @@ gb_internal x64Value x64_const_cstring_ptr(x64Procedure *p, String sv, bool wide
 }
 
 // A constant `string16` ({data: [^]u16, len: int}, len in UTF-16 UNITS). UTF-16-encode the UTF-8
-// source, intern the u16 bytes, and build a 16-byte header — vs x64_const_string which would emit the
-// raw UTF-8 bytes with len in bytes (the string16 constant would then read UTF-8 as UTF-16). Was
-// test_issue_6101: `string16("猫")` gave len=3 / u[0]=0x8CE7 (UTF-8 E7 8C) not len=1 / 0x732B.
+// source, intern the u16 bytes, and build a 16-byte header (vs x64_const_string's raw UTF-8 bytes).
 gb_internal x64Value x64_const_string16(x64Procedure *p, String sv) {
 	x64Module *m = p->module;
 	i32 str_off = x64_alloc_local(p, 16, 8);
@@ -283,11 +279,8 @@ gb_internal x64Value x64_build_compound_lit(x64Procedure *p, Ast *lit, Type *typ
 
 // A compile-time integer constant of a BIG-ENDIAN type (u16be/u32be/u64be) is materialised as a
 // host-order immediate; pre-swap to the type's byte width so the little-endian store lays the bytes
-// out big-endian (mirrors x64_const_int_bytes' static path). e.g. net's IP6_Address = [8]u16be, whose
-// `{0x2620, …}` literals compared unequal to DNS-parsed addresses because the constants weren't swapped.
-// Uses core_type (not base_type) so an ENUM backed by a be integer is unwrapped to its backing type —
-// base_type leaves a Type_Enum (not is_type_integer) and the swap was skipped. Was png's
-// `Signature :: enum u64be` constant `.PNG` emitted native-order → every PNG failed Invalid_Signature.
+// out big-endian (mirrors x64_const_int_bytes' static path). Uses core_type (not base_type) so an
+// ENUM backed by a be integer is unwrapped to its backing type (else the swap is skipped).
 gb_internal i64 x64_endian_fix_const_int(Type *type, i64 v) {
 	Type *bt = type ? core_type(x64_typed(type)) : nullptr;
 	if (bt == nullptr || !is_type_integer(bt) || is_type_endian_little(bt)) return v;
@@ -332,14 +325,21 @@ gb_internal x64Value x64_handle_param_value(x64Procedure *p, Type *ptype,
 			}
 			return x64v_imm(t, 0);
 		}
-		case ExactValue_Compound:
+		case ExactValue_Compound: {
 			// Aggregate default value (`vp: [2]Size = {…}`): materialise the stored CompoundLit
-			// (mirrors lb_const_value(ExactValue_Compound)). The scalar cases above + this share
-			// the build_expr constant path. Was zero-filled by the default below → an omitted
-			// aggregate default arrived all-zero (THE blick timeline viewport_size={fill,fill}
-			// default → {children,children} → scrollview viewport collapsed to 0).
-			if (ev.value_compound != nullptr) return x64_build_compound_lit(p, ev.value_compound, t);
-			break; // null compound → zero-fill (handled by caller)
+			// (mirrors lb_const_value(ExactValue_Compound)).
+			if (ev.value_compound == nullptr) break; // null compound → zero-fill (handled by caller)
+			// Build at the ORIGINAL expression's type, then convert to the param type — a union param
+			// with a VARIANT default must be boxed (build at the union type directly leaves tag 0).
+			// Mirrors lb_handle_param_value's non-constant-type branch (build type_of_expr, then conv).
+			Type *ot      = (pv.original_ast_expr != nullptr) ? type_of_expr(pv.original_ast_expr) : nullptr;
+			Type *build_t = (ot != nullptr) ? x64_typed(ot) : t;
+			x64Value cv = x64_build_compound_lit(p, ev.value_compound, build_t);
+			if (build_t != nullptr && t != nullptr && !are_types_identical(build_t, t)) {
+				cv = x64_emit_conv(p, cv, build_t, t);
+			}
+			return cv;
+		}
 		default:
 			return x64v_imm(t, 0);
 		}
@@ -350,8 +350,7 @@ gb_internal x64Value x64_handle_param_value(x64Procedure *p, Type *ptype,
 		break; // zero — handled by caller (imm 0 / zero-fill)
 	case ParameterValue_Location: {
 		// `loc := #caller_location`: build the CALL SITE's Source_Code_Location (caller proc +
-		// call expr position). Was zero-filled before → identical locations → e.g. UI hashes
-		// built from `loc` all collided.
+		// call expr position).
 		String proc_name = (p->entity != nullptr) ? p->entity->token.string : str_lit("");
 		TokenPos pos = {};
 		if (call_expr != nullptr) {
@@ -396,9 +395,7 @@ gb_internal x64Value x64_apply_using_subtype(x64Procedure *p, x64Value v, Type *
 
 	// `#subtype`/`using`-field narrowing. Two source forms (mirror lb_emit_conv):
 	//   value source (Allocator{using ...}): offset into the value's memory;
-	//   pointer source (^Chan → ^Raw_Chan via `#subtype impl: ^Raw_Chan`): walk the
-	//   field path on the POINTED-TO struct, then LOAD the field (the old code bailed
-	//   here, passing &struct unchanged → reading the field as the struct → crash).
+	//   pointer source (^Chan → ^Raw_Chan): walk the field path on the POINTED-TO struct, then LOAD.
 	bool src_is_ptr = is_type_pointer(v.type);
 	i64 off = 0;
 	Type *cur = base_type(src_is_ptr ? type_deref(v.type) : v.type);
@@ -417,8 +414,6 @@ gb_internal x64Value x64_apply_using_subtype(x64Procedure *p, x64Value v, Type *
 		//   (a) `using base: Inner` — base is an EMBEDDED VALUE subobject; `^Outer → ^Inner` is the
 		//       ADDRESS of that subobject (ptr + off), NO load. (want == ^last_field_type)
 		//   (b) `#subtype impl: ^Inner` — the field IS the wanted pointer; LOAD the field value.
-		// Was: always (b) → for case (a) it dereferenced the pointer and read the subobject's first
-		// bytes as the pointer (blick gfx_init_null_procedures got *gfx not gfx → AV at startup).
 		x64_value_to_reg(p, v, X64Reg_RAX);
 		bool want_addr_of_field = is_type_pointer(want) && last_field_type != nullptr &&
 			are_types_identical(base_type(type_deref(want)), base_type(last_field_type));
@@ -554,8 +549,7 @@ gb_internal x64Value x64_emit_minmax2(x64Procedure *p, Type *rt,
 	X64OpSize osz = x64_op_size_of(rt);
 	bool sgn = x64_is_signed_integer(rt);
 	// Replace a with b when: min→a>b, max→a<b. Load/extend each operand to a full register
-	// (sub-8-byte slots hold only `sz` bytes — a 64-bit load/store would read/CLOBBER neighbours;
-	// the store especially corrupted the adjacent stack, e.g. the reduce fold's vector base → crash).
+	// (sub-8-byte slots hold only `sz` bytes; a 64-bit load/store would read/CLOBBER neighbours).
 	X64Cc cc = is_min ? (sgn ? X64Cc_G : X64Cc_A) : (sgn ? X64Cc_L : X64Cc_B);
 	x64_value_to_reg(p, x64v_mem(rt, x64_rbp_mem(a_off)), X64Reg_RAX);
 	x64_value_to_reg(p, x64v_mem(rt, x64_rbp_mem(b_off)), X64Reg_RCX);
@@ -665,8 +659,7 @@ gb_internal void x64_store_compound_elems(x64Procedure *p, Slice<Ast *> const &e
 
 // Compute the bit_set membership mask `1 << (elem - lower)` into RAX. The element value
 // must already be in RCX (which is also clobbered by the `- lower`); `sz` is the backing
-// integer size. Shared by the bit_set literal builder and `in`/`not_in` — keeping these in
-// lockstep is what prevents the literal-vs-membership divergence class of bugs.
+// integer size. Shared by the bit_set literal builder and `in`/`not_in` (keep them in lockstep).
 gb_internal void x64_emit_bit_set_mask(x64Procedure *p, X64OpSize sz, i64 lower) {
 	if (lower != 0) x64_emit_sub_ri(&p->asm_, sz, X64Reg_RCX, (i32)lower);
 	x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RAX, 1);
@@ -689,9 +682,7 @@ gb_internal x64Value x64_spill_value(x64Procedure *p, x64Value v, Type *t) {
 // Byte offset of the `len` field in a fixed-capacity dynamic array `[dynamic; N]E`. Layout is
 // {data: [N]E @0, len: int} (runtime.Raw_Fixed_Capacity_Dynamic_Array): len sits right AFTER the
 // data array, at align_up(N*size_of(E), align_of(int)). NOT type_size-8 — when E is over-aligned the
-// struct gets TRAILING padding (size aligned up to align_of(E)), so type_size-8 points into that
-// padding, not len. THE blick `media.streams` bug: Media_Stream is 64-byte aligned → 56 bytes of
-// padding after len → `append` wrote len at the real field while `len()` read the padding (always 0).
+// struct gets TRAILING padding (size aligned up to align_of(E)), so type_size-8 points into padding.
 gb_internal i64 x64_fca_len_offset(Type *fca) {
 	Type *bt = base_type(fca);
 	i64 esz = type_size_of(bt->FixedCapacityDynamicArray.elem);
@@ -709,10 +700,7 @@ gb_internal i64 x64_fca_len_offset(Type *fca) {
 // Store one struct compound-literal field value `fval` (AST type `fet`) into `dst` (field type
 // `ftype`). Mirrors lb_build_struct_compound_lit_field_assignment: a variant boxed into a union
 // FIELD needs its discriminant tag written, and an EMPTY-struct variant builds to a typeless None
-// (x64_build_expr carries no type for a zero-sized value) — so the variant type must come from the
-// AST (`fet`), not fval.type. Was THE blick shutdown hang: `Message_Quit` is `struct{}`, boxed via
-// `Message{variant = variant}` its tag stayed 0 → the app pump never matched Message_Quit → the
-// quit never propagated → thread.join hung forever.
+// (no type for a zero-sized value) — so the variant type must come from the AST (`fet`), not fval.type.
 gb_internal void x64_store_compound_field(x64Procedure *p, X64Mem dst, Type *ftype, x64Value fval, Type *fet) {
 	if (fval.type == nullptr) fval.type = fet;
 	Type *ftb = (ftype != nullptr) ? base_type(ftype) : nullptr;
@@ -778,11 +766,9 @@ gb_internal x64Value x64_build_compound_lit(x64Procedure *p, Ast *lit, Type *typ
 					}
 				}
 				if (ftype == nullptr) {
-						// Field PROMOTED via `using` (e.g. a `using _: struct #raw_union` member like
-						// d3d11 view descs' Texture2D/Buffer): the direct-field loop misses it. Resolve via
-						// the shared Selection walk. allow_deref=false: a literal can't write THROUGH a
-						// `using p: ^T` (the pointer isn't set yet) → such a field is skipped, not clobbered
-						// at offset 0. Was: foff stayed 0 → clobbered field 0 → garbage view descs.
+						// Field PROMOTED via `using` (e.g. a `using _: struct #raw_union` member): the
+						// direct-field loop misses it. Resolve via the shared Selection walk. allow_deref=false:
+						// a literal can't write THROUGH a `using p: ^T` (ptr not set yet) → skip, don't clobber @0.
 						x64Addr dg = x64_emit_deep_field_gep(p, x64_rbp_mem(res_off), bt,
 						                                     fv->field->Ident.interned, /*allow_deref*/false);
 						if (dg.type != nullptr) { foff = dg.mem.disp - res_off; ftype = dg.type; }
@@ -793,10 +779,8 @@ gb_internal x64Value x64_build_compound_lit(x64Procedure *p, Ast *lit, Type *typ
 			}
 		} else {
 			// Positional. A multi-return call element (`S{f(), x}`, f → N values) SPREADS across N
-			// consecutive fields, so advance a field cursor by the element's value count — not 1 per
-			// element. Was test_issue_6853: `test_s{case0(), 3, 4, 5}` (case0→(1,2)) wrote a=1 then
-			// b,c,d=3,4,5 and e=0 (one field per element) instead of a,b=1,2 / c,d,e=3,4,5. Mirrors LLVM's
-			// multi-value spread in compound literals.
+			// consecutive fields, so advance a field cursor by the element's value count, not 1 per
+			// element. Mirrors LLVM's multi-value spread in compound literals.
 			isize fc = 0;
 			for (isize ei = 0; ei < cl->elems.count && fc < bt->Struct.fields.count; ei++) {
 				if (cl->elems[ei] == nullptr) { fc++; continue; }
@@ -838,29 +822,25 @@ gb_internal x64Value x64_build_compound_lit(x64Procedure *p, Ast *lit, Type *typ
 	} else if (bt->kind == Type_Slice) {
 		// `{a, b, …}` typed as []T: build a backing array on the stack, store elements, then
 		// fill the header {data=&array, len=N} (mirrors lb_build_addr's CompoundLit Type_Slice).
-		// Without this the header was just zeroed → callee saw a nil slice. len = max(elem
-		// count, highest index+1) so indexed elements past the positional count fit (cl->max_count).
+		// len = max(elem count, highest index+1) so indexed elements past the positional count fit.
 		Type *et  = bt->Slice.elem;
 		i64   esz = type_size_of(et);  if (esz <= 0) esz = 1;
 		i64   eal = type_align_of(et); if (eal <= 0) eal = 1;
 		i64   n   = gb_max((i64)cl->elems.count, (i64)cl->max_count);
 		i32 arr_off = x64_alloc_local(p, n * esz, eal);
-		// The slice header points INTO this backing (.data = &arr), so it must outlive the
-		// statement — mark scope-lived (named_seq) so the temp reclaimer never reuses it. The header
-		// can also escape the ENCLOSING BLOCK (`key: []u8; if … { key = []u8{…} }; use key` — png
-		// truecolor tRNS keying), which named_seq does NOT guard: bump escape_floor so the block/if-scope
-		// reclaim leaves the backing alive too (mirrors the &local / tmp[:] escape fixes). Was tbrn2c08's
-		// tRNS key backing reclaimed at the if-exit → garbage key → every pixel mis-keyed.
+		// The slice header points INTO this backing (.data = &arr), so it must outlive the statement
+		// — mark scope-lived (named_seq) so the temp reclaimer never reuses it. The header can also
+		// escape the ENCLOSING BLOCK (`key: []u8; if … { key = []u8{…} }; use key`), which named_seq
+		// does NOT guard: bump escape_floor so the block/if-scope reclaim leaves the backing alive too.
 		p->named_seq++;
 		if (p->local_size > p->escape_floor) p->escape_floor = p->local_size;
 		x64_zero_mem(p, x64_rbp_mem(arr_off), n * esz);
 		x64_store_compound_elems(p, cl->elems, bt, et, esz, arr_off, 0);
 		if (p->is_startup) {
 			// GLOBAL initializer (runs in __entry_point): a stack backing DANGLES once the function
-			// returns → the global slice's .data pointed at freed stack → garbage. Copy the built
-			// backing into a STATIC global and point .data there (mirrors the &CompoundLit is_startup
-			// path). An all-const slice takes the x64_const_value static path; this covers slices with
-			// runtime elements, e.g. `g := []f64{ math.inf_f64(-1), … }` (core:math test _sc tables).
+			// returns, so copy the built backing into a STATIC global and point .data there (mirrors
+			// the &CompoundLit is_startup path). Covers slices with runtime elements (all-const slices
+			// take the x64_const_value static path).
 			Type  *arrt = alloc_type_array(et, n);
 			String sym  = x64_add_global_generated(p->module, arrt);
 			x64_emit_lea_sym(&p->asm_, X64Reg_RAX, sym);
@@ -875,10 +855,8 @@ gb_internal x64Value x64_build_compound_lit(x64Procedure *p, Ast *lit, Type *typ
 		x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(res_off + 8), X64Reg_RAX); // .len
 	} else if (bt->kind == Type_FixedCapacityDynamicArray) {
 		// `[dynamic;N]T{a, b, …}`: elements live INLINE in the data array (field 0 @0); set len
-		// (field 1, at size-8). cap is implicit in the type. Mirrors LLVM lb_build_addr_compound_lit
-		// + the FCA index layout (len at type_size-8). Was left zeroed → len 0 → THE blick keyboard
-		// bug: `register_action(…, {{{.ctrl_or_cmd}, .O}})` keybind lists came back empty
-		// (len(info.keybinds)==0 skipped every shortcut → ctrl+O etc. did nothing).
+		// (field 1, via x64_fca_len_offset). cap is implicit in the type. Mirrors LLVM
+		// lb_build_addr_compound_lit + the FCA index layout.
 		Type *et  = bt->FixedCapacityDynamicArray.elem;
 		i64   esz = type_size_of(et); if (esz <= 0) esz = 1;
 		i64   cap = bt->FixedCapacityDynamicArray.capacity;
@@ -1004,10 +982,7 @@ gb_internal x64Value x64_build_compound_lit(x64Procedure *p, Ast *lit, Type *typ
 // bit_field member access (read/write). A bit_field member has no addressable byte
 // location, so SelectorExpr-read and field-assignment can't go through x64_build_addr;
 // they shift/mask the (single-integer ≤8B) backing in-register. Mirrors lb_addr_bit_field
-// load (shift+mask+sign-extend) and store (read-modify-write). Array-of-integer backing
-// is a rare TODO. Was the rollback_stack allocator bug: its header is a `bit_field u64`,
-// and field writes clobbered the whole backing (no shift/mask) → map grow corrupted →
-// `odin test` (tracking allocator uses a map) crashes.
+// load (shift+mask+sign-extend) and store (read-modify-write). Array-of-integer backing is a TODO.
 gb_internal bool x64_bit_field_member_info(Ast *expr, Type **field_type, Type **backing_type,
                                            i64 *bit_offset, i64 *bit_size, i64 *byte_offset) {
 	Ast *e = unparen_expr(expr);
@@ -1021,9 +996,7 @@ gb_internal bool x64_bit_field_member_info(Ast *expr, Type **field_type, Type **
 
 	// The bit_field is either `outer` itself, OR a `using`-promoted member of a struct/raw_union
 	// (e.g. `struct #raw_union { using _: bit_field u32 {…}, value: u32 }`, possibly through distinct
-	// types). Find the bit_field type + its byte offset within `outer`. Was: only the direct case was
-	// handled → a promoted member fell back to a full-width field access aliasing the backing (no
-	// shift/mask) → garbage (THE blick slot_map handle.index write returned 0).
+	// types). Find the bit_field type + its byte offset within `outer`.
 	Type *bt = nullptr;
 	i64 bf_byte_off = 0;
 	if (obt->kind == Type_BitField) {
@@ -1198,9 +1171,8 @@ gb_internal x64Addr x64_emit_struct_ep(x64Procedure *p, x64Addr base, AstSelecto
 		}
 
 		// Single-component array swizzle: v.x/.y/.z/.w → &v[i]; lookup_field maps the
-		// component to the element index (same Selection lb_build_addr walks). Without this
-		// .x/.y/.z all resolved to offset 0 (the {24,0,0} bug). swizzle_count > 0 (multi-
-		// component) builds a separate value and falls through.
+		// component to the element index (same Selection lb_build_addr walks). swizzle_count > 0
+		// (multi-component) builds a separate value and falls through.
 		if ((st->kind == Type_Array || st->kind == Type_EnumeratedArray) &&
 		    sel->swizzle_count == 0 && sel->selector->kind == Ast_Ident) {
 			Selection s = lookup_field(st, sel->selector->Ident.interned, false);
@@ -1243,8 +1215,7 @@ gb_internal x64Addr x64_emit_struct_ep(x64Procedure *p, x64Addr base, AstSelecto
 			}
 			// PROMOTED field via `using`: the loops above only see DIRECT fields, so a promoted
 			// field falls through with field_off=0 and aliases offset 0. Resolve via the Selection
-			// walk (x64_emit_deep_field_gep). Was the thread bug: Thread.win32_thread_id (promoted,
-			// off 8) resolved to 0 and overwrote the handle.
+			// walk (x64_emit_deep_field_gep).
 			if (!found && sel->selector->kind == Ast_Ident) {
 				x64Addr dg = x64_emit_deep_field_gep(p, base.mem, st, sel->selector->Ident.interned, /*allow_deref*/true);
 				if (dg.type != nullptr) return dg;
@@ -1254,8 +1225,6 @@ gb_internal x64Addr x64_emit_struct_ep(x64Procedure *p, x64Addr base, AstSelecto
 			// allocator@24). The checker may resolve the selector to the underlying Raw_* field
 			// entity (field != nullptr), but `st` is the aggregate type, not its Raw_ struct, so
 			// the struct-offset path can't run — apply the offset BY NAME regardless of `field`.
-			// (Gating on field==nullptr read .allocator at 0, the data ptr: _make stored it via
-			// the ^Raw_Dynamic_Array struct field @24, every read here saw @0 → make/delete crash.)
 			String fname = sel->selector->Ident.token.string;
 			if      (fname == "data")      { field_off =  0; }
 			else if (fname == "len")       { field_off =  8; }
@@ -1279,7 +1248,6 @@ gb_internal x64Addr x64_emit_struct_ep(x64Procedure *p, x64Addr base, AstSelecto
 		} else if (is_type_quaternion(st)) {
 			// quaternion components via .x/.y/.z/.w selectors (real/imag/jmag/kmag are builtins, not
 			// fields). Layout {imag@0, jmag, kmag, real} (esz=size/4) → x/y/z/w == imag/jmag/kmag/real.
-			// Without this .y/.z/.w resolved to offset 0 (same non-struct field gap as above).
 			i64 esz = type_size_of(st) / 4;
 			String fname = sel->selector->Ident.token.string;
 			if      (fname == "y") field_off = 1 * esz;
@@ -1302,8 +1270,7 @@ gb_internal x64Addr x64_emit_struct_ep(x64Procedure *p, x64Addr base, AstSelecto
 // e.g. `using params` where params: ^Filter_Params, then a bare `channels`/`dest` means params^.channels.
 // The field entity has no storage of its own — compute it every time from the using_parent's address +
 // the field offset. Handles a pointer parent (`using p: ^T`) by dereferencing. Returns {type==nullptr}
-// when it can't (unknown parent) so the caller falls through. Was core:image/png emitting bare `width`/
-// `channels`/`dest`/`depth` as unresolved external symbols (fell to the global LEA [RIP+name] path).
+// when it can't (unknown parent) so the caller falls through.
 gb_internal x64Addr x64_get_using_variable(x64Procedure *p, Entity *e) {
 	Entity *parent = e->using_parent;
 	if (parent == nullptr) return x64addr(X64Mem{}, nullptr);
@@ -1449,9 +1416,8 @@ gb_internal x64Addr x64_build_addr_index_expr(x64Procedure *p, Ast *expr) {
 		// `m[k1].field`. Materialize the map VALUE (zero/nil map if the key is absent, which
 		// __dynamic_map_get handles safely) into a temp and return its address; the outer op then
 		// operates on that addressable copy. Mirrors LLVM's lb_addr_load(lbAddr_Map) for the inner
-		// index. (Using &m[k1]'s element pointer would be nil for an absent key → deref crash.) Was:
-		// this fell to the garbage-temp fallback below → `m["LOG"]["level"]` read a bogus inner map →
-		// segfault (core:encoding/ini parse_ini). Chained map STORE still prefers the &m[k] path.
+		// index. (Using &m[k1]'s element pointer would be nil for an absent key → deref crash.)
+		// Chained map STORE still prefers the &m[k] path.
 		x64Value v = x64_build_map_index_load(p, idx->expr, idx->index, t);
 		if (v.kind != x64Value_Mem) v = x64_spill_value(p, v, t);
 		return x64addr(v.mem, t);
@@ -1467,8 +1433,7 @@ gb_internal x64Addr x64_build_addr_index_expr(x64Procedure *p, Ast *expr) {
 // Addressing_SoaVariable machinery (lb_addr_soa_variable); compute the element address directly. The #soa
 // struct is { f0:[^]F0, f1:[^]F1, …, __$len:int } for slice/dynamic (each field a pointer), or
 // { f0:[N]F0, … } inline for fixed. `soa[idx].fk` = (slice/dyn: load the [^]Fk at the field's offset;
-// fixed: soa_base + field_offset) + idx*size(Fk). Was UNIMPLEMENTED → read as an AoS slice → garbage/AV
-// (reflect.struct_fields_zipped returns #soa[]Struct_Field → core:encoding/json crash → config_load fail).
+// fixed: soa_base + field_offset) + idx*size(Fk).
 gb_internal x64Addr x64_build_soa_index_field(x64Procedure *p, Ast *ie_expr, Ast *sel_ast, Type *field_type) {
 	ast_node(ie, IndexExpr, ie_expr);
 	Type *soa_ptr_t = ie->expr->tav.type;
@@ -1589,16 +1554,14 @@ gb_internal x64Addr x64_build_addr(x64Procedure *p, Ast *expr) {
 	expr = unparen_expr(expr);
 	Type *t = expr->tav.type;
 
-	// A constant has no storage or linker symbol. AGGREGATE constants → emitted once into
-	// .rdata and referenced by address (mirrors lb_add_global_generated_from_procedure for
-	// &CONST). SCALAR constants → a stack local. Without this, &named/compound constant fell
-	// through to the Ident global path → LEA [RIP+name] → unresolved.
+	// A constant has no storage or linker symbol. AGGREGATE constants → emitted once into .rdata
+	// and referenced by address (mirrors lb_add_global_generated_from_procedure for &CONST).
+	// SCALAR constants → a stack local.
 	//
 	// EXCEPT a CompoundLit operand: `&T{…}` is a pointer to a FRESH MUTABLE temporary (Odin
 	// semantics), even when the literal is a compile-time constant. Routing it to the read-only
-	// .rdata constant made writes through the pointer fault — `copy_n`'s `&Limited_Reader{}`
-	// then `l.r = r` wrote to .rdata → AV (THE blick cbor.decode / project-open crash). Let it
-	// fall to the default case below, which spills a WRITABLE stack copy.
+	// .rdata constant would fault on writes through the pointer — let it fall to the default case
+	// below, which spills a WRITABLE stack copy.
 	if (expr->tav.mode == Addressing_Constant && expr->kind != Ast_CompoundLit) {
 		Type *ct = t ? x64_typed(t) : t_int;
 		i64 sz = x64_type_size(ct); if (sz <= 0) sz = 8;
@@ -1659,8 +1622,7 @@ gb_internal x64Addr x64_build_addr(x64Procedure *p, Ast *expr) {
 	case_ast_node(sel, SelectorExpr, expr); {
 		// Package-qualified selector (e.g. `runtime.args__`): base is an import name with no
 		// value (Addressing_Invalid), so build the SELECTOR directly — it resolves to the
-		// global/proc entity (mirrors lb_build_addr). Without this the field-offset path below
-		// would build off the package "value" (garbage).
+		// global/proc entity (mirrors lb_build_addr).
 		if (unparen_expr(sel->selector)->kind == Ast_Ident &&
 		    sel->expr->tav.mode == Addressing_Invalid) {
 			return x64_build_addr(p, unparen_expr(sel->selector));
@@ -1753,13 +1715,10 @@ gb_internal x64Addr x64_build_addr(x64Procedure *p, Ast *expr) {
 	} case_end;
 
 	case_ast_node(ta, TypeAssertion, expr); {
-		// `&x.(T)`: address of the variant DATA inside the union/any — NOT a copy. Falling through to
-		// default spilled a COPY (x64_build_type_assertion copies the value out), so writes through the
-		// pointer never reached the real aggregate (e.g. a worker doing `v := &stream.variant.(Video);
-		// v.ready = true` set the flag on a throwaway temp → the reader's union field stayed false).
-		// The variant value lives at offset 0 of a tagged/maybe-pointer union, so &union is the data
-		// ptr; for `any` the data ptr is the `.data` field. Mirrors LLVM lb_build_addr TypeAssertion.
-		// (Tag/id mismatch panic is not emitted, matching the existing value path.)
+		// `&x.(T)`: address of the variant DATA inside the union/any — NOT a copy (default would spill
+		// a copy, so writes through the pointer wouldn't reach the real aggregate). The variant value
+		// lives at offset 0 of a tagged/maybe-pointer union, so &union is the data ptr; for `any` it is
+		// the `.data` field. Mirrors LLVM lb_build_addr TypeAssertion. (No tag/id mismatch panic.)
 		bool maybe_unwrap = ta->type != nullptr && ta->type->kind == Ast_UnaryExpr &&
 		                    ta->type->UnaryExpr.op.kind == Token_Question;
 		Type *dst_type = (ta->type != nullptr && !maybe_unwrap) ? type_of_expr(ta->type) : t;
@@ -1768,9 +1727,7 @@ gb_internal x64Addr x64_build_addr(x64Procedure *p, Ast *expr) {
 		Type *expr_bt = base_type(x64_typed(ta->expr->tav.type));
 		// `ptr.(T)` auto-derefs: the union/any lives at *ptr, so its address is the pointer VALUE
 		// (x64_build_expr), not &ptr — x64_build_addr on a pointer variable returns the address of the
-		// pointer slot itself. Writing a >8B variant there overflows the stack. Was aes/ct64's
-		// init_impl `&ctx.(ct64.Context)` with ctx:^union → the 968-byte key schedule written to the
-		// wrong slot → stack smash → crypto test_aead SEGV. (Value operand keeps the &union path below.)
+		// pointer slot itself. (Value operand keeps the &union path below.)
 		if (expr_bt != nullptr && expr_bt->kind == Type_Pointer) {
 			Type *pointee_bt = base_type(x64_typed(expr_bt->Pointer.elem));
 			x64Value pv = x64_build_expr(p, ta->expr);                // pointer value = &union / &any
@@ -1816,8 +1773,7 @@ gb_internal x64Addr x64_build_addr(x64Procedure *p, Ast *expr) {
 // = plain MOV, atomic_store = LOCK XCHG (atomic + full barrier, valid for seq_cst). RMW:
 // LOCK XADD (add/sub) / LOCK XCHG (exchange) return the OLD value; or/and/xor/nand use a
 // LOCK CMPXCHG retry loop; compare_exchange = one LOCK CMPXCHG → (old, ok). `_explicit`
-// ordering args are ignored (LOCK ops are seq_cst; x86 loads/stores need no fence). Without
-// these, atomics silently no-op'd (sync.Mutex/Sema, thread flags) → threads hung. Mirrors
+// ordering args are ignored (LOCK ops are seq_cst; x86 loads/stores need no fence). Mirrors
 // LLVM lb_build_builtin_proc's atomic cases.
 gb_internal bool x64_is_atomic_builtin(i32 id) {
 	switch (id) {
@@ -1931,8 +1887,7 @@ gb_internal x64Value x64_build_atomic(x64Procedure *p, Ast *expr, i32 id) {
 }
 
 // Scalar compiler intrinsics (intrinsics.odin) lowered inline, mirroring lb_build_builtin_proc.
-// These are NOT runtime calls in LLVM either (LLVM lowers them to llvm.* intrinsics) — without
-// them they silently no-op and return garbage (e.g. overflow_add → 0 broke the temp arena).
+// These are NOT runtime calls in LLVM either (LLVM lowers them to llvm.* intrinsics).
 gb_internal bool x64_is_simple_intrinsic(i32 id) {
 	switch (id) {
 	case BuiltinProc_count_ones: case BuiltinProc_count_zeros:
@@ -1972,9 +1927,7 @@ gb_internal x64Value x64_build_intrinsic(x64Procedure *p, Ast *expr, i32 id) {
 	// alloca(size, align): grow the stack by `size` (16-aligned) and return a pointer ABOVE the
 	// fixed call area (shadow 32 + outgoing 64 = 96), which is rsp-relative and follows rsp down — so
 	// later calls write their shadow/args below the alloca region without clobbering it. rsp is
-	// restored to rbp in the epilogue, freeing it. Was UNIMPLEMENTED → returned 0 (nil) → callers
-	// crashed (core:encoding/json unmarshal_object's `field_used := alloca(...)` → mem_zero(nil) → AV →
-	// config_load failed → wrong window size). Result is 16-aligned (covers align ≤ 16; json uses 1).
+	// restored to rbp in the epilogue, freeing it. Result is 16-aligned (covers align ≤ 16).
 	if (id == BuiltinProc_alloca) {
 		x64Value sz = x64_build_expr(p, ce->args[0]);
 		x64_value_to_reg(p, sz, X64Reg_RAX);
@@ -2166,8 +2119,6 @@ gb_internal x64Value x64_build_intrinsic(x64Procedure *p, Ast *expr, i32 id) {
 
 	// 128-bit bit-count intrinsics: no 128b GPR, so split into hi/lo 64-bit halves and combine.
 	// Result type is the 16-byte input type → return a Mem (count in low 8B, high 8B zeroed).
-	// Returning x64v_none() here (the old bail) fed a bogus operand into callers like floattidf's
-	// `N - count_leading_zeros(a)` → garbage/crash (reflect.as_f64(i128) segfault).
 	if (bytes == 16 && (id == BuiltinProc_count_ones || id == BuiltinProc_count_zeros ||
 	    id == BuiltinProc_count_leading_zeros  || id == BuiltinProc_count_trailing_zeros ||
 	    id == BuiltinProc_count_leading_ones   || id == BuiltinProc_count_trailing_ones)) {
@@ -2328,8 +2279,7 @@ gb_internal x64Value x64_build_value_builtin(x64Procedure *p, Ast *expr, i32 id)
 		return x64_emit_arith_matrix(p, Token_Mul, a, b, x64_typed(expr->tav.type), /*component_wise*/true);
 	}
 	// matrix_flatten(m) → the matrix's raw internal storage reinterpreted as a [R*C]T array (same byte
-	// size, incl. any column padding); a straight copy (mirrors lb_emit_matrix_flatten memcpy). Was
-	// unimplemented → 0 (test_issue_4210 flatten reads all zero; the literal store itself was correct).
+	// size, incl. any column padding); a straight copy (mirrors lb_emit_matrix_flatten memcpy).
 	if (id == BuiltinProc_matrix_flatten) {
 		Type *rt = x64_typed(expr->tav.type);
 		x64Value m = x64_build_expr(p, ce->args[0]);
@@ -2368,12 +2318,8 @@ gb_internal x64Value x64_build_value_builtin(x64Procedure *p, Ast *expr, i32 id)
 
 	if (id == BuiltinProc_real || id == BuiltinProc_imag || id == BuiltinProc_jmag || id == BuiltinProc_kmag) {
 		Type *vt = base_type(x64_typed(ce->args[0]->tav.type));
-		// The component ALWAYS has the operand's element float type (f64 for complex128). Do NOT use
-		// expr->tav.type: when the checker types `real(z)` in a wider target context (e.g. boxed into a
-		// union like cbor.Value, or converted to f32) tav.type is that target — labelling the raw float
-		// bytes as it skips the real conversion (union boxing → wrong tag; f32 cast → no truncation). Let
-		// the caller's emit_conv handle any further conversion. Was cbor's complex encode: real(z) boxed
-		// into cbor.Value got a garbage variant tag → the [2]Value array encoded to nothing.
+		// Component type is the operand's element float type, NOT expr->tav.type (which may be a wider
+		// target context, e.g. boxed into a union or cast to f32); the caller's emit_conv handles the rest.
 		Type *ft = x64_typed(base_complex_elem_type(vt));
 		i64 esz = type_size_of(base_complex_elem_type(vt));
 		bool cplx = is_type_complex(vt);
@@ -2523,22 +2469,13 @@ gb_internal x64Value x64_emit_conv(x64Procedure *p, x64Value src, Type *from, Ty
 
 	// f16 conversions via the runtime libgcc-style helpers (x64 has no native f16; F16C not assumed).
 	// extendhfsf2(f16)->f32, truncsfhf2(f32)->f16, truncdfhf2(f64)->f16 (Odin entity names; link __…).
-	// f16be is byte-swapped to/from LE around the helper. (Helper bodies now compile — see the float
-	// compound-assign fix; gnu_h2f_ieee's `v.f *= magic.f` previously gave 0.)
+	// f16be is byte-swapped to/from LE around the helper.
 	{
 		bool dst_f16 = x64_is_f16(dst_base);
 		bool src_f16 = (src_base != nullptr) && x64_is_f16(src_base);
-		// SCALAR f16 conversions only. A `f16 -> [N]f16` / `f16 -> #simd[N]f16` is a scalar→aggregate
-		// BROADCAST (e.g. `vec_f16 * f16_scalar`) and must fall through to the array/#simd broadcast cases
-		// below — NOT be treated as an f16→scalar conv (which returned a 4-byte f32 typed as the array →
-		// movss-spilled → low half landed in lane 0 = 0, high half in lane 1). Was the blick rounded-corner
-		// bug: corner_roundness ([4]f16) * f16(dpi) → garbage lanes.
-		// Only a genuine f16 *numeric* conversion (both sides float/int). Boxing an f16 INTO a union
-		// variant / any / struct — or broadcasting to [N]f16 / #simd — is NOT an f16 scalar conv and
-		// must fall through to the union/aggregate construction below. The old guard only excluded
-		// arrays/#simd, so `f16 -> union` relabeled an f32 as the union type and skipped
-		// x64_store_union_variant → variant value + tag never written → cbor's half-float decode of
-		// 0.5 boxed into cbor.Value read back as 0 (blick's saved layout fractions collapsed to 0).
+		// SCALAR f16 numeric conversions only (both sides float/int). A `f16 -> [N]f16` / `#simd[N]f16`
+		// is a scalar→aggregate BROADCAST, and boxing an f16 INTO a union/any/struct is a construction —
+		// both must fall through to the aggregate/union cases below, not be treated as an f16 scalar conv.
 		bool dst_num = is_type_float(dst_base) || is_type_integer(dst_base);
 		bool src_num = src_base != nullptr && (is_type_float(src_base) || is_type_integer(src_base));
 		if ((src_f16 && dst_num) || (dst_f16 && src_num)) {
@@ -2590,10 +2527,8 @@ gb_internal x64Value x64_emit_conv(x64Procedure *p, x64Value src, Type *from, Ty
 
 	// Complex/quaternion conversions (component-wise float convert; mirrors lb_emit_conv). x64 has no
 	// native complex/quaternion — they're aggregates of 2/4 floats — so a widening/narrowing conv
-	// (e.g. `complex128(complex64)` in fmt's fmt_value) must convert EACH float component, not
-	// reinterpret bits. Without this it fell to the reinterpret fallback → garbage (fmt printed
-	// complex64 as 32768.008+0i; quaternion widening then segfaulted). complex layout {real@0, imag@1};
-	// quaternion @QuaternionLayout {x/imag@0, y/jmag@1, z/kmag@2, w/real@3}.
+	// (e.g. `complex128(complex64)`) must convert EACH float component, not reinterpret bits.
+	// complex layout {real@0, imag@1}; quaternion @QuaternionLayout {x/imag@0, y/jmag@1, z/kmag@2, w/real@3}.
 	if (src_base != nullptr && (is_type_complex(dst_base) || is_type_quaternion(dst_base))) {
 		Type *dft  = x64_typed(base_complex_elem_type(dst_base));
 		i64   desz = type_size_of(dft);
@@ -2642,15 +2577,13 @@ gb_internal x64Value x64_emit_conv(x64Procedure *p, x64Value src, Type *from, Ty
 		return x64v_reg(x64_typed(to), X64Reg_RAX);
 	}
 	// 128-bit integer → float: no SSE cvtsi2s* for 128-bit operands. Call the runtime compiler-rt
-	// helpers (__floattidf / __floattidf_unsigned) for f64, then narrow for f32/f16. Was reflect's
-	// as_f64(i128) → garbage (the cvtsi2sd path below saw only the low 64 bits). Must precede it.
+	// helpers (__floattidf / __floattidf_unsigned) for f64, then narrow for f32/f16. Must precede the
+	// cvtsi2sd path below (which sees only the low 64 bits).
 	if (x64_is_float(dst_base) && src_base != nullptr && is_type_integer(src_base) && type_size_of(src_base) == 16) {
 		bool uns = !x64_is_signed_integer(src_base);
 		// floattidf/_unsigned take the i128/u128 by value, but Win64 passes a 16-byte scalar param
 		// INDIRECTLY (a pointer to a caller copy). x64_emit_call has no per-arg indirect lowering, so
-		// pass the address ourselves as a pointer-typed arg (mirrors the normal call path's indirect
-		// slot). Passing the raw 16B value loaded only its low 8B as the "pointer" → floattidf deref'd
-		// a small int as an address → segfault (reflect.as_f64(i128) crash).
+		// pass the address ourselves as a pointer-typed arg (mirrors the normal call path's indirect slot).
 		x64Value slot = x64_spill_value(p, src, x64_typed(from));
 		GB_ASSERT(slot.kind == x64Value_Mem);
 		i32 ptr_off = x64_alloc_local(p, 8, 8);
@@ -2664,9 +2597,7 @@ gb_internal x64Value x64_emit_conv(x64Procedure *p, x64Value src, Type *from, Ty
 	if (x64_is_float(dst_base) && src_base != nullptr && x64_is_integer(src_base)) {
 		x64_value_to_reg(p, src, X64Reg_RAX);
 		// A big-endian integer source (u32be/i16be/…) is stored byte-reversed, so the raw load into RAX
-		// holds the swapped value — normalize to native BEFORE the width-extend + cvtsi2s*. The int→int
-		// path already did this; the float path did not → `f32(u32be)` reinterpreted the reversed bytes
-		// (THE png cHRM/gAMA garbage: f32(u32be 31270) → 6.455296e8 = 0x267A0000 = bswap of 0x00007A26).
+		// holds the swapped value — normalize to native BEFORE the width-extend + cvtsi2s*.
 		if (is_type_different_to_arch_endianness(src_base)) {
 			i64 bsz = type_size_of(src_base);
 			if      (bsz == 2) x64_emit_bswap16(p, X64Reg_RAX);
@@ -2775,8 +2706,7 @@ gb_internal x64Value x64_emit_conv(x64Procedure *p, x64Value src, Type *from, Ty
 	// Matrix → matrix cast (mirrors lb_emit_conv's is_type_matrix(dst)&&is_type_matrix(src)). Same dims:
 	// element-wise copy (+ elem conv). Both square, different dims (submatrix cast): copy the overlapping
 	// top-left block, put 1 on the EXTENDED diagonal (i==j beyond src), 0 elsewhere. Same total count:
-	// column-major reshape. Was: fell through to a raw reinterpret → `mat4(mat2)` left the extended
-	// diagonal 0 (m4[2,2] should be 1). Must precede the scalar→matrix path (src IS a matrix here).
+	// column-major reshape. Must precede the scalar→matrix path (src IS a matrix here).
 	if (dst_base->kind == Type_Matrix && src_base != nullptr && src_base->kind == Type_Matrix) {
 		Type *delem = base_type(dst_base->Matrix.elem);
 		Type *selem = base_type(src_base->Matrix.elem);
@@ -2863,9 +2793,8 @@ gb_internal x64Value x64_emit_conv(x64Procedure *p, x64Value src, Type *from, Ty
 	}
 
 	// Widen a ≤8-byte integer to a 128-bit integer (i128/u128): the reg-scalar path can't represent
-	// 16 bytes, so without this it fell to the reinterpret fallback → high 64 bits left GARBAGE (THE
-	// udivmod128 `u128(n[low]/d[low])` bug → bad i128 div/mod + strconv u128 format). Build a 16-byte
-	// temp: low = the (extended) source, high = sign-extension (signed) or 0 (unsigned).
+	// 16 bytes (the reinterpret fallback would leave the high 64 bits GARBAGE). Build a 16-byte temp:
+	// low = the (extended) source, high = sign-extension (signed) or 0 (unsigned).
 	if (is_type_integer(dst_base) && type_size_of(dst_base) == 16 &&
 	    from != nullptr && is_type_integer(src_base) && type_size_of(src_base) <= 8) {
 		// A big-endian source stores its bytes reversed, so normalize it to native first (value_to_reg
@@ -2884,8 +2813,7 @@ gb_internal x64Value x64_emit_conv(x64Procedure *p, x64Value src, Type *from, Ty
 		else            { x64_emit_xor_rr(&p->asm_, X64OpSize_32, X64Reg_RDX, X64Reg_RDX); }
 		x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(off + 8), X64Reg_RDX);
 		// Native little-endian 128-bit value now at [off]. A big-endian DESTINATION (u128be) needs all
-		// 16 bytes reversed: bswap each half + swap the halves. Was cast(u128be)i64 storing native bytes
-		// → every later be op read garbage (uuid generate_v6's timestamp was all-but-one-byte zero).
+		// 16 bytes reversed: bswap each half + swap the halves.
 		if (is_type_different_to_arch_endianness(dst_base)) {
 			i32 doff = x64_alloc_local(p, 16, 16);
 			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(off));
@@ -2917,11 +2845,9 @@ gb_internal x64Value x64_emit_conv(x64Procedure *p, x64Value src, Type *from, Ty
 	}
 
 	// Narrow a 128-bit big-endian integer to a ≤8-byte integer: a be value stores its bytes reversed, so
-	// its LOW bits live in the HIGH (last) bytes. The ≤8-endian path below can't reach a 16-byte source
-	// and the fallback reinterpret would take the first 8 (most-significant, here all-zero) bytes — THE
-	// uuid raw_time_v7 bug where `cast(u64)(u128be >> 80)` returned 0. Normalize the source to native
-	// (byte-swap all 16 via the 128↔128 path), then narrow through the platform type so a be DESTINATION
-	// still gets its own byte-swap (mirrors lb_emit_conv's endian-then-truncate order).
+	// its LOW bits live in the HIGH (last) bytes. The ≤8-endian path below can't reach a 16-byte source.
+	// Normalize the source to native (byte-swap all 16 via the 128↔128 path), then narrow through the
+	// platform type so a be DESTINATION still gets its own byte-swap (endian-then-truncate order).
 	if (src_base != nullptr && is_type_integer(src_base) && is_type_integer(dst_base) &&
 	    type_size_of(src_base) == 16 && type_size_of(dst_base) <= 8 &&
 	    is_type_different_to_arch_endianness(src_base)) {
@@ -2935,8 +2861,6 @@ gb_internal x64Value x64_emit_conv(x64Procedure *p, x64Value src, Type *from, Ty
 
 	// Endian integer conversions: u16be/u32be/u64be (and *le on a BE arch) store bytes in the non-native
 	// order, so converting to/from one must byte-swap (mirrors lb_emit_conv int↔int endian handling).
-	// Without this `u64(u32be)` read the bytes natively → net's parse_ip4_address formatted 0100007f
-	// instead of 7f000001. 128-bit endian ints (IP6 u128be) are left to the fallthrough (TODO).
 	if (src_base != nullptr && is_type_integer(src_base) && is_type_integer(dst_base) &&
 	    type_size_of(src_base) <= 8 && type_size_of(dst_base) <= 8 &&
 	    (is_type_different_to_arch_endianness(src_base) || is_type_different_to_arch_endianness(dst_base))) {
@@ -3114,6 +3038,57 @@ gb_internal x64Value x64_soa_zip(x64Procedure *p, Ast *expr) {
 	return x64v_mem(res_t, x64_rbp_mem(res));
 }
 
+// soa_unzip(s: #soa[]T) → (…[]Ci) (mirrors lb_soa_unzip): recover each component slice.
+// s is a StructSoa_Slice struct — fields[0..n-1] are the per-member [^] multipointers,
+// field[n] is __$len. result[i] = {data = s.field[i], len = s.len}. Result is a tuple.
+gb_internal x64Value x64_soa_unzip(x64Procedure *p, Ast *expr) {
+	ast_node(ce, CallExpr, expr);
+	x64Value arg = x64_build_expr(p, ce->args[0]);
+	Type *at = base_type(arg.type);
+	if (at == nullptr || at->kind != Type_Struct) return x64v_none();
+	type_set_offsets(at);
+	int n = (int)at->Struct.fields.count - 1; // last field is __$len
+
+	// Stabilise the arg to an RBP-relative buffer: each component read re-reads arg.mem.
+	if (arg.kind != x64Value_Mem || (arg.mem.base != X64Reg_RBP && !arg.mem.rip_rel)) {
+		i32 tmp = x64_alloc_local(p, type_size_of(at), type_align_of(at));
+		x64_store_value(p, x64addr(x64_rbp_mem(tmp), at), arg);
+		arg = x64v_mem(at, x64_rbp_mem(tmp));
+	}
+
+	i32 len_off = x64_alloc_local(p, 8, 8);
+	x64_emit_lea(&p->asm_, X64Reg_RAX, arg.mem);
+	x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RCX, x64_mem(X64Reg_RAX, (i32)at->Struct.offsets[n]));
+	x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(len_off), X64Reg_RCX);
+
+	Type *res_t  = x64_typed(expr->tav.type);
+	Type *res_bt = base_type(res_t);
+
+	if (res_bt != nullptr && res_bt->kind == Type_Tuple) {
+		i32 res = x64_alloc_local(p, type_size_of(res_bt), type_align_of(res_bt));
+		x64Value rv = x64v_mem(res_t, x64_rbp_mem(res));
+		for (int i = 0; i < n; i++) {
+			x64Addr dst = x64_emit_tuple_ep(p, rv, i); // []Ci: {data@0, len@8}
+			x64_emit_lea(&p->asm_, X64Reg_RAX, arg.mem);
+			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RCX, x64_mem(X64Reg_RAX, (i32)at->Struct.offsets[i]));
+			x64_emit_mov_mr(&p->asm_, X64OpSize_64, dst.mem, X64Reg_RCX);
+			X64Mem lm = dst.mem; lm.disp += 8;
+			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RCX, x64_rbp_mem(len_off));
+			x64_emit_mov_mr(&p->asm_, X64OpSize_64, lm, X64Reg_RCX);
+		}
+		return rv;
+	}
+
+	// Single-component #soa → a lone []C0 slice.
+	i32 res = x64_alloc_local(p, type_size_of(res_t), type_align_of(res_t));
+	x64_emit_lea(&p->asm_, X64Reg_RAX, arg.mem);
+	x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RCX, x64_mem(X64Reg_RAX, (i32)at->Struct.offsets[0]));
+	x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(res), X64Reg_RCX);
+	x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RCX, x64_rbp_mem(len_off));
+	x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(res + 8), X64Reg_RCX);
+	return x64v_mem(res_t, x64_rbp_mem(res));
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Expression value building
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3224,14 +3199,11 @@ gb_internal x64Value x64_reconstruct_call_result(x64Procedure *p, Type *ct, int 
 // step-over debugging (Tier-1; S_INLINESITE inline-frames are a planned Tier-2 addition).
 #define X64_MAX_INLINE_DEPTH 8
 gb_internal bool x64_try_inline_call(x64Procedure *p, AstCallExpr *ce, Entity *callee, Type *ct, x64Value *out) {
-	// Mirror LLVM EXACTLY: at -O0 + -debug the module pass manager runs NOTHING — including the
-	// always-inliner (llvm_backend_opt.cpp:189 returns before LLVMAddAlwaysInlinerPass) — so LLVM
-	// leaves #force_inline procs as REAL CALLS in debug builds. A real call has its own frame and is
-	// trivially steppable in every debugger; a manual inline produces S_INLINESITE inline frames that
-	// VS/RemedyBG/RAD don't surface (verified: the records are byte-correct but no debugger steps in).
-	// So DON'T inline in debug builds — keep the real call. Inline only where LLVM would: opt>0, or
-	// -O0 without -debug (then the always-inliner runs). Callees stay reachable via the normal call
-	// path's on-demand min_dep==0 compilation.
+	// Mirror LLVM: at -O0 + -debug the pass manager runs NOTHING (not even the always-inliner), so
+	// LLVM leaves #force_inline procs as REAL CALLS in debug builds — a real call is trivially
+	// steppable, whereas manual inlining produces S_INLINESITE frames debuggers don't surface. Only
+	// inline where LLVM would: opt>0, or -O0 without -debug. Callees stay reachable via the normal
+	// call path's on-demand min_dep==0 compilation.
 	if (build_context.optimization_level <= 0 && build_context.ODIN_DEBUG) return false;
 
 	if (callee == nullptr || callee->kind != Entity_Procedure || callee->Procedure.is_foreign) return false;
@@ -3410,7 +3382,7 @@ gb_internal i32 x64_i128_operand(x64Procedure *p, x64Value v, Type *wide_t, bool
 }
 
 // 128-bit integer (i128/u128, 16-byte bit_set) arithmetic via two-register (lo:hi) lowering — x64 has no
-// 128-bit GP register, so x64_emit_arith's single-register path truncated+crashed. add/sub use ADC/SBB;
+// 128-bit GP register, so x64_emit_arith's single-register path can't be used. add/sub use ADC/SBB;
 // bitwise is per-half; shifts use SHLD/SHRD with a count≥64 branch (Odin: count≥width → 0); mul is the
 // truncated 3-product; quo/mod call the runtime __udivti3/__divti3/__umodti3/__modti3 helpers (sret ABI).
 gb_internal x64Value x64_emit_arith_i128(x64Procedure *p, TokenKind op, x64Value lhs, x64Value rhs, Type *result_type, bool signed_) {
@@ -3650,7 +3622,6 @@ gb_internal x64Value x64_emit_arith(x64Procedure *p, TokenKind op, x64Value lhs,
 	}
 
 	// f16 arithmetic via f32 promotion (x64 has no native f16 arith): a op b = f16(f32(a) op f32(b)).
-	// Was: f16 fell to the integer path → int ops on the raw bits. (pow2_f16's denormal `*`/`/`.)
 	if (x64_is_f16(lt)) {
 		x64Value la = x64_spill_value(p, x64_emit_conv(p, lhs, lt, t_f32), t_f32);
 		x64Value ra = x64_spill_value(p, x64_emit_conv(p, rhs, rhs.type ? rhs.type : lt, t_f32), t_f32);
@@ -3712,17 +3683,27 @@ gb_internal x64Value x64_emit_arith(x64Procedure *p, TokenKind op, x64Value lhs,
 	case Token_Quo:
 	case Token_Mod: case Token_ModMod: {
 		// 8-bit DIV/IDIV are special: dividend is AX (not DX:AX), quotient→AL, remainder→AH — NOT DX.
-		// The RDX-based sequence below then read RDX(=0) for the remainder → `u8 % 10` returned 0 (the
-		// month-as-00 bug). Promote 8-bit to 32-bit (operands are already extended in RAX/RCX by
-		// value_to_reg) so quotient lands in EAX and remainder in EDX like the wider sizes.
+		// The RDX-based sequence below would then read RDX for the remainder. Promote sub-32-bit to
+		// 32-bit (operands are extended in RAX/RCX by value_to_reg) so quotient lands in EAX and
+		// remainder in EDX like the wider sizes. 16-bit is promoted too: the floored-mod fixup below
+		// re-divides with 16-bit ops that leave stale upper EAX bits, so cdq/idiv-16 would read garbage DX.
 		X64OpSize dsz = sz;
-		if (sz == X64OpSize_8) {
-			if (signed_) { x64_emit_movsx_rr(&p->asm_, X64OpSize_8, X64Reg_RAX, X64Reg_RAX); x64_emit_movsx_rr(&p->asm_, X64OpSize_8, X64Reg_RCX, X64Reg_RCX); }
-			else         { x64_emit_movzx_rr(&p->asm_, X64OpSize_8, X64Reg_RAX, X64Reg_RAX); x64_emit_movzx_rr(&p->asm_, X64OpSize_8, X64Reg_RCX, X64Reg_RCX); }
+		if (sz == X64OpSize_8 || sz == X64OpSize_16) {
+			if (signed_) { x64_emit_movsx_rr(&p->asm_, sz, X64Reg_RAX, X64Reg_RAX); x64_emit_movsx_rr(&p->asm_, sz, X64Reg_RCX, X64Reg_RCX); }
+			else         { x64_emit_movzx_rr(&p->asm_, sz, X64Reg_RAX, X64Reg_RAX); x64_emit_movzx_rr(&p->asm_, sz, X64Reg_RCX, X64Reg_RCX); }
 			dsz = X64OpSize_32;
 		}
 		if (signed_) { if (dsz==X64OpSize_64) x64_emit_cqo(&p->asm_); else x64_emit_cdq(&p->asm_); x64_emit_idiv_r(&p->asm_, dsz, X64Reg_RCX); }
 		else         { x64_emit_xor_rr(&p->asm_, X64OpSize_32, X64Reg_RDX, X64Reg_RDX); x64_emit_div_r(&p->asm_, dsz, X64Reg_RCX); }
+		// Signed `%%` is the FLOORED modulo (sign of divisor): z = ((x % y) + y) % y (mirrors
+		// lb_emit_arith Token_ModMod). Plain remainder (RDX) is truncated (sign of dividend), so
+		// `-3 %% 4` would wrongly give -3 instead of 1. Unsigned %% == % (already correct).
+		if (op == Token_ModMod && signed_) {
+			x64_emit_mov_rr(&p->asm_, dsz, X64Reg_RAX, X64Reg_RDX); // RAX = x % y
+			x64_emit_add_rr(&p->asm_, dsz, X64Reg_RAX, X64Reg_RCX); // RAX = (x % y) + y
+			if (dsz==X64OpSize_64) x64_emit_cqo(&p->asm_); else x64_emit_cdq(&p->asm_);
+			x64_emit_idiv_r(&p->asm_, dsz, X64Reg_RCX);             // RDX = ((x % y) + y) % y
+		}
 		if (op == Token_Mod || op == Token_ModMod) x64_emit_mov_rr(&p->asm_, X64OpSize_64, X64Reg_RAX, X64Reg_RDX);
 		return x64v_reg(result_type, X64Reg_RAX);
 	}
@@ -3931,8 +3912,7 @@ gb_internal x64Value x64_emit_comp(x64Procedure *p, TokenKind op, x64Value lhs, 
 	// f16 comparison: f16 is moved as a raw 2-byte integer (x64_is_float excludes size-2), so it would
 	// fall to the INTEGER compare path below and compare raw BITS — wrong for floats: neg-zero(0x8000)
 	// != 0, NaN==NaN reads true, and </>/<=/>= treat the sign bit as an unsigned magnitude. Convert both
-	// operands to f32 and compare as floats (NaN-correct). Was math.classify_f16 returning Inf for
-	// Neg_Zero / NaN / Neg_Inf (x==0, x*0.25==x, x<0 all mis-evaluated).
+	// operands to f32 and compare as floats (NaN-correct).
 	if (x64_is_f16(lbt)) {
 		x64Value lf = x64_emit_conv(p, lhs, lt, t_f32);
 		lf = x64_spill_value(p, lf, t_f32); // stabilize: the rhs conversion below reuses XMM0
@@ -3946,8 +3926,7 @@ gb_internal x64Value x64_emit_comp(x64Procedure *p, TokenKind op, x64Value lhs, 
 	// EXCLUDE cstring/cstring16: those are 8B POINTERS (BasicFlag_String is set on them too), NOT
 	// 16B {data,len} — comparing them as strings transmutes the pointer to a Raw_String and reads
 	// garbage for .len. They fall through to the scalar pointer compare below (correct for `== nil`
-	// and pointer identity). Was the `wkey == nil` crash (wkey: cstring16) → string_eq →
-	// memory_equal(garbage_len) → SIMD overrun.
+	// and pointer identity).
 	if (is_type_string(lbt) && !is_type_cstring(lbt) && !is_type_cstring16(lbt)) {
 		bool is16 = is_type_string16(lbt);
 		String name = {};
@@ -3985,8 +3964,7 @@ gb_internal x64Value x64_emit_comp(x64Procedure *p, TokenKind op, x64Value lhs, 
 
 	// cstring comparison: CONTENT compare via runtime cstring_eq/ne/lt/le/gt/ge (cstrings are 8-byte
 	// pointers passed DIRECTLY, unlike 16-byte strings). These helpers are nil-safe (check the
-	// pointers first), so `cstring == nil` works too — distinct-pointer same-content cstrings now
-	// compare EQUAL (was a pointer compare → unequal; the flags test_all_strings failure).
+	// pointers first), so `cstring == nil` works too.
 	if ((is_type_cstring(lbt) || is_type_cstring16(lbt)) &&
 	    (op == Token_CmpEq || op == Token_NotEq || op == Token_Lt || op == Token_LtEq || op == Token_Gt || op == Token_GtEq)) {
 		bool is16 = is_type_cstring16(lbt);
@@ -4046,9 +4024,7 @@ gb_internal x64Value x64_emit_comp(x64Procedure *p, TokenKind op, x64Value lhs, 
 		// Non-simple comparable struct/union (string / other deep-compare members): the bitwise path
 		// above can't be used — it would compare string HEADERS (ptr,len) not content. Call the per-type
 		// synth equal proc `__$equal$<hash>(&lhs, &rhs) -> bool` (field-wise / tag-then-variant; strings
-		// by content, mirrors lb's generated record-equality proc). Was json unmarshal_json's
-		// `product == original` comparing only the first field's bytes, and cbor's unmarshalled union
-		// `dest == src` comparing the variant's string pointer instead of its bytes.
+		// by content, mirrors lb's generated record-equality proc).
 		if (lbt != nullptr && (lbt->kind == Type_Struct || lbt->kind == Type_Union) && is_type_comparable(lt)) {
 			if (lhs.kind != x64Value_Mem) lhs = x64_spill_value(p, lhs, lt);
 			if (rhs.kind != x64Value_Mem) rhs = x64_spill_value(p, rhs, lt);
@@ -4188,11 +4164,9 @@ gb_internal x64Value x64_emit_comp(x64Procedure *p, TokenKind op, x64Value lhs, 
 // `-` (negate; float = XOR sign bit), `~` (bitwise not), `!` (logical not → bool). Address-of (`&`) is
 // NOT here — it needs the lvalue and is handled in the UnaryExpr case via x64_build_addr.
 gb_internal x64Value x64_emit_unary_arith(x64Procedure *p, TokenKind op, x64Value val, Type *t) {
-	// Aggregate unary op (array / #simd): apply the scalar op element-wise. Without this, `-v` on a
-	// [3]f32 fell to the scalar path below → value_to_reg loaded only the low 8 of 12 bytes into RAX
-	// and integer-negated float bits → garbage (THE core:math/noise 3D bug: `a0 := f_sign * -ri` with
-	// ri:[3]f32; 2D/[2] and 4D/[4] "worked" only because power-of-2 sizes hid it less). Binary arith
-	// already has x64_emit_arith_array; this is its unary counterpart.
+	// Aggregate unary op (array / #simd): apply the scalar op element-wise. The scalar path below
+	// would load only the low 8 bytes and integer-negate float bits. Binary arith already has
+	// x64_emit_arith_array; this is its unary counterpart.
 	Type *ubt = (t != nullptr) ? base_type(t) : nullptr;
 	if (ubt != nullptr && (ubt->kind == Type_Array || ubt->kind == Type_SimdVector)) {
 		Type *et = (ubt->kind == Type_Array) ? ubt->Array.elem : ubt->SimdVector.elem;
@@ -4232,8 +4206,7 @@ gb_internal x64Value x64_emit_unary_arith(x64Procedure *p, TokenKind op, x64Valu
 	case Token_Sub: {
 		if (x64_is_f16(base_type(t))) {
 			// f16 is moved as a raw 2-byte integer, so x64_is_float is false — but negate must flip the
-			// SIGN BIT (XOR 0x8000), not two's-complement the bits. Was math.trunc_f16 wrong for every
-			// negative input (trunc uses -trunc_internal(-f)): NEG turned e.g. -8.07 into +Inf-ish garbage.
+			// SIGN BIT (XOR 0x8000), not two's-complement the bits.
 			x64_value_to_reg(p, val, X64Reg_RAX);
 			x64_emit_xor_ri(&p->asm_, X64OpSize_16, X64Reg_RAX, 0x8000);
 			return x64v_reg(t, X64Reg_RAX);
@@ -4295,7 +4268,7 @@ gb_internal x64Value x64_build_type_assertion(x64Procedure *p, Ast *expr) {
 
 		// `x.?` (Maybe/union unwrap): its type node is a `?` UnaryExpr and type_of_expr(`?`)
 		// is null, so derive the asserted type from the result (tav.type = union variant;
-		// comma-ok promotes to (value, bool)). Was type_of_expr(`?`)→null→x64v_none.
+		// comma-ok promotes to (value, bool)).
 		bool maybe_unwrap = ta->type != nullptr && ta->type->kind == Ast_UnaryExpr &&
 		                    ta->type->UnaryExpr.op.kind == Token_Question;
 		Type *dst_type = nullptr;
@@ -4416,8 +4389,7 @@ gb_internal x64Value x64_build_slice_expr(x64Procedure *p, Ast *expr) {
 
 		// Auto-deref a POINTER source: `p[lo:hi]` (p: ^[]T / ^[N]T / ^string) slices THROUGH the
 		// pointer (like IndexExpr; mirrors lb_build_addr). The effective aggregate address is the
-		// pointer VALUE, not &p. Without this `.data`/`.len` were read from &p / &p+8 (garbage len)
-		// — was os.read_directory→…→_split_iterator's `s[:]` (s: ^string) returning a huge len → hang.
+		// pointer VALUE, not &p (else `.data`/`.len` are read from &p / &p+8 → garbage len).
 		bool via_ptr = is_type_pointer(src_bt);
 		i32 src_ea_off = x64_alloc_local(p, 8, 8);
 		if (via_ptr) {
@@ -4436,8 +4408,6 @@ gb_internal x64Value x64_build_slice_expr(x64Procedure *p, Ast *expr) {
 			// bound to an outer-scope var), the slot must outlive the block — mark scope-lived so
 			// block/if reclamation never reuses it (mirrors LLVM's entry-hoisted allocas, same as the
 			// `&Foo{}` escape). Slice/DA sources point at heap `.data`, not the slot, so they're exempt.
-			// Was aes/ghash's partial-block `tmp:[16]byte; src=tmp[:]`: tmp reclaimed at else-block exit
-			// → the following unaligned_load's temp reused the slot → 16-byte load read duplicated bytes.
 			if ((src_bt->kind == Type_Array || src_bt->kind == Type_FixedCapacityDynamicArray) &&
 			    src_addr.mem.base == X64Reg_RBP && !src_addr.mem.rip_rel) {
 				if (p->local_size > p->escape_floor) p->escape_floor = p->local_size;
@@ -4616,9 +4586,8 @@ gb_internal x64Value x64_emit_logical_binary_expr(x64Procedure *p, TokenKind op,
 // a register made value_to_reg a no-op, degenerating the test to `mask & mask` (every elem read "in").
 gb_internal x64Value x64_build_binary_in(x64Procedure *p, Ast *left, Ast *right, TokenKind op) {
 	// type_deref: `k in m` also accepts a POINTER to the map/bit_set (auto-deref), e.g. `k in section`
-	// where `section := &m[k1]` is a ^map. base_type alone leaves rt as Type_Pointer → the Type_Map check
-	// below misses → the "unknown type" fallback returned false → duplicate keys never detected (was
-	// core:text/i18n's Duplicate_Key never firing). x64_map_addr_of handles the pointer operand itself.
+	// where `section := &m[k1]` is a ^map. base_type alone leaves rt as Type_Pointer → the Type_Map
+	// check below misses → the "unknown type" fallback. x64_map_addr_of handles the pointer itself.
 	Type *rt = base_type(x64_typed(type_deref(right->tav.type)));
 	if (rt != nullptr && rt->kind == Type_BitSet) {
 		Type     *it = bit_set_to_int(rt);
@@ -4700,10 +4669,8 @@ gb_internal x64Value x64_emit_comp_against_nil(x64Procedure *p, TokenKind op, As
 }
 
 // `&x.(T)` in COMMA-OK context → (^T, bool): the IN-PLACE variant address (nil on a tag/id mismatch)
-// plus ok. Mirrors lb_build_unary_and's Ast_TypeAssertion tuple branch. NOT a copy — the generic
-// build_unary_and returned a single ^T with no `ok`, so `if v, ok := &u.(T); ok {…}` saw ok=0 and the
-// body never ran (blick: `if v,ok := &stream.variant.(Video_Stream); ok { slot_map.init(&v.decode_map) }`
-// never initialised the decode_map → allocate_decoder bailed on nil .items → no frames → black monitor).
+// plus ok. Mirrors lb_build_unary_and's Ast_TypeAssertion tuple branch. NOT a copy — a single ^T with
+// no `ok` would make `if v, ok := &u.(T); ok {…}` always see ok=0.
 gb_internal x64Value x64_build_addr_type_assertion_tuple(x64Procedure *p, Ast *ta_expr, Type *tuple_type) {
 	ast_node(ta, TypeAssertion, ta_expr);
 	Type *dst_type = type_of_expr(ta->type);
@@ -4796,9 +4763,7 @@ gb_internal x64Value x64_build_unary_and(x64Procedure *p, Ast *expr) {
 	// The address of a stack-local lvalue may escape the block it was taken in (e.g. `p = &tmp` with p
 	// bound in an outer scope), so the slot must outlive that block — mark scope-lived so block/if
 	// reclamation never reuses it (mirrors the `&Foo{}` and `local[:]` escapes; LLVM hoists all allocas
-	// to entry so it never has this problem). Was crypto/blake2's final(finalize_clone=true): a local
-	// `tmp_ctx: T; clone(&tmp_ctx,ctx); ctx=&tmp_ctx` in an if-block, used after → tmp_ctx reclaimed →
-	// its slot reused → ctx.size read as garbage (136) → "slice 0:136 out of range 0..<32" + wrong hash.
+	// to entry so it never has this problem).
 	if (addr.mem.base == X64Reg_RBP && !addr.mem.rip_rel) {
 		if (p->local_size > p->escape_floor) p->escape_floor = p->local_size;
 	}
@@ -4912,8 +4877,7 @@ gb_internal x64Value x64_emit_or_return(x64Procedure *p, Ast *expr) {
 					lhs = x64v_mem(lhs_a.type, lhs_a.mem);
 				} else {
 					// count > 2: assemble the (count-1)-value success TUPLE into a local of tv.type
-					// (mirrors lb_emit_try_lhs_rhs). Was only capturing field 0 → 3+-value `or_return`
-					// (e.g. strconv `parse_components(str) or_return`) lost every value → parse failed.
+					// (mirrors lb_emit_try_lhs_rhs).
 					i32 sub = x64_alloc_local(p, type_size_of(tav.type), gb_max(type_align_of(tav.type), (i64)1));
 					for (int i = 0; i < count - 1; i++) {
 						x64Addr fa = x64_emit_tuple_ep(p, rv, i);
@@ -4940,8 +4904,7 @@ gb_internal x64Value x64_emit_or_return(x64Procedure *p, Ast *expr) {
 
 	// Success condition depends on the indicator TYPE (mirrors lb_emit_try_has_value): a BOOLEAN ok-flag
 	// succeeds when TRUE; an ERROR / nil-able value when NIL. A tagged UNION error is nil ⟺ tag==0 — the
-	// tag lives AFTER the variant block, so testing the first word (the variant DATA) is wrong. Was THE
-	// core:flags `set_option() or_return` bug: a non-nil Parse_Error union read as nil → never propagated.
+	// tag lives AFTER the variant block, so testing the first word (the variant DATA) is wrong.
 	// #shared_nil: nil ⟺ variant block all-zero. Enum/pointer/maybe-pointer errors keep a discriminant @0.
 	isize lbl_continue = x64_label_alloc(&p->asm_);
 	if (is_type_boolean(rhs_t)) {
@@ -4985,9 +4948,8 @@ gb_internal x64Value x64_emit_or_return(x64Procedure *p, Ast *expr) {
 				if (loff != nullptr) {
 					// Store via x64_store_value so a DIFFERING error type is CONVERTED, not copied raw: () or_return
 					// may propagate a small error (enum/pointer) into a result of a different error type (e.g. a
-					// compiler.Error enum -> a #shared_nil regex.Error union), which must be boxed (variant data +
-					// tag). A raw <=8B mov skipped the boxing -> the propagated union stayed nil (regex
-					// Program_Too_Big never surfaced). No-op conversion when the types already match.
+					// enum -> a #shared_nil union), which must be boxed (variant data + tag). A raw <=8B mov
+					// would skip the boxing. No-op conversion when the types already match.
 					x64_store_value(p, x64addr(x64_rbp_mem(*loff), last_res->type), rhs_mem);
 				}
 			}
@@ -5091,8 +5053,8 @@ gb_internal String x64_map_llvm_math_intrinsic(String ln) {
 }
 
 // Compute an `llvm.<op>.f16` math intrinsic (no ucrt symbol for f16) by promoting to f32: convert
-// each f16 arg → f32, call the .f32 ucrt fn, convert the f32 result → f16. Was: unmapped llvm.*.f16
-// no-op'd → 0, so math.pow(2, f16(n)) returned 0. Returns none if not an f16 intrinsic / .f32 unmapped.
+// each f16 arg → f32, call the .f32 ucrt fn, convert the f32 result → f16. Returns none if not an
+// f16 intrinsic / .f32 unmapped.
 gb_internal x64Value x64_try_llvm_f16_intrinsic(x64Procedure *p, AstCallExpr *ce, String fl, Type *result_type) {
 	if (fl.len < 5 || gb_strncmp((char const *)fl.text + fl.len - 4, ".f16", 4) != 0) return x64v_none();
 	int argc = (int)ce->args.count;
@@ -5529,7 +5491,7 @@ gb_internal x64Value x64_build_builtin_simd_proc_inner(x64Procedure *p, Ast *exp
 		Type *elem = base_type(vt->SimdVector.elem);
 		if (bop >= 0 && x64_simd_packed_ok(bop, elem)) { // binop_vec pads sub-128 to a 128-bit op
 			// Build+spill each operand in sequence: building rhs may reuse lhs's temp slot (esp. for
-			// small sub-128 vectors), so lhs MUST be spilled before rhs is built. (Was the sub-128 bug.)
+			// small sub-128 vectors), so lhs MUST be spilled before rhs is built.
 			x64Value la = x64_spill_value(p, x64_build_expr(p, ce->args[0]), vt);
 			x64Value ra = x64_spill_value(p, x64_build_expr(p, ce->args[1]), vt);
 			bool swap = (bop == X64SimdBin_AndN); // (v)pandn = (~v)&s → v=b, s=a to get a&~b
@@ -6659,9 +6621,8 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 	}
 	// A typeid CONSTANT whose mode is NOT Addressing_Type — e.g. a POINTER type `^T` used directly as a
 	// value (`x.id == ^os.File`): the checker folds it to an ExactValue_Typeid with mode Value/Constant,
-	// so the check above misses it and it fell through to a bogus AST path (UnaryExpr `^`) → typeid 0.
+	// so the check above misses it (it would otherwise fall to a bogus AST path, UnaryExpr `^`).
 	// (A plain named/struct type IS Addressing_Type and is handled above; only the folded forms land here.)
-	// Was core:flags `type_info.id == ^os.File` (and datetime/net) always false → Unsupported_Type.
 	if (tav.value.kind == ExactValue_Typeid) {
 		Type *tt = tav.value.value_typeid ? tav.value.value_typeid : tav.type;
 		if (tt != nullptr) return x64_typeid(tt);
@@ -6692,8 +6653,8 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 			// AGGREGATE array broadcast: `[N]E : E{…}` — the constant value is a single ELEMENT compound
 			// (its type is E, not [N]E), so replicate it to every lane. The scalar broadcast below
 			// (Float/Integer) doesn't fire for a struct element, and build_compound_lit would treat the
-			// struct's fields as array[0]'s elements → only lane 0 set. Was test_issue_4364 (`[4]Struct :
-			// Struct{MAGIC}` → {MAGIC},{0},{0},{0}). (Scalar `[4]int : 7` already broadcasts below.)
+			// struct's fields as array[0]'s elements → only lane 0 set. (Scalar `[4]int : 7` already
+			// broadcasts below.)
 			if (ct->kind == Type_Array) {
 				Type *elem = base_array_type(tav.type);
 				Type *vct  = ev.value_compound->tav.type ? base_type(x64_typed(ev.value_compound->tav.type)) : nullptr;
@@ -6719,8 +6680,6 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 			// SCALAR >8-byte int (i128/u128) or wide bit_set only. An ARRAY/#simd/matrix-typed integer
 			// constant (e.g. `[2]int` is 16B) must NOT be written as one wide scalar — that yields
 			// {value, 0, …} instead of a broadcast. Let it fall to the array-broadcast handler below.
-			// Was THE blick no-text bug: `base_slot * BASE_SLOT_SIZE` ([2]int * 16) → {x, 0} → every glyph
-			// in atlas row 0 → wrong/garbled glyph UVs.
 			if (isz > 8 && ct->kind != Type_Array && ct->kind != Type_SimdVector && ct->kind != Type_Matrix) {
 				u8 stackbuf[32] = {};
 				u8 *buf = stackbuf;
@@ -6759,13 +6718,11 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 
 		// Array/#simd-typed constant carrying a SCALAR exact value (e.g. `vec * 0.5`: the checker types
 		// the untyped `0.5` operand as the array type [2]f32, not f32). Build the scalar at the element
-		// type and broadcast to every lane via x64_emit_conv (mirrors lb_const_value's array path). Was:
-		// fell through to the integer fallback → exact_value_to_i64(0.5)=0 → all lanes 0. THE blick
-		// all-text-at-origin bug: glyph center_position = (placement_p0+placement_p1)*0.5 → {0,0}.
+		// type and broadcast to every lane via x64_emit_conv (mirrors lb_const_value's array path).
 		if ((ct->kind == Type_Array || ct->kind == Type_SimdVector || ct->kind == Type_Matrix) &&
 		    (ev.kind == ExactValue_Float || ev.kind == ExactValue_Integer)) {
 			// Matrix: emit_conv scalar→matrix puts the value on the diagonal (scaled identity), NOT every
-			// lane — `m: matrix[R,C]T = 1` is identity. Was an all-zero matrix (const `mat = 1`).
+			// lane — `m: matrix[R,C]T = 1` is identity.
 			Type *elem = (ct->kind == Type_Array)      ? base_array_type(tav.type) :
 			             (ct->kind == Type_SimdVector) ? ct->SimdVector.elem :
 			                                             ct->Matrix.elem;
@@ -6828,9 +6785,8 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 		if (ev.kind == ExactValue_Procedure) {
 			// An ANONYMOUS proc literal folded to a constant — e.g. a struct-field value in a
 			// compound literal (`{procedure = proc(){…}}`), which the named-proc walk below can't
-			// resolve (proc_e is a Constant, not an Entity_Procedure) → it returned 0. Generate the
-			// anon proc on-demand + lea, like x64_generate_anonymous_proc_lit. Was crypto.random_generator's
-			// `procedure` field → nil → uuid generate_v7 CSPRNG assert (then the runner hung).
+			// resolve (proc_e is a Constant, not an Entity_Procedure). Generate the anon proc
+			// on-demand + lea, like x64_generate_anonymous_proc_lit.
 			Ast *plast = ev.value_procedure ? unparen_expr(ev.value_procedure) : unparen_expr(expr);
 			if (plast != nullptr && plast->kind == Ast_ProcLit) {
 				Entity *ae = x64_anon_proc_entity(p->module, plast);
@@ -6850,8 +6806,8 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 			}
 			if (proc_e != nullptr && proc_e->kind == Entity_Procedure) {
 				// A top-level proc stored as data (stream vtable, default handler) references it — enqueue
-				// if min_dep==0 so its body is emitted (see the Ident Entity_Procedure note). This is THE
-				// path for `s.procedure = _writer_proc`; without it → unresolved external at link.
+				// if min_dep==0 so its body is emitted (see the Ident Entity_Procedure note), else it is
+				// an unresolved external at link.
 				if (!proc_e->Procedure.is_foreign && proc_e->min_dep_count.load(std::memory_order_relaxed) == 0) x64_enqueue_oncall(p, proc_e);
 				x64_emit_lea_sym(&p->asm_, X64Reg_RAX, x64_get_entity_name(proc_e));
 				return x64v_reg(x64_typed(tav.type), X64Reg_RAX);
@@ -6898,7 +6854,7 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 			// Taking a proc's ADDRESS (as a proc value) references it just like a call — a min_dep==0
 			// proc reached only this way (e.g. bufio._writer_proc assigned into a stream vtable) must be
 			// enqueued for on-demand compilation, else it's an unresolved external. The call path already
-			// does this; the address path did not. Was tests/documentation link failure.
+			// does this; the address path did not.
 			if (!e->Procedure.is_foreign && e->min_dep_count.load(std::memory_order_relaxed) == 0) x64_enqueue_oncall(p, e);
 			x64_emit_lea_sym(&p->asm_, X64Reg_RAX, x64_get_entity_name(e));
 			return x64v_reg(e->type, X64Reg_RAX);
@@ -7244,7 +7200,7 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 	} case_end;
 
 	// `x when cond else y`: cond is compile-time; build the taken branch (mirrors lb_build_expr's
-	// TernaryWhenExpr). Was UNHANDLED → fell to default → returned 0 when the branch is a runtime value.
+	// TernaryWhenExpr).
 	case_ast_node(te, TernaryWhenExpr, expr); {
 		TypeAndValue ctav = type_and_value_of_expr(te->cond);
 		GB_ASSERT(ctav.mode == Addressing_Constant && ctav.value.kind == ExactValue_Bool);
@@ -7268,7 +7224,7 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 	// @(disabled=true) proc: the call is a compile-time no-op (mirrors lb_build_call_expr's
 	// EntityFlag_Disabled early-return). The body is never emitted, so emitting the call leaves an
 	// unresolved external — esp. for polymorphic instantiations (the flag propagates to them).
-	// Disabled procs may not have return values, so nothing consumes a result. Was test_issue_2666.
+	// Disabled procs may not have return values, so nothing consumes a result.
 	{
 		Entity *disabled_e = entity_of_node(unparen_expr(ce->proc));
 		if (disabled_e != nullptr && (disabled_e->flags & EntityFlag_Disabled)) {
@@ -7276,16 +7232,14 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 		}
 	}
 		// Type-conversion call form (int(x), f64(x), etc.) — actually convert, same as
-		// cast(T)x (mirrors lb_emit_conv via x64_emit_conv). Returning the operand untouched
-		// skipped width/sign/float conversions and left the result mistyped.
+		// cast(T)x (mirrors lb_emit_conv via x64_emit_conv).
 		if (ce->proc->tav.mode == Addressing_Type) {
 			if (ce->args.count >= 1) {
 				x64Value cv = x64_build_expr(p, ce->args[0]);
 				// Convert to the EXPLICITLY NAMED cast type (ce->proc), NOT expr->tav.type: the checker
 				// widens the call's type to the assignment target, so a `Distinct(x)` boxed into a union
-				// (e.g. `My_Union = My_Distinct("hi")`) had tav.type = the union → it converted string→union
-				// directly and boxed the value as the WRONG variant (string, not My_Distinct → tag off by
-				// one). Producing the named type here lets the outer store box it with the right variant.
+				// would convert directly and box the WRONG variant. Producing the named type here lets the
+				// outer store box it with the right variant.
 				return x64_emit_conv(p, cv, ce->args[0]->tav.type, ce->proc->tav.type);
 			}
 			return x64v_none();
@@ -7296,7 +7250,6 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 		if (ce->proc->tav.mode == Addressing_Builtin) {
 			Entity *be = entity_of_node(unparen_expr(ce->proc));
 			// Atomic intrinsics (intrinsics.atomic_*) — LOCK-prefixed ops / MOV / CMPXCHG.
-			// Without these all atomics silently no-op (sync.Mutex/Sema, thread flags) → hangs.
 			if (be != nullptr && be->kind == Entity_Builtin && x64_is_atomic_builtin(be->Builtin.id)) {
 				return x64_build_atomic(p, expr, be->Builtin.id);
 			}
@@ -7315,8 +7268,7 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 			}
 			// `intrinsics.constant_utf16_cstring("…")` (e.g. win.L). Encode the constant string to
 			// UTF-16 (surrogate pairs for astral), NUL-terminate, intern as .rdata, return a pointer.
-			// Mirrors lb's BuiltinProc_constant_utf16_cstring. Was returning none → 0 → null
-			// CreateWindowExW class name → null HWND → the whole D3D11 swapchain null chain.
+			// Mirrors lb's BuiltinProc_constant_utf16_cstring.
 			if (be != nullptr && be->kind == Entity_Builtin && be->Builtin.id == BuiltinProc_constant_utf16_cstring) {
 				String s = ce->args[0]->tav.value.value_string;
 				u16  *buf = gb_alloc_array(temporary_allocator(), u16, s.len + 2);
@@ -7368,6 +7320,9 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 			if (be != nullptr && be->kind == Entity_Builtin && be->Builtin.id == BuiltinProc_soa_zip) {
 				return x64_soa_zip(p, expr);
 			}
+			if (be != nullptr && be->kind == Entity_Builtin && be->Builtin.id == BuiltinProc_soa_unzip) {
+				return x64_soa_unzip(p, expr);
+			}
 			// intrinsics.__entry_point() -> run @(init) procs (mirrors LLVM's
 			// _startup_runtime body) then call info->entry_point (user main).
 			if (be != nullptr && be->kind == Entity_Builtin &&
@@ -7385,9 +7340,8 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 			// `#location()` / `#location(entity)`: a BuiltinProc_DIRECTIVE whose proc is a BasicDirective
 			// named "location" — returns a runtime.Source_Code_Location of the CALL SITE (or the arg
 			// entity's decl). x64 had no case → fell through to a zeroed location {file="",line=0,col=0,
-			// proc=""}. Was every core:testing expect_assert_from failing (location never matched). Mirrors
-			// LLVM lb_build_builtin_proc DIRECTIVE name=="location". x64_build_source_code_location already
-			// exists (the #caller_location default-param fix).
+			// proc=""}. Mirrors LLVM lb_build_builtin_proc DIRECTIVE name=="location".
+			// x64_build_source_code_location already exists (the #caller_location default-param fix).
 			{
 				Ast *proc_ast = (ce->proc != nullptr) ? unparen_expr(ce->proc) : nullptr;
 				if (proc_ast != nullptr && proc_ast->kind == Ast_BasicDirective &&
@@ -7415,7 +7369,6 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 				// `type_info_of(id)` → runtime.__type_info_of(id) (mirrors LLVM). Compile-time
 				// `type_info_of(T)` passes T's canonical typeid (== Type_Info.id) through the SAME
 				// lookup — robust vs leaing the slot symbol (an un-emitted kind would be unresolved).
-				// Was unimplemented → nil → every reflect.* on a static type crashed.
 				{
 					AstPackage *rt_pkg = p->module->gen->info->runtime_package;
 					Entity *tio = (rt_pkg != nullptr)
@@ -7665,11 +7618,8 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 					x64_emit_mov_mr(&p->asm_, X64OpSize_16, x64_rbp_mem(off), X64Reg_RAX);
 					return x64v_mem(rt, x64_rbp_mem(off));
 				}
-				// 128-bit signed abs: the single-register path below only touches the low 64 bits, so
-				// abs(i128) returned garbage high bits (u128(abs(i128)) in strconv → fmt of any negative
-				// i128 printed the raw two's-complement magnitude, e.g. -5 as -(2^128-5); the cbor
-				// test_decode_negative -2^64 mismatch). Negate both halves (0-x with borrow) then select
-				// on the sign of the HIGH word.
+				// 128-bit signed abs: the single-register path below only touches the low 64 bits.
+				// Negate both halves (0-x with borrow) then select on the sign of the HIGH word.
 				if (type_size_of(rt) == 16 && x64_is_integer(rt)) {
 					i32 vo  = x64_i128_operand(p, xv, rt, true);
 					i32 off = x64_alloc_local(p, 16, 16);
@@ -7997,7 +7947,7 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 						// Backing array of `variadic_elem_type[N]`, then a {ptr,len}. A variadic positional
 						// arg that is a MULTI-VALUE call (tuple) spreads EACH of its fields into a separate
 						// element — `fmt.println(two())` → 2 `any`s, not one 16-byte tuple stored as one any
-						// (which read past the slot → garbage/crash). N = sum of the args' tuple arities.
+						// N = sum of the args' tuple arities.
 						Type *et  = x64_typed(variadic_elem_type);
 						i64   esz = type_size_of(et); if (esz <= 0) esz = 1;
 						i64   eal = type_align_of(et); if (eal <= 0) eal = 1;
@@ -8131,15 +8081,12 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 			for (int i = 0; i < n_params; i++) {
 				Entity *pe = params->variables[i];
 				// c_vararg: the `..any` param itself takes NO ABI slot — the promoted C varargs
-				// (appended below) occupy its place. Without this skip it consumed a register slot,
-				// shifting every vararg one slot over (snprintf read garbage for %d/%f).
+				// (appended below) occupy its place (else it consumes a register slot and shifts
+				// every vararg one slot over).
 				if (is_c_vararg && i == variadic_index) continue;
 				// Skip non-runtime params: Entity_TypeName ($T) AND Entity_Constant (polymorphic
-					// `$x: T` value params). These take NO ABI slot. Was: only TypeName skipped → a
-					// `$const` value param consumed a slot here but not in the callee → partial-return
-					// pointer shifted → callee wrote result[0] through a NULL pointer. THE
-					// bit_array.iterate_internal_ (`$ITERATE_SET_BITS: bool`, 2 returns) crash →
-					// blick project-open via core:flags.
+					// `$x: T` value params). These take NO ABI slot (a slot here but not in the callee
+					// would shift the partial-return pointer → callee writes result[0] through a bad ptr).
 					if (pe->kind != Entity_Variable) continue;
 				Type *pt2 = pe->type;
 				if (pt2 != nullptr && type_size_of(pt2) == 0) continue; // zero-sized
@@ -8153,9 +8100,7 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 						// v.mem holds a POINTER to the value (indirect aggregate). A non-identity
 						// conversion — union→any boxing, #subtype extraction — must run on the VALUE,
 						// so materialize it: load the pointer, deref, then convert. (A layout-identical
-						// retype re-tags and re-stabilizes back to by_ref, no value copy.) Was the blick
-						// project-open crash: get_union_variant_raw_tag(clip.effects[i]^) passed the raw
-						// union bytes as the `any` {data,id} instead of boxing → type_info_of(garbage id).
+						// retype re-tags and re-stabilizes back to by_ref, no value copy.)
 						x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, v.mem);
 						x64Value deref = x64v_mem(v.type, x64_mem(X64Reg_RAX, 0));
 						v = x64_stabilize_value(p, x64_emit_conv(p, deref, v.type, pt2));
@@ -8214,9 +8159,7 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 				DeferredProcedureKind dk = callee_ent->Procedure.deferred_procedure.kind;
 				Entity *dproc = callee_ent->Procedure.deferred_procedure.entity;
 				// `@(deferred_none=F)` (dk == DeferredProcedure_none) defers F with NO in/out args — it
-				// must STILL be registered (only the context is passed). Was skipped → the deferred call
-				// never ran (blick ui.parent_scope's `@(deferred_none=parent_pop)` leaked every parent →
-				// stale parent_stack across the frame swap → OOB block_from_index crash).
+				// must STILL be registered (only the context is passed).
 				if (dproc != nullptr) {
 					bool by_ptr   = dk == DeferredProcedure_in_by_ptr || dk == DeferredProcedure_out_by_ptr || dk == DeferredProcedure_in_out_by_ptr;
 					bool want_in  = dk == DeferredProcedure_in  || dk == DeferredProcedure_in_by_ptr  || dk == DeferredProcedure_in_out || dk == DeferredProcedure_in_out_by_ptr;
@@ -8275,9 +8218,8 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 			// #optional_ok / #optional_allocator_error used as a SINGLE value (`!m[k]`, `x := f()`,
 			// `assertf(!get(...))`): the proc returns a tuple but expr->tav.type is just the first
 			// result. Reduce to field 0 here so EVERY consumer (unary/binary/arg/decl) sees the value,
-			// not the tuple. Was core:flags: `!bit_array.get(...)` read field 1 (ok=true) → `!true`=false
-			// → the "pos already assigned" assert fired. (A genuine multi-value use keeps tav.type a
-			// tuple — e.g. `a, b := f()` or a spread arg — so this doesn't fire there.)
+			// not the tuple. (A genuine multi-value use keeps tav.type a tuple — e.g. `a, b := f()`
+			// or a spread arg — so this doesn't fire there.)
 			if (ct->Proc.result_count > 1 && tav.type != nullptr && !is_type_tuple(tav.type) &&
 			    call_result.kind == x64Value_Mem) {
 				x64Addr f0 = x64_emit_tuple_ep(p, call_result, 0);

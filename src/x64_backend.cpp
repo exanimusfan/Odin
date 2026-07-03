@@ -253,11 +253,10 @@ gb_internal void x64_compile_procedure(x64Module *m, Entity *e, Ast *body) {
 	p->fallthrough_lbl = -1;
 	p->cur_line = -1;
 	p->cur_file_id = -1;
-	// Line-table file from the BODY, not the entity token (mirrors LLVM's node->file()).
-	// For a generic instantiation (e.g. make_slice[[]Logger]) the entity token resolves
-	// to a DIFFERENT file than the body; wrong file → x64_record_line drops every body
-	// line (file_id mismatch) → no DEBUG_S_LINES → debugger falls to disassembly.
-	// (x64 never inlines, so a body is a single file — one file block suffices.)
+	// Line-table file from the BODY, not the entity token (mirrors LLVM's node->file()):
+	// a generic instantiation's entity token can resolve to a different file than its body,
+	// and a file mismatch makes x64_record_line drop every body line. x64 never inlines, so
+	// a body is a single file — one file block suffices.
 	p->file_id  = ast_token(body).pos.file_id;
 	if (p->file_id == 0) p->file_id = e->token.pos.file_id;
 
@@ -285,9 +284,9 @@ gb_internal void x64_build_nested_proc(x64Procedure *p, Ast *proc_lit, Entity *e
 	if (proc_lit == nullptr || proc_lit->kind != Ast_ProcLit) return;
 	if (proc_lit->ProcLit.body == nullptr) return;
 	// DEFER into THIS (enclosing) module — mirrors LLVM lb_build_nested_proc (enqueue, not
-	// inline). Compiling inline re-enters x64_compile_procedure on the SAME per-thread temp
-	// arena (reset via ArenaTempGuard) mid-codegen, corrupting the enclosing proc. Enclosing
-	// module (not the entity's owner) because a nested proc has no standalone module mapping.
+	// inline): compiling inline would re-enter x64_compile_procedure on the SAME per-thread temp
+	// arena mid-codegen and corrupt the enclosing proc. Enclosing module (not the entity's owner)
+	// because a nested proc has no standalone module mapping.
 	mpsc_enqueue(&p->module->proc_queue, e);
 }
 
@@ -302,8 +301,7 @@ gb_internal GB_COMPARE_PROC(x64_proc_entity_cmp) {
 // name. Wrapped in its own DEBUG_S_SYMBOLS subsection; off/seg resolved via SECREL/
 // SECTION relocs against the global's COFF symbol (`link_name`). Display name uses the
 // simple source name (mirrors LLVM). `rectype` = S_GTHREAD32 (0x1113) for thread-locals
-// — THREADSYM32 is byte-identical to DATASYM32; only the relocs target a `.tls$` symbol
-// (resolved per-thread via the TLS array).
+// — THREADSYM32 is byte-identical to DATASYM32; only the relocs target a `.tls$` symbol.
 gb_internal void x64_emit_cv_global(x64Module *m, String link_name, Entity *e, u16 rectype = 0x110Du) {
 	if (m->debug_s == nullptr || link_name.len == 0) return;
 	String disp = e->token.string;
@@ -378,10 +376,9 @@ gb_internal void x64_emit_global_variable(x64Module *m, Entity *e) {
 	u32 off = (u32)coff_section_len(m->bss);
 	for (i64 b = 0; b < sz; b++) coff_section_write_u8(m->bss, 0);
 
-	// ALL global vars must be EXTERNAL: a STATIC symbol is file-local and won't resolve
-	// a UNDEF external ref from another .obj (the encoding_base64 ENC_TABLE/DEC_TABLE bug:
-	// coff_sym_add_proc mis-read is_export from a Variable union as 0 → STATIC + FUNCTION).
-	// Upgrade an existing UNDEF entry in place so its relocs point at the definition.
+	// ALL global vars must be EXTERNAL: a STATIC symbol is file-local and won't resolve a
+	// UNDEF external ref from another .obj. Upgrade an existing UNDEF entry in place so its
+	// relocs point at the definition.
 	u32 *existing = string_map_get(&m->coff.sym_map, name);
 	if (existing != nullptr) {
 		CoffSymEntry &se = m->coff.syms[*existing];
@@ -447,7 +444,7 @@ gb_internal void x64_emit_global_static(x64Module *m, Entity *e, DeclInfo *d) {
 	x64_emit_global_static_value(m, e, d->init_expr);
 }
 
-// Append a linker directive (e.g. " /INCLUDE:_tls_used", " /EXPORT:app_init") to this module's
+// Append a linker directive (e.g. " /INCLUDE:_tls_used", " /EXPORT:name") to this module's
 // `.drectve` section, creating it lazily. `.drectve` is link-only metadata (IMAGE_SCN_LNK_INFO |
 // IMAGE_SCN_LNK_REMOVE) that link.exe reads and drops from the image; multiple objects' contents
 // are concatenated. Directives must be space-separated.
@@ -606,10 +603,10 @@ gb_internal void x64_startup_init_global(x64Procedure *p, PtrSet<Entity *> *init
 }
 
 // Emit __$startup_runtime: a REAL proc running the initializers of LAZILY-defined
-// (min_dep==0) globals that the eager __entry_point loop skipped (e.g. math/big's
-// `INT_ZERO := &Int{}`); without it the global stays null and the @(init) proc using it
-// faults. Mirrors lb_create_startup_runtime; the runtime entry calls it before
-// intrinsics.__entry_point. `defined` = globals that received lazy storage.
+// (min_dep==0) globals that the eager __entry_point loop skipped (e.g. `INT_ZERO := &Int{}`);
+// without it the global stays null and any @(init) proc using it faults. Mirrors
+// lb_create_startup_runtime; the runtime entry calls it before intrinsics.__entry_point.
+// `defined` = globals that received lazy storage.
 gb_internal void x64_emit_startup_runtime(x64Module *m, x64Generator *gen, PtrSet<Entity *> *defined) {
 	CheckerInfo *info = gen->info;
 
@@ -640,10 +637,9 @@ gb_internal void x64_emit_startup_runtime(x64Module *m, x64Generator *gen, PtrSe
 
 	x64_proc_begin(p);
 
-	// Initialize EVERY file-scope global that has storage (eager min_dep!=0, or lazy
-	// in `defined`). Mirrors LLVM, which runs ALL initializers here over its created-
-	// globals list. Doing it after the on-demand closure (every referenced global now
-	// defined) avoids the eager/lazy asymmetry that left math/big's INT_ONE uninitialized.
+	// Initialize EVERY file-scope global that has storage (eager min_dep!=0, or lazy in
+	// `defined`). Mirrors LLVM, which runs ALL initializers here. Doing it after the on-demand
+	// closure (every referenced global now defined) avoids an eager/lazy asymmetry.
 	// p->is_startup makes &CompoundLit allocate a static global (so `&Int{}` escapes).
 	p->is_startup = true;
 
@@ -660,8 +656,8 @@ gb_internal void x64_emit_startup_runtime(x64Module *m, x64Generator *gen, PtrSe
 		if (!has_storage) continue;
 		x64_startup_init_global(p, &inited, e, d);
 	}
-	// Pass 2: lazy globals not in variable_init_order (LLVM iterates created-globals,
-	// not init order, so e.g. some math/big constants must still be initialized).
+	// Pass 2: lazy globals not in variable_init_order (LLVM iterates created-globals, not
+	// init order, so some constants still need initializing).
 	FOR_PTR_SET(e, *defined) {
 		x64_startup_init_global(p, &inited, e, decl_info_of_entity(e));
 	}
@@ -806,7 +802,7 @@ gb_internal u64 x64_typeid_kind(Type *type) {
 		if (flags & BasicFlag_Unsigned) kind = Typeid_Integer;
 		if (flags & BasicFlag_Float)    kind = Typeid_Float;
 		if (flags & BasicFlag_Complex)  kind = Typeid_Complex;
-		if (flags & BasicFlag_Quaternion) kind = Typeid_Quaternion; // was missing → quaternion type_info tagged Named → fmt read a garbage base → crash
+		if (flags & BasicFlag_Quaternion) kind = Typeid_Quaternion;
 		if (flags & BasicFlag_Pointer)  kind = Typeid_Pointer;
 		if (flags & BasicFlag_String)   kind = Typeid_String;
 		if (flags & BasicFlag_Rune)     kind = Typeid_Rune;
@@ -917,8 +913,10 @@ gb_internal void x64_emit_type_table(x64Generator *gen) {
 	gbAllocator    a = arena_allocator(scratch);
 
 	// Type_Info_Struct field offsets (relative to the variant payload at off_var):
-	// 0 types, 1 names, 2 offsets, 3 usings, 4 tags, 5 field_count, 6 flags.
+	// 0 types, 1 names, 2 offsets, 3 usings, 4 tags, 5 field_count, 6 flags, 7 soa_kind(u8),
+	// 8 soa_len(i32), 9 soa_base_type(^Type_Info).
 	i64 sf_types = 0, sf_names = 8, sf_offsets = 16, sf_usings = 24, sf_tags = 32, sf_fc = 40, sf_flags = 44;
+	i64 sf_soa_kind = 45, sf_soa_len = 48, sf_soa_base = 56;
 	if (t_type_info_struct != nullptr) {
 		Type *tis = base_type(t_type_info_struct);
 		if (tis->kind == Type_Struct && tis->Struct.fields.count >= 7) {
@@ -929,6 +927,11 @@ gb_internal void x64_emit_type_table(x64Generator *gen) {
 			sf_tags    = type_offset_of(t_type_info_struct, 4);
 			sf_fc      = type_offset_of(t_type_info_struct, 5);
 			sf_flags   = type_offset_of(t_type_info_struct, 6);
+		}
+		if (tis->kind == Type_Struct && tis->Struct.fields.count >= 10) {
+			sf_soa_kind = type_offset_of(t_type_info_struct, 7);
+			sf_soa_len  = type_offset_of(t_type_info_struct, 8);
+			sf_soa_base = type_offset_of(t_type_info_struct, 9);
 		}
 	}
 
@@ -956,7 +959,7 @@ gb_internal void x64_emit_type_table(x64Generator *gen) {
 		else if (bt->kind == Type_Union)  emit = true;
 		else if (bt->kind == Type_Map)    emit = true;
 		else if (bt->kind == Type_Matrix || bt->kind == Type_SimdVector ||
-		         bt->kind == Type_BitSet || bt->kind == Type_EnumeratedArray) emit = true; // were unemitted → type_info nil/garbage → fmt(matrix)/flags(bit_set) crash
+		         bt->kind == Type_BitSet || bt->kind == Type_EnumeratedArray) emit = true;
 		if (!emit) continue;
 		isize slot = type_info_index(info, pair, false);
 		if (slot < 0 || slot >= n) continue;
@@ -969,10 +972,10 @@ gb_internal void x64_emit_type_table(x64Generator *gen) {
 		if (!slot_emit[slot]) continue;
 		Type *t  = slot_type[slot];
 		Type *bt = base_type(t);
-		// Named types (distinct/aliased: time.Duration, MyDur :: distinct i64, named structs)
-		// emit a Type_Info_Named{name, base, pkg, loc} pointing at the base type's slot — NOT
-		// the base variant. Without this, fmt's named custom-formatters (Duration/Time/SCL)
-		// never fire and reflect.Type_Info_Named matching fails. Mirrors lb_type_info Type_Named.
+		// Named types (distinct/aliased: MyDur :: distinct i64, named structs) emit a
+		// Type_Info_Named{name, base, pkg, loc} pointing at the base type's slot — NOT the base
+		// variant, else fmt's named custom-formatters never fire and reflect.Type_Info_Named
+		// matching fails. Mirrors lb_type_info Type_Named.
 		bool is_named = (t->kind == Type_Named);
 
 		// Struct variant: emit names/types/offsets/usings/tags arrays first, capturing
@@ -1099,6 +1102,15 @@ gb_internal void x64_emit_type_table(x64Generator *gen) {
 			// scalar fields (field_count, flags). Pointers stay zero in the buffer.
 			gb_memmove(vd + sf_fc,    &field_count,  4);
 			gb_memmove(vd + sf_flags, &struct_flags, 1);
+			// #soa struct: soa_kind(u8)@7, soa_len(i32)@8; soa_base_type(^Type_Info)@9 via reloc
+			// below. Without these, fmt/reflect can't detect a #soa value and prints the raw
+			// component arrays instead of the AoS element view.
+			if (bt->Struct.soa_kind != StructSoa_None) {
+				u8  sk = (u8)bt->Struct.soa_kind;
+				i32 sl = (i32)bt->Struct.soa_count;
+				gb_memmove(vd + sf_soa_kind, &sk, 1);
+				gb_memmove(vd + sf_soa_len,  &sl, 4);
+			}
 		} else if (bt->kind == Type_Pointer || bt->kind == Type_MultiPointer ||
 		           bt->kind == Type_Slice   || bt->kind == Type_DynamicArray  ||
 		           bt->kind == Type_Array   || bt->kind == Type_FixedCapacityDynamicArray) {
@@ -1319,6 +1331,11 @@ gb_internal void x64_emit_type_table(x64Generator *gen) {
 			if (a_offsets.len) coff_reloc_add(rm->rdata, vbase + (u32)sf_offsets, a_offsets, COFF_REL_ADDR64);
 			if (a_usings.len)  coff_reloc_add(rm->rdata, vbase + (u32)sf_usings,  a_usings,  COFF_REL_ADDR64);
 			if (a_tags.len)    coff_reloc_add(rm->rdata, vbase + (u32)sf_tags,    a_tags,    COFF_REL_ADDR64);
+			// #soa: soa_base_type (@sf_soa_base) → the AoS element type's Type_Info (fmt/reflect gather it).
+			if (bt->Struct.soa_kind != StructSoa_None && bt->Struct.soa_elem != nullptr) {
+				isize ss = type_info_index(info, bt->Struct.soa_elem, false);
+				if (ss >= 0 && ss < n && slot_emit[ss]) coff_reloc_add(rm->rdata, vbase + (u32)sf_soa_base, x64_ti_slot_sym(ss), COFF_REL_ADDR64);
+			}
 		}
 
 		// Elem-based variant: point `elem` (@off_var+0) at the element type's Type_Info.
@@ -1406,14 +1423,12 @@ gb_internal void x64_emit_type_table(x64Generator *gen) {
 			if (bf_tags.len)   coff_reloc_add(rm->rdata, rdata_off + (u32)off_var + (u32)o_tg, bf_tags,   COFF_REL_ADDR64);
 		}
 
-		// Map variant: key (@0) + value (@8) + map_info (@16). map_info was left nil, but reflection
-		// DOES use it — core:flags calls `type_info.map_info.key_hasher(...)` through the reflected
-		// type_info → null-call segfault (map[cstring]cstring test hung). Point it at the same
-		// {ks,vs,key_hasher,key_equal} Map_Info global the compiled map ops use.
-		// !is_named: a `distinct map` (json.Object) emits the Named variant (name/base/pkg); running
-		// this block on that slot would write map key/value/map_info OVER the Named fields — map_info@16
-		// collides with Named base@16 → a garbage base → type_info_base loops onto null → SEGV. The
-		// underlying map has its OWN slot (pointed to by Named base) with these fields. Was test_issue_2694.
+		// Map variant: key (@0) + value (@8) + map_info (@16). map_info MUST be set: reflection
+		// calls `type_info.map_info.key_hasher(...)` through it, so leaving it nil segfaults. Point
+		// it at the same {ks,vs,key_hasher,key_equal} Map_Info global the compiled map ops use.
+		// !is_named: a `distinct map` emits the Named variant, and running this block on that slot
+		// would write map key/value/map_info OVER the Named fields (map_info@16 collides with Named
+		// base@16 → garbage base → SEGV). The underlying map has its own slot with these fields.
 		if (!is_named && bt->kind == Type_Map) {
 			i64 ok2 = 0, ov2 = 8, om2 = 16;
 			if (t_type_info_map != nullptr) {
@@ -1538,9 +1553,9 @@ gb_internal WORKER_TASK_PROC(x64_write_module_worker) {
 	m->obj_path   = {};
 	m->obj_failed = false;
 
-	// Write any module with real content. .rdata matters: a package referenced only for
-	// its read-only globals (e.g. encoding_base64's ENC_TABLE/DEC_TABLE) has empty text/
-	// data/bss but a non-empty .rdata — skipping it leaves those globals undefined.
+	// Write any module with real content. .rdata matters: a package referenced only for its
+	// read-only globals has empty text/data/bss but a non-empty .rdata — skipping it would
+	// leave those globals undefined.
 	if (coff_section_len(m->text)  == 0 &&
 	    coff_section_len(m->rdata) == 0 &&
 	    coff_section_len(m->data)  == 0 &&
@@ -1565,10 +1580,10 @@ gb_internal WORKER_TASK_PROC(x64_write_module_worker) {
 	} else {
 		m->obj_path = copy_string(permanent_allocator(), filepath);
 	}
-	// No coff_writer_free: all COFF data is in the module arena (reclaimed at exit). The
-	// old free did string_map_destroy on the heap-backed sym_map — a CRT-heap free under
-	// the global lock per module in the hot parallel write path; dropping it removes that
-	// contention and keeps section data live for the post-write byte-breakdown diagnostic.
+	// No coff_writer_free: all COFF data is in the module arena (reclaimed at exit). Freeing
+	// would string_map_destroy the heap-backed sym_map — a CRT-heap free under the global lock
+	// per module in the hot parallel write path; skipping it avoids that contention and keeps
+	// section data live for the post-write byte-breakdown diagnostic.
 	return 0;
 }
 
@@ -1674,11 +1689,10 @@ gb_internal x64Generator *x64_generate_code(Checker *c) {
 		}
 	}
 
-	// Globals first, so symbols are available. Iterate variable_init_order, the SAME
-	// source LLVM uses: info->entities misses some package-level globals (encoding_base64's
-	// ENC_TABLE/DEC_TABLE) → unresolved externals. We emit every non-foreign global
-	// unconditionally — unlike LLVM we have no on-demand creation to backstop a
-	// wrongly-skipped but still-referenced global (an unused definition is harmless).
+	// Globals first, so symbols are available. Iterate variable_init_order, the SAME source
+	// LLVM uses: info->entities misses some package-level globals (→ unresolved externals). We
+	// emit every non-foreign global unconditionally — unlike LLVM we have no on-demand creation
+	// to backstop a wrongly-skipped but still-referenced global (an unused definition is harmless).
 	for (DeclInfo *d : info->variable_init_order) {
 		Entity *e = d->entity.load(std::memory_order_relaxed); // d->entity is std::atomic<Entity*>
 		if (e == nullptr || e->kind != Entity_Variable) continue;
@@ -1739,9 +1753,8 @@ gb_internal x64Generator *x64_generate_code(Checker *c) {
 			}
 		}
 		// -build-mode:dll: @(export) procs are reached only externally (via GetProcAddress /
-		// dynlib), so min_dep_count is 0 and the loop above skipped them → the DLL would be empty
-		// of app_init/app_loop/app_fini and the /EXPORT directives would dangle. Force them in
-		// (min_dep!=0 ones are already added above; skip those to avoid a duplicate root).
+		// dynlib), so min_dep_count is 0 and the loop above skipped them → an empty DLL and
+		// dangling /EXPORT directives. Force them in (min_dep!=0 ones were already added above).
 		if (build_context.build_mode == BuildMode_DynamicLibrary) {
 			for (Entity *e : info->entities) {
 				if (e->kind != Entity_Procedure || !e->Procedure.is_export || e->Procedure.is_foreign) continue;
@@ -1816,10 +1829,9 @@ gb_internal x64Generator *x64_generate_code(Checker *c) {
 	x64_generate_pending(gen, global_thread_pool.threads.count > 1);
 
 	// @(export) entities → PE export table. link.exe builds the export directory from `/EXPORT:name`
-	// directives in `.drectve` — this is what LLVM's DLLExport storage class lowers to. Without it a
-	// -build-mode:dll output has NO exports, so `dynlib.initialize_symbols` finds nothing (blick's
-	// hot-reload spun forever in _load_dll_code's retry loop). DLL-only for now (matches the reported
-	// need; an exe's @(export) would also want this but changes exe output — deferred).
+	// directives in `.drectve` — what LLVM's DLLExport storage class lowers to. Without it a
+	// -build-mode:dll output has NO exports, so `dynlib.initialize_symbols` finds nothing. DLL-only
+	// for now (an exe's @(export) would also want this but changes exe output — deferred).
 	if (build_context.build_mode == BuildMode_DynamicLibrary) {
 		for (Entity *e : info->entities) {
 			bool is_exp = (e->kind == Entity_Procedure) ? e->Procedure.is_export
@@ -1877,9 +1889,8 @@ gb_internal x64Generator *x64_generate_code(Checker *c) {
 					if (slot->hash == 0) continue;
 					Entity *e = slot->value;
 					// Match LLVM (lb_add_foreign_library_path asserts EntityFlag_Used): only
-					// collect libraries whose foreign entities are actually USED. Passing stray
-					// declared-but-unused libs lets one win symbol resolution over the correct one
-					// (Kernel32.lib vs Synchronization.lib for WakeByAddressSingle).
+					// collect libraries actually USED. Stray declared-but-unused libs can win
+					// symbol resolution over the correct one (e.g. Kernel32 vs Synchronization).
 					if (e != nullptr && e->kind == Entity_LibraryName && (e->flags & EntityFlag_Used)) {
 						x64_add_foreign_lib(gen, e);
 					}
@@ -1893,9 +1904,8 @@ gb_internal x64Generator *x64_generate_code(Checker *c) {
 	}
 
 	// Deterministic link order, EXACTLY like LLVM (lb_generate_code): sort by priority_index, then
-	// package/file/source order. The unsorted scope-walk order let Kernel32.lib precede
-	// Synchronization.lib, so WakeByAddressSingle resolved against the wrong DLL
-	// (STATUS_ENTRYPOINT_NOT_FOUND) once the Windows SDK changed (VS uninstall).
+	// package/file/source order. The unsorted scope-walk order can let a lib precede the one that
+	// should resolve a shared symbol, causing STATUS_ENTRYPOINT_NOT_FOUND.
 	array_sort(gen->foreign_libraries, foreign_library_cmp);
 
 	return gen;

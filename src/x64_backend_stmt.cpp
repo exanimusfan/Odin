@@ -22,11 +22,9 @@ gb_internal void x64_zero_mem(x64Procedure *p, X64Mem dst, i64 size) {
 			off += 1; rem -= 1;
 		}
 	} else {
-		// AL=0, RDI=dst, RCX=size; REP STOSB. RDI is nonvolatile in Win64 — save/
-		// restore it (dst is RBP/RAX-based, not RSP, so the push doesn't shift it).
-		// Compute the address BEFORE zeroing RAX — dst.base may BE RAX (e.g. a global
-		// field `app.project.panels` whose &app was loaded into RAX), and `xor eax,eax`
-		// would otherwise clobber the base, leaving RDI = the bare field offset.
+		// AL=0, RDI=dst, RCX=size; REP STOSB. RDI is nonvolatile in Win64 — save/restore it
+		// (dst is RBP/RAX-based, not RSP, so the push doesn't shift it). LEA the address BEFORE
+		// zeroing RAX — dst.base may BE RAX, so `xor eax,eax` would otherwise clobber the base.
 		x64_emit_push_r(a, X64Reg_RDI);
 		x64_emit_lea(a, X64Reg_RDI, dst);
 		x64_emit_xor_rr(a, X64OpSize_32, X64Reg_RAX, X64Reg_RAX);
@@ -101,10 +99,8 @@ gb_internal x64Procedure::LoopInfo *x64_find_loop(x64Procedure *p, String label)
 
 // Statement builder
 
-// `{}` — an empty compound literal, i.e. the zero value of its type. Assigning/initializing
-// with it should ZERO the destination in place; building the whole zero value into a temp and
-// copying it makes a full-size stack temp (a Slot_Map-sized field ⇒ ~74MB ⇒ stack overflow:
-// `app.project.panels = {}`).
+// `{}` — an empty compound literal (the zero value of its type). Zero the destination in place;
+// building the whole zero value into a temp and copying it can make a huge full-size stack temp.
 gb_internal bool x64_is_empty_compound_lit(Ast *e) {
 	e = unparen_expr(e);
 	return e != nullptr && e->kind == Ast_CompoundLit && e->CompoundLit.elems.count == 0;
@@ -129,12 +125,9 @@ gb_internal Ast *x64_range_strip(Ast *v) {
 	return v;
 }
 
-// Mirrors lb_build_return_stmt. Builds `results` into the result ABI (RAX / XMM0 / sret /
-// partial-return pointers), running defers at the LLVM-matching point. Conversion to each result
-// type is handled by x64_store_value (→ x64_emit_conv).
-// A `return` inside an inlined callee body: store results into the active inline frame's
-// slots (with conversion), run the inlined scope's defers, and jump to its join label —
-// never the real epilogue. Mirrors x64_build_return_stmt's result handling.
+// A `return` inside an inlined callee body: store results into the active inline frame's slots
+// (with conversion via x64_store_value), run the inlined scope's defers, and jump to its join
+// label — never the real epilogue.
 gb_internal void x64_build_inline_return(x64Procedure *p, Slice<Ast *> const &results) {
 	x64Procedure::InlineFrame *frp = &p->inline_frames[p->inline_frames.count - 1];
 	// Copy out: building a result expr may push/pop nested inline frames (array realloc).
@@ -192,18 +185,10 @@ gb_internal void x64_build_return_stmt(x64Procedure *p, Slice<Ast *> const &resu
 	} else if (nres <= 1) {
 		// Build the return value BEFORE running defers (mirrors lb_build_return_stmt_internal:
 		// store the result, THEN lb_emit_defer_stmts). A defer that resets the temp arena or
-		// clobbers registers must NOT run before the return expression is evaluated — was the
-		// os bug: `return win32_utf16_to_utf8(...)` allocated into an arena the deferred
-		// TEMP_ALLOCATOR_GUARD_END had already reset, so the output aliased its input.
+		// clobbers registers must NOT run before the return expression is evaluated.
 		x64Value v  = x64_build_expr(p, results[0]);
 		Type    *rt = (nres == 1) ? results_tuple->Tuple.variables[0]->type : nullptr;
-		// Store the result into its NAMED result local BEFORE running defers (mirrors LLVM: store the
-		// result var, THEN lb_emit_defer_stmts) so pending defers OBSERVE — and may MODIFY — it; the
-		// defer-pending marshal paths below then read THIS local. Was a non-debug gap: a single-result
-		// `defer if !ok {…}` read the zero-init local (debug masked it — the old code stored here only
-		// in debug, for the debugger). Guard on (defers || debug) to keep the no-defer hot path's
-		// single copy. Unnamed results have no local. Was [[x64-multireturn-store-before-defers]]'s
-		// single-return tail (e.g. json single-result unmarshal helpers built without -debug).
+		// Store the result into its NAMED result local BEFORE running defers (mirrors LLVM) so pending defers may OBSERVE/MODIFY it (the defer-pending marshal paths below read THIS local); guard on (defers || debug) to keep the no-defer hot path single copy. Unnamed results have no local.
 		Entity *re0   = (nres == 1) ? results_tuple->Tuple.variables[0] : nullptr;
 		i32    *nloff = (re0 != nullptr && re0->kind == Entity_Variable && re0->token.string.len > 0)
 		                ? x64_var_get(&p->var_offsets, re0) : nullptr;
@@ -305,13 +290,7 @@ gb_internal void x64_build_return_stmt(x64Procedure *p, Slice<Ast *> const &resu
 				sfoff += ssz;
 			}
 		} else {
-			// `return v0, v1, ...` — one expression per result. Evaluate ALL expressions into fresh
-			// temps FIRST, reading the current named-result locals, THEN copy into the named locals —
-			// otherwise `return b, a` (a,b ARE the named results) stores a=b before reading a, aliasing
-			// both to b. Mirrors LLVM's evaluate-then-store (SSA) ordering. The named-local write is kept
-			// so pending defers OBSERVE — and may MODIFY — the results before the ABI write (a `defer if
-			// !ok {…}` saw the zero-init ok after `return true, nil` — THE json unmarshal_string_token
-			// bug). The marshal loop below reads toff[i], so named-local writes flow through.
+			// `return v0, v1, ...` - one expression per result. Evaluate ALL expressions into fresh temps FIRST (reading current named-result locals), THEN copy into the named locals - else `return b, a` (a,b ARE the named results) aliases both to b. Mirrors LLVM SSA evaluate-then-store; the named-local write lets pending defers OBSERVE/MODIFY results before the ABI write, and the marshal loop reads toff[i].
 			Array<i32> vtmp; array_init(&vtmp, temporary_allocator(), nres, nres);
 			for (int i = 0; i < nres && i < res_count; i++) {
 				i64 fsz = type_size_of(ttyp[i]); if (fsz <= 0) fsz = 1;
@@ -408,12 +387,7 @@ struct X64RangeStmt {
 gb_internal void x64_build_range_interval(x64Procedure *p, X64RangeStmt *c) {
 	ast_node(be, BinaryExpr, c->iter_expr);
 	bool inclusive = (be->op.kind == Token_RangeFull || be->op.kind == Token_Ellipsis);
-	// vsz/vsigned MUST come from the value var's type (when it exists) — the value var IS c->elem_e and
-	// the loop loads/stores/increments it in its slot. The range expr's type can be wider (e.g. `int`)
-	// than a `i32`/`u32` bound's element var; using that width made an 8-byte access of the 4-byte elem
-	// slot OVERRUN into the adjacent index slot → the index increment clobbered the counter's high bits
-	// → it jumped huge and the loop exited after 1 iteration. (THE blick icon-load bug: a `for i in
-	// 0..<n` over an i32 length in wstring_to_utf8's NUL-trim ran once → paths kept the trailing NUL.)
+	// vsz/vsigned MUST come from the value var type (when it exists) - the loop loads/stores/increments it in its slot. The range expr type can be wider (e.g. `int`) than a `i32`/`u32` bound element var; using that width would overrun the elem slot into the adjacent index slot.
 	Type *vt = c->elem_e != nullptr ? x64_typed(c->elem_e->type)
 	         : (c->iter_expr->tav.type ? x64_typed(c->iter_expr->tav.type) : t_int);
 	X64OpSize vsz = x64_op_size_of(vt);
@@ -742,10 +716,7 @@ gb_internal void x64_build_range_string(x64Procedure *p, X64RangeStmt *c) {
 	AstPackage *rt = p->module->gen->info->runtime_package;
 	Entity *de = (rt != nullptr) ? scope_lookup_current(rt->scope, string_interner_insert(decode)) : nullptr;
 
-	// A `^string` operand (`for r in ps`, ps: ^string) ranges over the pointee: the string header's
-	// address is the pointer VALUE, not &pointer (mirrors x64_range_base_to_rax's via_ptr path). Was
-	// core:strings.fields_iterator's `for r,offset in s` (s: ^string) reading {data,len} from &s →
-	// garbage len → runaway loop + out-of-bounds field slices. THE core:image/netpbm PBM/PFM load bug.
+	// A `^string` operand (`for r in ps`, ps: ^string) ranges over the pointee: the string header address is the pointer VALUE, not &pointer (mirrors x64_range_base_to_rax via_ptr path).
 	Type *iter_raw = c->iter_expr->tav.type ? base_type(x64_typed(c->iter_expr->tav.type)) : nullptr;
 	bool via_ptr = iter_raw != nullptr && iter_raw->kind == Type_Pointer;
 	i32 data_off  = x64_alloc_local(p, 8, 8);
@@ -857,10 +828,7 @@ gb_internal void x64_build_range_string(x64Procedure *p, X64RangeStmt *c) {
 	x64_emit_jmp(&p->asm_, c->lbl_loop);
 }
 
-// Address of a for-range source. An addressable source (a variable/field/deref) gives its address
-// directly; a non-addressable R-VALUE (slice/array compound literal, a call result) is materialized to
-// a temp first — else x64_build_addr returns a garbage/zero header and the loop reads len==0 (was
-// `for x in []T{…}` / `for x in f()` iterating 0 times).
+// Address of a for-range source. An addressable source (variable/field/deref) gives its address directly; a non-addressable r-value (compound literal, call result) is materialized to a temp first, else x64_build_addr returns a garbage/zero header and the loop reads len==0.
 gb_internal x64Addr x64_range_source_addr(x64Procedure *p, Ast *iter_expr, Type *iter_type) {
 	Ast *e = unparen_expr(iter_expr);
 	if (e->tav.mode == Addressing_Variable) {
@@ -888,11 +856,7 @@ gb_internal void x64_range_base_to_rax(x64Procedure *p, Ast *iter_expr, Type *it
 
 gb_internal void x64_build_range_stmt(x64Procedure *p, Ast *stmt) {
 	ast_node(rs, RangeStmt, stmt);
-		// Strip parens: a `ParenExpr` node carries NO tav.type (the checker records the type on the
-		// inner operand), so reading `rs->expr->tav.type` on `for x in (s)` / `for x in ([]T{…})` gave
-		// nullptr → iter_type nullptr → the body was SKIPPED entirely (0 iterations, for BOTH slices and
-		// arrays). The value/addr builders unparen internally; the TYPE reads below did not. Mirrors LLVM
-		// lb_build_range_stmt using type_of_expr(expr) (which sees through parens).
+		// Strip parens: a `ParenExpr` carries NO tav.type (the checker records it on the inner operand), so reading rs->expr->tav.type gives nullptr and the body would be SKIPPED. The value/addr builders unparen internally; the TYPE reads below must too. Mirrors LLVM lb_build_range_stmt via type_of_expr(expr) (which sees through parens).
 		Ast  *iter_expr = unparen_expr(rs->expr);
 		// A pointer source (`for x in p`, p: ^[]T/^[N]T/^map) ranges over the pointee: deref for the
 		// kind dispatch, remember via_ptr so the base address is the pointer VALUE (mirrors LLVM's
@@ -1178,12 +1142,7 @@ gb_internal void x64_build_switch_stmt(x64Procedure *p, Ast *node) {
 				// Single value case
 				x64Value v = x64_build_expr(p, case_expr);
 				if (has_tag && tag_t) {
-					// SPILL the case value before touching the tag: a RUNTIME case expr leaves v in
-					// RAX, which a tag load would clobber. Compare via x64_emit_comp so STRING/cstring/
-					// float/aggregate tags compare by CONTENT — a raw cmp_rr read only the first 8 bytes
-					// (a string's DATA pointer) → matched interned literals but missed equal-content
-					// substrings (THE json `false`-keyword switch → Unexpected_Token bug). Mirrors
-					// lb_build_switch_stmt's lb_emit_comp(Token_CmpEq).
+					// SPILL the case value before touching the tag: a RUNTIME case expr leaves v in RAX, which a tag load would clobber. Compare via x64_emit_comp so STRING/cstring/float/aggregate tags compare by CONTENT (a raw cmp_rr reads only the first 8 bytes). Mirrors lb_build_switch_stmt lb_emit_comp(Token_CmpEq).
 					x64Value vs = x64_spill_value(p, v, tag_t);
 					x64Value tv = x64v_mem(tag_t, x64_rbp_mem(tag_off));
 					x64Value eq = x64_emit_comp(p, Token_CmpEq, tv, vs);
@@ -1297,11 +1256,7 @@ gb_internal void x64_build_type_switch_stmt(x64Procedure *p, Ast *node) {
 			for_array(ti, cc->list) {
 				Type *case_type = type_of_expr(cc->list[ti]);
 				if (case_type == nullptr) continue;
-				// `case nil:` — check the RAW type: x64_typed maps untyped_nil→rawptr, which would make
-				// is_type_untyped_nil false, so the nil case fell to the union branch below and got
-				// `continue`d (no comparison emitted) → a nil union/any never matched `case nil`. Was
-				// core:flags set_option: `switch &e in error { case nil: register_field() }` never ran on
-				// a successful (nil) parse → positional tracking bit never set → positionals misassigned.
+				// `case nil:` - check the RAW type: x64_typed maps untyped_nil to rawptr (making is_type_untyped_nil false), so without this the nil case would fall to the union branch below and get `continue`d, never matching a nil union/any.
 				if (is_type_untyped_nil(case_type)) {
 					x64_emit_test_rr(&p->asm_, X64OpSize_64, X64Reg_RAX, X64Reg_RAX);
 					x64_emit_jcc(&p->asm_, X64Cc_E, case_lbls[ci]);
@@ -1330,11 +1285,7 @@ gb_internal void x64_build_type_switch_stmt(x64Procedure *p, Ast *node) {
 
 			x64_label_bind(&p->asm_, case_lbls[ci]);
 
-			// Bind the implicit case entity. A single concrete-type case binds it to that
-			// type (copy the variant's data); a multi/default (`case:`) case binds it to the
-			// OPERAND type (union/any), aliasing the whole value. ALL cases must register it
-			// — else a body reference falls to x64_global_mem and emits a bogus extern (e.g.
-			// `specific_type_info` in a `#partial switch …{ … case: }`).
+			// Bind the implicit case entity. A single concrete-type case binds it to that type (copy the variant data); a multi/default (`case:`) case binds it to the OPERAND type (union/any), aliasing the whole value. ALL cases must register it, else a body reference falls to x64_global_mem and emits a bogus extern.
 			Entity *case_entity = implicit_entity_of_node(cc_ast);
 			if (case_entity != nullptr) {
 				Type *ct    = x64_typed(case_entity->type);
@@ -1354,10 +1305,7 @@ gb_internal void x64_build_type_switch_stmt(x64Procedure *p, Ast *node) {
 					// so RCX already = &operand.
 
 					if (by_reference) {
-						// `switch &dst in v`: bind dst as an INDIRECT local — an 8-byte slot
-						// holding the source ADDRESS (RCX); x64_entity_addr derefs it so writes
-						// (`dst = …`) reach the operand's data. Mirrors lb's by_reference path
-						// (lb_add_entity(e, ptr)). Was the json assign_int/assign_bool store loss.
+						// `switch &dst in v`: bind dst as an INDIRECT local - an 8-byte slot holding the source ADDRESS (RCX); x64_entity_addr derefs it so writes reach the operand data. Mirrors lb by_reference path (lb_add_entity(e, ptr)).
 						i32 slot = x64_alloc_local(p, 8, 8);
 						x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(slot), X64Reg_RCX);
 						x64_var_set(&p->var_offsets, case_entity, slot);
@@ -1452,10 +1400,7 @@ gb_internal void x64_build_assign_stmt(x64Procedure *p, Ast *node) {
 						}
 					}
 				}
-				// `v.xy = rhs` multi-component swizzle LVALUE: no single contiguous address — SCATTER each
-				// rhs element into v[swizzle_indices[i]] (mirrors lb_addr_store lbAddr_Swizzle). Single-comp
-				// `.y` (swizzle_count==0) keeps the addressable build_addr path below. Was test_issue_1730:
-				// `out.yz = ll.yz` fell through to build_addr → &out (offset 0) → wrote [2,3,0,0] not [0,2,3,0].
+				// `v.xy = rhs` multi-component swizzle LVALUE: no single contiguous address - SCATTER each rhs element into v[swizzle_indices[i]] (mirrors lb_addr_store lbAddr_Swizzle). Single-comp `.y` (swizzle_count==0) keeps the addressable build_addr path below.
 				{
 					Ast *lhs0 = unparen_expr(as->lhs[0]);
 					if (lhs0->kind == Ast_SelectorExpr && lhs0->SelectorExpr.swizzle_count > 0) {
@@ -1597,12 +1542,7 @@ gb_internal void x64_build_assign_stmt(x64Procedure *p, Ast *node) {
 			}
 			// Compound assignment (+=, -=, …); single lhs only.
 			if (lhs_count == 1 && rhs_count == 1) {
-				// `||=` / `&&=` are SHORT-CIRCUIT logical ops, not value ops: build the logical expr
-				// and store (mirrors lb_build_assign_stmt's Token_CmpAnd/CmpOr branch). The generic
-				// integer compound path below has NO switch case for Token_CmpOrEq/CmpAndEq → it
-				// silently no-op'd (lhs unchanged). THE blick no-text bug: `updated_points ||=
-				// shape_was_newly_created` never set updated_points → the glyph curve-point buffer was
-				// never uploaded to the GPU → glyphs rasterized from empty/stale curves → no text.
+				// `||=` / `&&=` are SHORT-CIRCUIT logical ops, not value ops: build the logical expr and store (mirrors lb_build_assign_stmt Token_CmpAnd/CmpOr branch). The generic integer compound path below has no case for Token_CmpOrEq/CmpAndEq and would silently no-op.
 				{
 					TokenKind lbop = cast(TokenKind)(Token_Add + (op - Token_AddEq));
 					if (lbop == Token_CmpAnd || lbop == Token_CmpOr) {
@@ -1654,13 +1594,7 @@ gb_internal void x64_build_assign_stmt(x64Procedure *p, Ast *node) {
 				i32 rhs_off = x64_alloc_local(p, (i32)rv_sz, 8);
 				x64_store_value(p, x64addr(x64_rbp_mem(rhs_off), rv_type), rv);
 
-				// FLOAT scalar AND aggregate (array/#simd/matrix) compound assign (+=,-=,*=,/=): the integer
-				// register path below does integer imul/add/div on the raw BIT PATTERNS → garbage. Route
-				// through x64_emit_arith (SSE for scalar float; element-wise + scalar broadcast for
-				// arrays/#simd/matrices via x64_emit_arith_array), like `lhs = lhs op rhs`. Was: scalar
-				// `v.f *= magic.f` → 0 (f16→f32); AND `arr /= s` integer-divided packed float bytes →
-				// denormal garbage — blick block_size_from_id's `res /= dpi_scale` → viewport size 0 →
-				// scrollview/timeline virtualization collapse (panels rendered nearly empty).
+				// FLOAT scalar AND aggregate (array/#simd/matrix) compound assign (+=,-=,*=,/=): the integer register path below would operate on raw BIT PATTERNS. Route through x64_emit_arith (SSE for scalar float; element-wise + scalar broadcast for arrays/#simd/matrices via x64_emit_arith_array), like `lhs = lhs op rhs`.
 				Type *tbt_ca = base_type(t);
 				bool is_aggr_arith = tbt_ca != nullptr && (tbt_ca->kind == Type_Array ||
 				                     tbt_ca->kind == Type_SimdVector || tbt_ca->kind == Type_Matrix);
@@ -1675,15 +1609,26 @@ gb_internal void x64_build_assign_stmt(x64Procedure *p, Ast *node) {
 					return;
 				}
 
+				// Integer division-family compound assign (/=, %=, %%=) - delegate to x64_emit_arith. The inline register path below lacks the 8/16-bit DIV promotion, the floored-mod (%%) correction, and any Token_ModModEq case.
+				{
+					TokenKind dbop = cast(TokenKind)(Token_Add + (op - Token_AddEq));
+					if (dbop == Token_Quo || dbop == Token_Mod || dbop == Token_ModMod) {
+						x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_R8, x64_rbp_mem(ea_off)); // R8 = &lhs
+						x64Value cur = x64_spill_value(p, x64v_mem(t, x64_mem(X64Reg_R8, 0)), t); // copy *lhs
+						x64Value rv2 = x64v_mem(rv_type, x64_rbp_mem(rhs_off));
+						x64Value nv  = x64_spill_value(p, x64_emit_arith(p, dbop, cur, rv2, t), t);
+						x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_R8, x64_rbp_mem(ea_off)); // reload (arith clobbered)
+						x64_store_value(p, x64addr(x64_mem(X64Reg_R8, 0), t), nv);
+						return;
+					}
+				}
+
 				// RAX = *lhs, RCX = rhs, R8 = &lhs (untouched by the op).
 				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_R8, x64_rbp_mem(ea_off));
 				x64_value_to_reg(p, x64v_mem(t, x64_mem(X64Reg_R8, 0)), X64Reg_RAX);
 				x64_value_to_reg(p, x64v_mem(t, x64_rbp_mem(rhs_off)), X64Reg_RCX);
 
-				// bit_set `+` is union (OR), `-` is difference (AND-NOT), NOT integer add/sub
-				// (empty-set `+= {x}` matches ADD, hiding this; an already-set bit doubles
-				// under ADD). Mirrors lb_emit_arith. Detect via LHS type OR the RHS operand
-				// type — `s += {x}`'s RHS literal resolves to Type_BitSet when the LHS doesn't.
+				// bit_set `+` is union (OR), `-` is difference (AND-NOT), not integer add/sub. Mirrors lb_emit_arith. Detect via LHS type OR the RHS operand type (an `s += {x}` RHS literal resolves to Type_BitSet when the LHS does not).
 				Type *abt = base_type(t);
 				bool is_bset = abt != nullptr && abt->kind == Type_BitSet;
 				if (!is_bset && as->rhs[0] != nullptr && as->rhs[0]->tav.type != nullptr) {
@@ -1782,9 +1727,7 @@ gb_internal void x64_build_value_decl(x64Procedure *p, Ast *node) {
 			return;
 		}
 
-		// @(static)/@(thread_local) locals persist across calls → lowered to module
-		// globals (mirrors lb_build_static_variables), not stack slots that would dangle
-		// after return (e.g. os's @(static) files corrupting stdout).
+		// @(static)/@(thread_local) locals persist across calls - lowered to module globals (mirrors lb_build_static_variables), not stack slots that would dangle after return.
 		{
 			bool is_static = false, is_tls = false;
 			for_array(i, vs->names) {
@@ -1808,11 +1751,7 @@ gb_internal void x64_build_value_decl(x64Procedure *p, Ast *node) {
 						gs = gb_string_append_fmt(gs, "-.%.*s-%llu",
 						                          LIT(se->token.string), (unsigned long long)se->id);
 						se->Variable.link_name = make_string((u8 const *)gs, gb_string_length(gs));
-						// A @(static) with a const initializer must BAKE the value into
-						// .rdata/.data (mirrors lb_build_static_variables). Routing it to
-						// x64_emit_global_variable zero-fills .bss with NO runtime init, so the
-						// static reads as all-zero — e.g. string_decode_rune's @(static,rodata)
-						// accept_sizes/accept_ranges → every rune decoded as U+FFFD.
+						// A @(static) with a const initializer must BAKE the value into .rdata/.data (mirrors lb_build_static_variables); routing it to x64_emit_global_variable zero-fills .bss with NO runtime init, so the static reads as all-zero.
 						Ast *init_val = (i < (isize)vs->values.count) ? vs->values[i] : nullptr;
 						if (se->Variable.thread_local_model.len != 0) {
 							x64_emit_global_tls(p->module, se, decl_info_of_entity(se));
@@ -1946,12 +1885,7 @@ gb_internal void x64_build_when_stmt(x64Procedure *p, Ast *node) {
 
 gb_internal void x64_build_if_stmt(x64Procedure *p, Ast *node) {
 	ast_node(ifs, IfStmt, node);
-	// The whole if-statement is a scope (mirrors lb_build_if_stmt's lb_open_scope(is->scope) /
-	// lb_close_scope at the end). Defers registered while building the init or the CONDITION must run
-	// at if-end — most importantly an `@(deferred_none)` proc called as the condition: the UI idiom
-	// `if parent_scope(b) { …children… }` defers parent_pop to the close of the if. Was: x64 had no
-	// such scope, so the condition's deferred call leaked past the if and never ran (blick: every
-	// `if ui.parent_scope(top_row){}` left its block pushed → following siblings became its children).
+	// The whole if-statement is a scope (mirrors lb_build_if_stmt lb_open_scope(is->scope)/lb_close_scope). Defers registered while building the init or the CONDITION must run at if-end - most importantly an `@(deferred_none)` proc called as the condition (e.g. a `if parent_scope(b) { ... }` UI idiom that defers parent_pop to the close of the if).
 	isize defer_base = p->deferred.count;
 	i32   ctx_save   = p->ctx_override_off;
 	i32   frame_save = p->local_size;
@@ -1972,10 +1906,7 @@ gb_internal void x64_build_if_stmt(x64Procedure *p, Ast *node) {
 	// Run+pop the if-scope's defers (init/condition) on the merged path — both branches reach here.
 	// A non-local exit (return/break) inside a branch already ran these via x64_run_deferred_from.
 	x64_scope_end(p, defer_base);
-	// Never reclaim below escape_floor: a `p = &Foo{}` in a branch (with p in an outer scope)
-	// keeps its slot alive past the if (mirrors the BlockStmt reclaim). Was: this reset dropped
-	// the escaped Parser in odin/parser parse_package's `if p==nil { p = &Parser{} }` → a later
-	// make() reused the slot and corrupted the pointee.
+	// Never reclaim below escape_floor: a `p = &Foo{}` in a branch (with p in an outer scope) keeps its slot alive past the if (mirrors the BlockStmt reclaim).
 	p->local_size      = gb_max(frame_save, p->escape_floor);
 	p->ctx_override_off = ctx_save;
 }
@@ -2007,10 +1938,7 @@ gb_internal void x64_build_for_stmt(x64Procedure *p, Ast *node) {
 	x64_pop_loop(p);
 }
 
-// `#unroll for v[, i] in EXPR { body }` (mirrors lb_build_unroll_range_stmt). The plain form fully
-// unrolls a COMPILE-TIME range — interval (const bounds), enum type, fixed/enumerated array, const
-// string — emitting the body once per element with v/i set. Was UNHANDLED → the loop was silently
-// skipped (body never ran). `#unroll(N)` (a runtime-stepped slice loop) is still a gap.
+// `#unroll for v[, i] in EXPR { body }` (mirrors lb_build_unroll_range_stmt). The plain form fully unrolls a COMPILE-TIME range - interval (const bounds), enum type, fixed/enumerated array, const string - emitting the body once per element with v/i set. `#unroll(N)` (runtime-stepped slice loop) is still a gap.
 gb_internal void x64_build_unroll_range_stmt(x64Procedure *p, Ast *stmt) {
 	ast_node(rs, UnrollRangeStmt, stmt);
 	if (rs->init != nullptr) x64_build_stmt(p, rs->init);
@@ -2104,9 +2032,7 @@ gb_internal void x64_build_stmt(x64Procedure *p, Ast *stmt) {
 	// CodeView: map the code that follows to this statement's source line.
 	x64_record_line(p, stmt);
 
-	// Apply this statement's `#no_bounds_check`/`#bounds_check` (inherited by nested stmts/exprs);
-	// restored at the end. Was: x64 only honoured global -no-bounds-check → e.g. the runtime's
-	// `#no_bounds_check ... &raw.data[raw.len]` (fixed-cap append at capacity) trapped.
+	// Apply the statement `#no_bounds_check`/`#bounds_check` (inherited by nested stmts/exprs); restored at the end.
 	u16 prev_sf = x64_push_state_flags(p, stmt);
 
 	switch (stmt->kind) {
@@ -2123,10 +2049,7 @@ gb_internal void x64_build_stmt(x64Procedure *p, Ast *stmt) {
 		isize defer_base = p->deferred.count;
 		i32   ctx_save   = p->ctx_override_off; // scoped `context` modifications: restore on exit
 		i32   frame_save = p->local_size;       // reclaim this block's locals+temps at scope exit
-		// A labeled block (`label: { … break label }`) is a break target: `break label` jumps past
-		// the block. Push a loop entry (continue disabled = -1) so x64_find_loop resolves the label;
-		// mirrors LLVM's lb_build_stmt BlockStmt target-list path. Was: x64 ignored block->label →
-		// `break label` found no loop → silently no-op'd (fell through the block instead of exiting).
+		// A labeled block (`label: { ... break label }`) is a break target: push a loop entry (continue disabled = -1) so x64_find_loop resolves the label; mirrors LLVM lb_build_stmt BlockStmt target-list path.
 		bool  labeled  = block->label != nullptr;
 		isize lbl_done = -1;
 		if (labeled) {
@@ -2178,7 +2101,7 @@ gb_internal void x64_build_stmt(x64Procedure *p, Ast *stmt) {
 		x64_build_range_stmt(p, stmt);
 	} case_end;
 
-	// `#unroll for` — fully unrolled compile-time range. Was missing → body silently skipped.
+	// `#unroll for` - fully unrolled compile-time range.
 	case_ast_node(urs, UnrollRangeStmt, stmt); {
 		x64_build_unroll_range_stmt(p, stmt);
 	} case_end;
@@ -2223,8 +2146,7 @@ gb_internal void x64_build_stmt(x64Procedure *p, Ast *stmt) {
 			break;
 		}
 		case Token_fallthrough:
-			// Jump to the next case clause's body (set per-case by x64_build_switch_stmt). Was a
-			// no-op → `case '+': … fallthrough; case 'i': …` never ran the 'i' body (parse_f64 "+inf").
+			// Jump to the next case clause body (set per-case by x64_build_switch_stmt).
 			if (p->fallthrough_lbl >= 0) x64_emit_jmp(&p->asm_, p->fallthrough_lbl);
 			break;
 		default:

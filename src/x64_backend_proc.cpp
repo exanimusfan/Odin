@@ -3,9 +3,8 @@
 static const X64Reg    X64_INT_ARG_REGS[4] = { X64Reg_RCX, X64Reg_RDX, X64Reg_R8, X64Reg_R9 };
 static const X64XmmReg X64_XMM_ARG_REGS[4] = { X64XmmReg_XMM0, X64XmmReg_XMM1, X64XmmReg_XMM2, X64XmmReg_XMM3 };
 
-// Indirect-ABI params at or below this size are copied into a frame-local on entry
-// (cheap, lets accesses use a direct RBP slot). Larger ones are accessed through the
-// incoming pointer (no copy) to avoid blowing the stack on huge by-value structs.
+// Indirect-ABI params at or below this size are copied into a frame-local on entry;
+// larger ones are accessed through the incoming pointer (no copy) to avoid huge stack copies.
 #define X64_INDIRECT_PARAM_COPY_MAX 4096
 
 gb_internal bool x64_arg_is_float(Type *t) { return x64_is_float(t); }
@@ -25,8 +24,7 @@ gb_internal u32 x64_cv_file_offset(x64Module *m, i32 file_id) {
 	if (m->cv_strtab.count == 0) array_add(&m->cv_strtab, (u8)0);
 	u32    str_off = (u32)m->cv_strtab.count;
 	String path    = get_file_path_string(file_id);
-	// Odin uses forward slashes; CodeView source paths need backslashes or the
-	// debugger can't match/open the file (name shows, but no source stepping).
+	// CodeView source paths need backslashes; Odin uses forward slashes.
 	for (isize i = 0; i < path.len; i++) {
 		u8 c = (u8)path.text[i];
 		if (c == '/') c = '\\';
@@ -57,8 +55,8 @@ gb_internal void x64_record_line(x64Procedure *p, Ast *node) {
 	TokenPos pos = ast_token(node).pos;
 	u32 code_off = (u32)p->asm_.code.count;
 
-	// S_INLINESITE: also record the CALLEE's real line+file for the active inline site (additive
-	// nested-frame info; the binary annotations are built from these).
+	// S_INLINESITE: also record the callee's real line+file for the active inline site
+	// (the binary annotations are built from these).
 	if (p->cur_inline_site >= 0 && pos.line > 0 && pos.file_id > 0) {
 		x64Procedure::InlineSiteRec *sr = &p->inline_sites[p->cur_inline_site];
 		x64Procedure::InlineSiteLine il; il.offset = code_off; il.line = pos.line; il.file_id = pos.file_id;
@@ -74,11 +72,9 @@ gb_internal void x64_record_line(x64Procedure *p, Ast *node) {
 	i32 line = pos.line;
 	i32 fid  = pos.file_id;
 	if (p->inline_frames.count > 0) {
-		// Inlined code → PRIMARY table gets the CALL-SITE line (caller's file) so the enclosing frame
-		// shows where the #force_inline was called; the inline frame's own callee lines come from the
-		// S_INLINESITE annotations recorded above. This pairing (primary=call-site, site=callee) is
-		// what makes the debugger surface a nested inline frame instead of just showing the callee
-		// line in the parent frame.
+		// Inlined code → primary table gets the call-site line (caller's file); the inline frame's
+		// own callee lines come from the S_INLINESITE annotations above. This pairing (primary=
+		// call-site, site=callee) is what surfaces a nested inline frame in the debugger.
 		fid  = p->file_id;
 		line = p->inline_call_line;
 	} else {
@@ -301,9 +297,8 @@ gb_internal u32 x64_cv_type(x64Module *m, Type *t) {
 }
 
 // Is a SINGLE value of type `rt` returned via a hidden pointer (vs RAX/XMM0)?
-// Win64 return ABI (mirrors LLVM's lbArg_Indirect): a register-sized scalar goes in
-// RAX/XMM0; aggregates go via hidden pointer unless size is 1/2/4/8. Zero-sized is a
-// "direct empty aggregate" (LLVM llvm_abi.cpp:1273): returns nothing.
+// Win64 return ABI (mirrors LLVM lbArg_Indirect): register-sized scalar → RAX/XMM0;
+// aggregates → hidden pointer unless size is 1/2/4/8. Zero-sized returns nothing.
 gb_internal bool x64_single_value_by_pointer(Type *rt) {
 	if (rt == nullptr) return false;
 	i64 sz = type_size_of(rt);
@@ -312,9 +307,8 @@ gb_internal bool x64_single_value_by_pointer(Type *rt) {
 	return !(sz == 1 || sz == 2 || sz == 4 || sz == 8);
 }
 
-// Number of results returned via HIDDEN POINTER ARGS (the first N-1 of an
-// N-result tuple, mirroring LLVM's split returns / lb_abi_modify_return_is_tuple).
-// Single-result and void procs have none.
+// Number of results returned via HIDDEN POINTER ARGS: the first N-1 of an N-result
+// tuple (mirrors LLVM split returns / lb_abi_modify_return_is_tuple). 0 for single/void.
 gb_internal int x64_num_partial_returns(Type *proc_type) {
 	Type *pt = base_type(proc_type);
 	if (pt == nullptr || pt->kind != Type_Proc) return 0;
@@ -322,9 +316,8 @@ gb_internal int x64_num_partial_returns(Type *proc_type) {
 	return 0;
 }
 
-// The "real" return value's type: the LAST result for a multi-result proc, the
-// sole result for a single-result proc, or null for void. Mirrors LLVM, where
-// only the last tuple field is the actual return; the rest are pointer outputs.
+// The "real" return value's type: the LAST result for a multi-result proc, the sole
+// result for single-result, or null for void (mirrors LLVM; the rest are pointer outputs).
 gb_internal Type *x64_last_result_type(Type *proc_type) {
 	Type *pt = base_type(proc_type);
 	if (pt == nullptr || pt->kind != Type_Proc) return nullptr;
@@ -333,9 +326,8 @@ gb_internal Type *x64_last_result_type(Type *proc_type) {
 	return vars[vars.count-1]->type;
 }
 
-// Win64 return ABI mirroring LLVM's split returns: for N>1 results only the LAST
-// determines whether a hidden sret pointer (param slot 0) is needed; the first
-// N-1 are returned through their own hidden pointer args (see x64_num_partial_returns).
+// For N>1 results only the LAST determines whether a hidden sret pointer (param slot 0)
+// is needed; the first N-1 use their own hidden pointer args (see x64_num_partial_returns).
 gb_internal bool x64_returns_by_pointer(Type *proc_type) {
 	Type *pt = base_type(proc_type);
 	if (pt == nullptr || pt->kind != Type_Proc) return false;
@@ -356,8 +348,7 @@ gb_internal void x64_proc_begin(x64Procedure *p) {
 	p->has_context = (pt->Proc.calling_convention == ProcCC_Odin);
 
 	// Count ABI slots: [ret_ptr?] [explicit_params...] [partial_ret_ptrs...] [context?]
-	// (partial-return ptrs = first N-1 results of a multi-result proc — split returns,
-	// mirrors LLVM. See x64_num_partial_returns.)
+	// (partial-return ptrs = first N-1 results of a multi-result proc; see x64_num_partial_returns.)
 	int slot = p->returns_by_pointer ? 1 : 0;
 	int first_explicit = slot;
 
@@ -395,8 +386,7 @@ gb_internal void x64_proc_begin(x64Procedure *p) {
 	// either `SUB RSP, imm32` (+NOP pad) for a small frame, or
 	// `MOV EAX,imm32; CALL __chkstk; SUB RSP,RAX` for a frame larger than one page.
 	// Win64 REQUIRES probing the guard pages for >4KB frames (__chkstk preserves the
-	// arg registers RCX/RDX/R8/R9); without it the first deep push (e.g. a call's
-	// return address) skips the guard page and faults — the default_context crash.
+	// arg registers RCX/RDX/R8/R9); without it a deep push skips a guard page and faults.
 	p->prologue_alloc_off = (isize)a->code.count;
 	x64_emit_sub_ri(a, X64OpSize_64, X64Reg_RSP, 0x1000); // 7-byte imm32 placeholder
 	p->sub_rsp_patch = (isize)(a->code.count - 4);         // imm32 sits at -4
@@ -417,9 +407,8 @@ gb_internal void x64_proc_begin(x64Procedure *p) {
 			if (e->kind != Entity_Variable) continue;
 			if (e->flags & EntityFlag_CVarArg) continue;
 
-			// Zero-sized param (empty struct/[0]T): carries no data and consumes
-			// no ABI slot (LLVM lowers it to a dropped empty aggregate). Map it to
-			// a non-dereferenced offset so references resolve (loads are no-ops).
+			// Zero-sized param (empty struct/[0]T): no data, no ABI slot. Map it to a
+			// non-dereferenced offset so references resolve (loads are no-ops).
 			if (x64_type_size(e->type) == 0) {
 				x64_var_set(&p->var_offsets, e, x64_alloc_local(p, 0, 1));
 				continue;
@@ -504,20 +493,17 @@ gb_internal void x64_proc_begin(x64Procedure *p) {
 		for_array(i, results->variables) {
 			Entity *e = results->variables[i];
 			if (e->kind != Entity_Variable) continue;
-			// Unnamed result (`-> Allocator_Error`): no debugger value normally. In a -debug
-			// build give it a slot anyway (named "result"/"result_N" in CodeView, see
-			// x64_proc_end) so the returned value is inspectable. Non-debug skips it (fast path).
+			// Unnamed result (`-> Allocator_Error`): only given a slot in a -debug build
+			// (named "result"/"result_N" in CodeView, see x64_proc_end) so it's inspectable.
 			if (e->token.string.len == 0 && p->module->debug_s == nullptr) continue;
 			i64 sz    = x64_type_size(e->type);
 			i64 align = x64_type_align(e->type);
 			i32 off   = x64_alloc_local(p, sz, align);
 			x64_var_set(&p->var_offsets, e, off);
-			// zero-init (x64_zero_mem caps unrolling and switches to REP STOSB for
-			// large results — a big by-value return must not explode .text)
+			// zero-init (x64_zero_mem caps unrolling, REP STOSB for large results)
 			x64_zero_mem(p, x64_rbp_mem(off), sz);
-			// Named return with a DEFAULT value (`-> (pow: u32 = 1)`): apply it (mirrors LLVM
-			// lb_build_proc_body's result-default store). Without this, the result starts at the
-			// zero value, ignoring `= 1` (was strconv Rabin-Karp pow=0 → strings.index always -1).
+			// Named return with a DEFAULT value (`-> (pow: u32 = 1)`): apply it
+			// (mirrors LLVM lb_build_proc_body's result-default store).
 			ParameterValue const &pv = e->Variable.param_value;
 			if (pv.kind != ParameterValue_Invalid &&
 			    pv.kind != ParameterValue_Location &&    // not valid for a result default (LLVM asserts)
@@ -551,9 +537,8 @@ gb_internal void x64_emit_named_returns(x64Procedure *p) {
 	X64Assembler *a = &p->asm_;
 	int nres = (int)results->variables.count;
 
-	// Split returns (mirrors LLVM): results[0..N-2] are copied through their hidden
-	// pointer args; result[N-1] is the REAL return — sret (param slot 0) if it's
-	// returned by pointer, else RAX/XMM0. For a single result only the last branch runs.
+	// Split returns (mirrors LLVM): results[0..N-2] copy through their hidden pointer args;
+	// result[N-1] is the REAL return — sret (param slot 0) if by pointer, else RAX/XMM0.
 	for (int i = 0; i < nres; i++) {
 		Entity *e = results->variables[i];
 		if (e->kind != Entity_Variable) continue;
@@ -762,8 +747,7 @@ gb_internal void x64_proc_end(x64Procedure *p) {
 
 	// frame = locals + shadow space (32) + outgoing stack args, 16-byte aligned. The outgoing
 	// area is the peak over all calls (max_outgoing_bytes), floored at 64 so the alloca path's
-	// fixed rsp+96 (shadow 32 + 64) assumption holds. A hardcoded 64 under-reserved for calls
-	// with >12 args (their extra stack slots overwrote a local).
+	// fixed rsp+96 (shadow 32 + 64) assumption holds.
 	i32 outgoing = gb_max(p->max_outgoing_bytes, 64);
 	i32 frame = ((p->frame_max + 32 + outgoing + 15) & ~15);
 	if (frame < 0x1000) {
@@ -1041,10 +1025,8 @@ gb_internal x64Value x64_emit_call(x64Procedure *p,
 	Type         *ct = base_type(callee_type_raw);
 	GB_ASSERT(ct->kind == Type_Proc);
 
-	// Reserve enough outgoing stack-arg space for THIS call (args beyond the 4 register slots).
-	// x64_proc_end sizes the frame's outgoing area from this peak; a fixed 64 bytes silently
-	// under-reserved for calls with >12 args → the 9th+ stack arg wrote past the area into a
-	// local (THE blick scrollview bug: 13-arg ui_scrollview_begin clobbered view_size).
+	// Reserve enough outgoing stack-arg space for THIS call (args beyond the 4 register slots);
+	// x64_proc_end sizes the frame's outgoing area from this peak.
 	if (arg_count > 4) {
 		i32 ob = (arg_count - 4) * 8;
 		if (ob > p->max_outgoing_bytes) p->max_outgoing_bytes = ob;
@@ -1065,9 +1047,8 @@ gb_internal x64Value x64_emit_call(x64Procedure *p,
 	}
 
 	// Register args (slots 0-3), reverse order to avoid clobbering: fill R9/XMM3 first.
-	// Win64 variadic ABI: a floating-point arg in a register slot of a variadic (c_vararg) callee must
-	// ALSO be placed in the corresponding GP register — the callee reads `...` args from GP. Without
-	// this, printf/ffmpeg-style `%f` args read garbage from the GP reg.
+	// Win64 variadic ABI: an FP arg in a register slot of a c_vararg callee must ALSO be
+	// placed in the corresponding GP register (the callee reads `...` args from GP).
 	bool variadic_abi = ct->Proc.c_vararg;
 	int reg_count = gb_min(arg_count, 4);
 	for (int i = reg_count - 1; i >= 0; i--) {

@@ -1,13 +1,11 @@
 // x64_backend_map.cpp — map[K]V support.
 //
-// Mirrors the LLVM backend's runtime-call path (build_context.dynamic_map_calls): every
-// map operation routes through the __dynamic_map_* runtime procedures plus a per-key-type
-// Map_Info table {ks, vs, key_hasher, key_equal}. The hasher/equal procs are compiler-
-// generated (no Odin AST) — emitted by hand as STATIC, file-local symbols, mirroring LLVM's
-// lb_hasher_proc_for_type / lb_equal_proc_generate_body internal-linkage procs.
+// Mirrors the LLVM runtime-call path: every map op routes through the __dynamic_map_* runtime
+// procs plus a per-key-type Map_Info {ks, vs, key_hasher, key_equal}. Hasher/equal procs are
+// compiler-generated (no Odin AST), emitted by hand as STATIC file-local symbols (mirrors
+// lb_hasher_proc_for_type / lb_equal_proc_generate_body).
 //
-// Included in the unity build AFTER x64_backend_expr.cpp (uses x64_emit_arith / x64_emit_conv
-// / x64_build_expr) and BEFORE x64_backend_stmt.cpp (RangeStmt uses the cell helpers).
+// Unity build: AFTER x64_backend_expr.cpp, BEFORE x64_backend_stmt.cpp.
 
 // ── small local helpers ─────────────────────────────────────────────────────
 
@@ -24,10 +22,9 @@ gb_internal x64Value x64_map_spill_u64(x64Procedure *p, x64Value v, Type *t) {
 	return x64v_mem(t, x64_rbp_mem(off));
 }
 
-// Look up a runtime procedure, enqueue it for compilation if it's an on-demand (min_dep==0)
-// proc, lower the full call ABI (sret / partial-return pointers / context for "odin" cc), and
-// emit it. `xargs[0..n)` are the EXPLICIT params (already register/pointer-sized values).
-// Returns the single-result value (RAX), or none for multi-result procs.
+// Call a runtime proc (enqueue if on-demand min_dep==0), lowering the full ABI: sret,
+// partial-return pointers, context for "odin" cc. `xargs[0..n)` are the EXPLICIT params.
+// Returns the single result (RAX), or none for multi-result procs.
 gb_internal x64Value x64_emit_runtime_call(x64Procedure *p, String name, x64Value *xargs, int n) {
 	AstPackage *rt = p->module->gen->info->runtime_package;
 	Entity *e = (rt != nullptr) ? scope_lookup_current(rt->scope, string_interner_insert(name)) : nullptr;
@@ -51,7 +48,7 @@ gb_internal x64Value x64_emit_runtime_call(x64Procedure *p, String name, x64Valu
 		last_rt = ct->Proc.results->Tuple.variables[ct->Proc.result_count-1]->type;
 	}
 
-	// sret pointer for the real (last) result, when it's returned by hidden pointer.
+	// sret pointer for the last result when returned by hidden pointer.
 	if (needs_rbp) {
 		i32 ro = x64_alloc_local(p, type_size_of(last_rt), type_align_of(last_rt));
 		i32 rp = x64_alloc_local(p, 8, 8);
@@ -60,7 +57,7 @@ gb_internal x64Value x64_emit_runtime_call(x64Procedure *p, String name, x64Valu
 		args[slot++] = x64v_mem(t_rawptr, x64_rbp_mem(rp));
 	}
 	for (int i = 0; i < n; i++) args[slot++] = xargs[i];
-	// Partial-return pointers for results[0..N-2] (throwaway locals — results ignored here).
+	// Partial-return pointers for results[0..N-2] (throwaway locals — ignored here).
 	for (int i = 0; i < npartial; i++) {
 		Type *pty = ct->Proc.results->Tuple.variables[i]->type;
 		i64 psz = type_size_of(pty); if (psz <= 0) psz = 1;
@@ -77,8 +74,8 @@ gb_internal x64Value x64_emit_runtime_call(x64Procedure *p, String name, x64Valu
 }
 
 // Deterministic per-type symbol for a synthetic hasher/equal proc. Canonicalised (core_type
-// for hashers, base_type for equal — matching the dedup keys) so distinct-but-equivalent types
-// share one proc, and the Map_Info reloc + the proc definition agree on the name.
+// for hashers, base_type for equal) so equivalent types share one proc and the Map_Info reloc
+// agrees with the proc definition's name.
 gb_internal String x64_synth_proc_name(x64Module *m, X64SynthKind kind, Type *type) {
 	Type *t = (kind == X64Synth_Hasher) ? core_type(type) : base_type(type);
 	u64 h = type_hash_canonical_type(t);
@@ -131,7 +128,7 @@ gb_internal x64Value x64_map_cap(x64Procedure *p, x64Value map_value) {
 // ── Map_Cell_Info / Map_Info backing globals ─────────────────────────────────
 
 // Emit (once per type) a private const Map_Cell_Info{size,align,cell_size,cell_len} into
-// .rdata; returns its symbol name. Pure integers, no relocations.
+// .rdata; returns its symbol name.
 gb_internal String x64_gen_map_cell_info_ptr(x64Module *m, Type *type) {
 	String *found = map_get(&m->map_cell_info_map, type);
 	if (found != nullptr) return *found;
@@ -160,8 +157,7 @@ gb_internal String x64_gen_map_cell_info_ptr(x64Module *m, Type *type) {
 }
 
 // Emit (once per map type) a private const Map_Info{ks, vs, key_hasher, key_equal} into .rdata
-// (4 pointer fields → ADDR64 relocs), enqueue the key hasher+equal for body generation, and
-// return its symbol name.
+// (4 pointer fields → ADDR64 relocs), enqueue the key hasher+equal, and return its symbol name.
 gb_internal String x64_gen_map_info_ptr(x64Module *m, Type *map_type) {
 	map_type = base_type(map_type);
 	GB_ASSERT(map_type->kind == Type_Map);
@@ -195,9 +191,8 @@ gb_internal String x64_gen_map_info_ptr(x64Module *m, Type *map_type) {
 	return name;
 }
 
-// Pointer (rawptr value) to a zeroed Source_Code_Location buffer, for the `loc` arg of the
-// "odin"-cc map procs. The runtime only reads it on the alloc-failure panic path, so a zeroed
-// location is acceptable; we don't yet emit real source locations.
+// rawptr to a zeroed Source_Code_Location for the `loc` arg of the "odin"-cc map procs. The
+// runtime only reads it on the alloc-failure panic path. TODO: emit real source locations.
 gb_internal x64Value x64_map_null_loc(x64Procedure *p) {
 	i64 sz = type_size_of(t_source_code_location); if (sz <= 0) sz = 8;
 	i64 al = type_align_of(t_source_code_location); if (al <= 0) al = 8;
@@ -224,8 +219,8 @@ gb_internal x64Value x64_map_key_ptr(x64Procedure *p, Ast *key_expr, Type *key_t
 	return x64v_mem(t_rawptr, x64_rbp_mem(po));
 }
 
-// hash = key_hasher(key_ptr, map_seed_from_map_data(data & ~63)) (mirrors lb_gen_map_key_hash;
-// lb_const_hash is disabled in LLVM, so we always go through the hasher proc).
+// hash = key_hasher(key_ptr, map_seed_from_map_data(data & ~63)). Mirrors lb_gen_map_key_hash;
+// always goes through the hasher proc (const-hash path is disabled in LLVM too).
 gb_internal x64Value x64_gen_map_key_hash(x64Procedure *p, x64Value map_value, x64Value key_ptr, Type *map_type) {
 	Type *key_type = base_type(map_type)->Map.key;
 	x64Value data = x64_map_data_uintptr(p, map_value);
@@ -540,9 +535,8 @@ gb_internal void x64_emit_equal_body(x64Procedure *p, Type *type, i32 res_off) {
 	x64_label_bind(&p->asm_, diff);
 
 	if (is_type_union(t) && !is_type_union_maybe_pointer(t)) {
-		// Compare the tags; if they differ the unions are unequal. If equal and nil (tag 0) they are
-		// equal. Otherwise dispatch on the tag and compare the active variant BY CONTENT — a flat byte
-		// compare would compare e.g. string headers (data pointers) instead of the string bytes.
+		// Compare tags; differ → unequal, equal-and-nil → equal. Otherwise dispatch on the tag and
+		// compare the active variant BY CONTENT (a flat byte compare would compare string headers).
 		bool no_nil = t->Union.kind == UnionType_no_nil;
 		i64 tag_sz = union_tag_size(t);
 		X64OpSize tsz = tag_sz <= 1 ? X64OpSize_8 : (tag_sz == 2 ? X64OpSize_16 : (tag_sz == 4 ? X64OpSize_32 : X64OpSize_64));
@@ -755,9 +749,7 @@ gb_internal x64Value x64_build_map_index_load(x64Procedure *p, Ast *map_expr, As
 }
 
 // `&m[k]` — map element POINTER (^V, nil if absent). Comma-ok form `p, ok := &m[k]` → (^V, bool) tuple.
-// Mirrors lb_internal_dynamic_map_get_ptr + the comma-ok wrap. Was UNHANDLED in x64: &map[key] fell to
-// x64_build_addr_index_expr's temp fallback → a garbage stack slot + exists=false (THE blick cache
-// corruption — writes through the bogus pointer clobbered cache.mem_entries).
+// Mirrors lb_internal_dynamic_map_get_ptr + the comma-ok wrap.
 gb_internal x64Value x64_build_map_index_ptr(x64Procedure *p, Ast *map_expr, Ast *key_expr, Type *result_type) {
 	Type *mt = base_type(type_deref(map_expr->tav.type));
 	GB_ASSERT(mt->kind == Type_Map);

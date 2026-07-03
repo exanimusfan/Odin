@@ -63,8 +63,8 @@ gb_internal void x64_const_int_bytes(Type *type, BigInt const *a, u8 *out, isize
 		mp_incr(&val);
 	}
 
-	// Buffer sized to the type (arbitrary width — mirrors lb_big_int_to_llvm). Small (≤32B = i256,
-	// i128/u128, etc.) stays on the stack; wider (large bit_sets backed by an int) heap-temp.
+	// Buffer sized to the type (arbitrary width, mirrors lb_big_int_to_llvm): ≤32B on the
+	// stack, wider via heap-temp.
 	u64 stack64[4] = {}; // 32 bytes
 	u8 *rop = cast(u8 *)stack64;
 	if (sz_in > (isize)gb_size_of(stack64)) {
@@ -99,10 +99,8 @@ gb_internal String x64_const_intern_string(x64Module *m, String s) {
 	String *cached = string_map_get(&m->const_strings, s);
 	if (cached != nullptr) return *cached;
 
-	// Align to 2: a `cstring16` (win.L / constant_utf16_cstring) is a u16 array, and Win32 APIs
-	// capture wide strings with a WCHAR (2-byte) ProbeForRead — an odd address raises
-	// STATUS_DATATYPE_MISALIGNMENT kernel-side → ERROR_NOACCESS (998). 1-byte packing let wide
-	// string constants land on odd addresses (the chaotic RegisterClassW/CreateWindowExW failures).
+	// Align to 2: a `cstring16` is a u16 array; Win32 wide-string ProbeForRead faults
+	// (STATUS_DATATYPE_MISALIGNMENT) on odd addresses.
 	coff_section_align(m->rdata, 2);
 	u32 boff = (u32)coff_section_len(m->rdata);
 	if (s.len > 0) coff_section_write(m->rdata, s.text, s.len);
@@ -175,9 +173,8 @@ gb_internal void x64_const_value(x64Module *m, CoffSection *sec, u32 off, Type *
 	i64 sz = type_size_of(type);
 	if (sz <= 0) return;
 
-	// static `any = <const>` (e.g. `@(static) v: any = 3`): box the value into a hidden .data
-	// global, then write any{data → it @0, id @8}. Without this the int bytes were written raw
-	// into the 16-byte any slot → id=0 → every `v.(T)` missed. Mirrors x64_box_any for statics.
+	// static `any = <const>`: box the value into a hidden .data global, then write
+	// any{data @0, id @8}. Mirrors x64_box_any for statics.
 	if (is_type_any(bt) && value.kind != ExactValue_Invalid) {
 		Type *vt = nullptr;
 		if (value_type != nullptr && !is_type_untyped(value_type) && !is_type_any(base_type(value_type))) {
@@ -275,10 +272,8 @@ gb_internal void x64_const_value(x64Module *m, CoffSection *sec, u32 off, Type *
 			return;
 		}
 		if (is_type_cstring16(bt)) {
-			// wide C string pointer (8 bytes, NOT a {data,len} header): UTF-16 encode + NUL-terminate,
-			// intern, emit ONLY the pointer. Mirrors the constant_utf16_cstring builtin. Without this,
-			// a `cstring16` const global fell to the 16-byte string path → wrote len past its 8-byte
-			// reservation (sys/windows package globals). Was the x64_const_patch off+n>data.count assert.
+			// wide C string is an 8-byte pointer, NOT a {data,len} header: UTF-16 encode +
+			// NUL-terminate, intern, emit ONLY the pointer. Mirrors constant_utf16_cstring.
 			u16  *buf = gb_alloc_array(temporary_allocator(), u16, s.len + 2);
 			isize n = 0; u8 const *text = s.text; isize len = s.len;
 			while (len > 0) {
@@ -315,10 +310,8 @@ gb_internal void x64_const_value(x64Module *m, CoffSection *sec, u32 off, Type *
 		if (pe != nullptr && pe->kind == Entity_Procedure) {
 			coff_reloc_add(sec, off, x64_get_entity_name(pe), COFF_REL_ADDR64);
 		} else if (pa != nullptr && pa->kind == Ast_ProcLit) {
-			// Anonymous `proc(){…}` literal as a compile-time-const global initializer (e.g. a
-			// package-global dispatch var like bufio._read_writer_procedure). Generate the anon proc
-			// + reloc the global to it. Was left 0 → the global proc pointer stayed nil (io.query
-			// returned an empty Stream_Mode_Set because s.procedure was nil).
+			// Anonymous `proc(){…}` literal as a compile-time-const global initializer:
+			// generate the anon proc + reloc the global to it.
 			Entity *ae = x64_anon_proc_entity(m, pa);
 			if (ae != nullptr) coff_reloc_add(sec, off, x64_get_entity_name(ae), COFF_REL_ADDR64);
 		}
@@ -326,9 +319,8 @@ gb_internal void x64_const_value(x64Module *m, CoffSection *sec, u32 off, Type *
 	}
 
 	case ExactValue_Typeid: {
-		// Canonical type hash — the SAME value as the typeid_of builtin, the constant
-		// typeid path in x64_build_expr, and the emitted Type_Info.id, so
-		// type_info_of(it) finds the table entry. (Was left 0 → type_info_of → nil.)
+		// Canonical type hash — the SAME value as the typeid_of builtin and the emitted
+		// Type_Info.id, so type_info_of(it) finds the table entry.
 		Type *tt = value.value_typeid;
 		u64 h = (tt != nullptr) ? type_hash_canonical_type(default_type(tt)) : 0;
 		x64_const_patch(sec, off, &h, gb_min(sz, (i64)8));
@@ -426,8 +418,8 @@ gb_internal void x64_const_value(x64Module *m, CoffSection *sec, u32 off, Type *
 					if (elem == nullptr || elem->kind != Ast_FieldValue) continue;
 					Ast *idx = elem->FieldValue.field;
 					if (idx == nullptr) continue;
-					// Key is a single integer (`0x80 = v`) or a RANGE (`lo..=hi = v` / `lo..<hi = v`,
-					// e.g. utf8.accept_sizes); ranges fill [lo, hi) (mirrors lb_const_value).
+					// Key is a single integer (`0x80 = v`) or a RANGE (`lo..=hi = v` / `lo..<hi = v`);
+					// ranges fill [lo, hi) (mirrors lb_const_value).
 					i64 lo, hi;
 					if (is_ast_range(idx)) {
 						ast_node(ie, BinaryExpr, idx);
