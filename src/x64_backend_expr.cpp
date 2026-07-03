@@ -7997,6 +7997,22 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 			x64Value *pvals = gb_alloc_array(temporary_allocator(), x64Value, n_params > 0 ? n_params : 1);
 			for (int i = 0; i < n_params; i++) pvals[i] = x64v_none();
 
+			// A fully-explicit, side-effect-free, non-variadic call lets each positional scalar-local
+			// arg be passed as a deferred RBP memory operand (via x64_build_binop_operand) — skipping
+			// load_addr's eager load AND stabilize's snapshot store. Safe only when nothing evaluated
+			// after a given arg writes memory that could alias the local, so require: no variadic /
+			// c_vararg (they build/pack extra args), no named args, positional covers every param (no
+			// defaults), and every positional arg side-effect-free. The final ABI-lowering loop only
+			// writes fresh stabilize slots, never the source locals, so the deferred reads stay valid.
+			bool defer_args = !has_variadic && !is_c_vararg &&
+			                  (ce->split_args == nullptr || ce->split_args->named.count == 0) &&
+			                  (int)positional.count == n_params;
+			if (defer_args) {
+				for (isize i = 0; i < positional.count; i++) {
+					if (!x64_expr_side_effect_free(positional[i])) { defer_args = false; break; }
+				}
+			}
+
 			// C varargs are appended as their own ABI slots after the fixed params.
 			x64Value *cvar = is_c_vararg ? gb_alloc_array(temporary_allocator(), x64Value, positional.count + 1) : nullptr;
 			int cvar_count = 0;
@@ -8088,7 +8104,8 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 					if (params->variables[param_cursor]->kind == Entity_TypeName) { param_cursor++; continue; }
 				}
 				if (param_cursor >= n_params) continue;          // safety (non-variadic overflow)
-				x64Value av = x64_build_expr(p, arg);
+				x64Value av = defer_args ? x64_build_binop_operand(p, arg, x64_typed(arg->tav.type))
+				                         : x64_build_expr(p, arg);
 				Type *abt = (av.type != nullptr) ? base_type(av.type) : nullptr;
 				// Spread a tuple-returning call across consecutive params only when the checker typed
 				// THIS arg as a tuple. An #optional_ok / #optional_allocator_error call used in single
