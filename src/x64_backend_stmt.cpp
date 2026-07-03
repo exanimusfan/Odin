@@ -104,6 +104,145 @@ gb_internal Ast *x64_range_strip(Ast *v) {
 	return v;
 }
 
+// Mirrors lb_build_return_stmt. Builds `results` into the result ABI (RAX / XMM0 / sret /
+// partial-return pointers), running defers at the LLVM-matching point. Conversion to each result
+// type is handled by x64_store_value (→ x64_emit_conv).
+gb_internal void x64_build_return_stmt(x64Procedure *p, Slice<Ast *> const &results) {
+	Type *pt = p->type;
+	GB_ASSERT(pt->kind == Type_Proc);
+
+	int res_count = (int)results.count;
+
+	Type *results_tuple = pt->Proc.results;
+	int   nres = (results_tuple != nullptr) ? (int)results_tuple->Tuple.variables.count : 0;
+
+	if (res_count == 0) {
+		// Bare return: defers may modify the named-return locals — run them FIRST, then
+		// write the (possibly modified) locals to the result ABI.
+		x64_run_deferred(p);
+		x64_emit_named_returns(p);
+	} else if (nres <= 1) {
+		// Build the return value BEFORE running defers (mirrors lb_build_return_stmt_internal:
+		// store the result, THEN lb_emit_defer_stmts). A defer that resets the temp arena or
+		// clobbers registers must NOT run before the return expression is evaluated — was the
+		// os bug: `return win32_utf16_to_utf8(...)` allocated into an arena the deferred
+		// TEMP_ALLOCATOR_GUARD_END had already reset, so the output aliased its input.
+		x64Value v  = x64_build_expr(p, results[0]);
+		Type    *rt = (nres == 1) ? results_tuple->Tuple.variables[0]->type : nullptr;
+		if (rt == nullptr || type_size_of(rt) == 0) {
+			x64_run_deferred(p); // void / zero-sized
+		} else if (p->returns_by_pointer) {
+			i64 rsz = type_size_of(rt);
+			// Spill (and convert) when v isn't already an rt-typed Mem (store_value → emit_conv).
+			if (v.kind != x64Value_Mem || (v.type != nullptr && !are_types_identical(v.type, rt))) {
+				i32 so = x64_alloc_local(p, rsz, type_align_of(rt));
+				x64_store_value(p, x64addr(x64_rbp_mem(so), rt), v);
+				v = x64v_mem(rt, x64_rbp_mem(so));
+			}
+			// Copy into the caller's sret buffer, THEN run defers (LLVM stores, then defers).
+			x64_emit_lea(&p->asm_, X64Reg_RAX, v.mem);
+			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RDX, x64_rbp_mem(x64_param_rbp_off(0)));
+			x64_copy_fixed(p, x64_mem(X64Reg_RDX, 0), x64_mem(X64Reg_RAX, 0), rsz);
+			x64_run_deferred(p);
+			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_rbp_off(0))); // RAX = sret ptr
+		} else if (p->deferred.count == 0) {
+			// No defers: move directly — but convert to rt first if needed (store_value → emit_conv).
+			if (v.type != nullptr && rt != nullptr && !are_types_identical(v.type, rt)) {
+				i64 rsz = type_size_of(rt);
+				i32 so = x64_alloc_local(p, rsz, type_align_of(rt));
+				x64_store_value(p, x64addr(x64_rbp_mem(so), rt), v);
+				v = x64v_mem(rt, x64_rbp_mem(so));
+			}
+			if (x64_is_float(rt)) x64_value_to_xmm(p, v, X64XmmReg_XMM0);
+			else                  x64_value_to_reg(p, v, X64Reg_RAX);
+		} else {
+			// Defers pending: spill the value so it survives them, run defers, then load it.
+			i64 rsz = type_size_of(rt);
+			i32 so = x64_alloc_local(p, rsz, type_align_of(rt));
+			x64_store_value(p, x64addr(x64_rbp_mem(so), rt), v);
+			x64_run_deferred(p);
+			if (x64_is_float(rt)) {
+				if (x64_is_double(rt)) x64_emit_movsd_rm(&p->asm_, X64XmmReg_XMM0, x64_rbp_mem(so));
+				else                    x64_emit_movss_rm(&p->asm_, X64XmmReg_XMM0, x64_rbp_mem(so));
+			} else {
+				x64_emit_mov_rm(&p->asm_, x64_op_size_of(rt), X64Reg_RAX, x64_rbp_mem(so));
+			}
+		}
+	} else {
+		// Split returns (mirror LLVM): results[0..N-2] go through hidden pointer args,
+		// result[N-1] in sret/RAX. Build all N into stack temps first (building clobbers
+		// RAX and the hidden-ptr regs; the ptrs survive in their homed shadow slots).
+		Array<i32>   toff; array_init(&toff, temporary_allocator(), nres, nres);
+		Array<Type*> ttyp; array_init(&ttyp, temporary_allocator(), nres, nres);
+		for (int i = 0; i < nres; i++) ttyp[i] = results_tuple->Tuple.variables[i]->type;
+
+		if (res_count == 1) {
+			// `return multi_valued_call()` — one expression yields the whole tuple. The call's
+			// result types may DIFFER from this proc's (implicit per-element conversion, e.g.
+			// `(string, Allocator_Error)` → `(string, os.Error)`), so read each field at the
+			// SOURCE tuple's offset/type and store it as the DEST type via x64_store_value,
+			// which applies the variant→union (and other) conversions.
+			x64Value tv = x64_build_expr(p, results[0]);
+			Type *src_tuple = (tv.type != nullptr) ? tv.type : results_tuple;
+			// Always spill the source tuple to an rbp-relative temp first: per-field reads below
+			// must be stable, but tv.mem.base may be a volatile reg that store_value/copy_fixed
+			// clobbers between fields.
+			i32 so = x64_alloc_local(p, type_size_of(src_tuple), type_align_of(src_tuple));
+			x64_store_value(p, x64addr(x64_rbp_mem(so), src_tuple), tv);
+			Type *src_base = base_type(src_tuple);
+			TypeTuple *stup = (src_base != nullptr && src_base->kind == Type_Tuple) ? &src_base->Tuple : nullptr;
+			i64 sfoff = 0;
+			for (int i = 0; i < nres; i++) {
+				Type *sty = (stup != nullptr && i < (int)stup->variables.count) ? stup->variables[i]->type : ttyp[i];
+				i64 ssz = type_size_of(sty);    if (ssz <= 0) ssz = 1;
+				i64 sal = type_align_of(sty);   if (sal <= 0) sal = 1;
+				sfoff = (sfoff + (sal - 1)) & ~(sal - 1);
+				i64 dsz = type_size_of(ttyp[i]); if (dsz <= 0) dsz = 1;
+				i64 dal = type_align_of(ttyp[i]); if (dal <= 0) dal = 1;
+				i32 t = x64_alloc_local(p, dsz, dal); toff[i] = t;
+				x64Value fv = x64_load_addr(p, x64addr(x64_rbp_mem((i32)(so + sfoff)), sty));
+				x64_store_value(p, x64addr(x64_rbp_mem(t), ttyp[i]), fv);
+				sfoff += ssz;
+			}
+		} else {
+			// `return v0, v1, ...` — one expression per result.
+			for (int i = 0; i < nres && i < res_count; i++) {
+				i64 fsz = type_size_of(ttyp[i]); if (fsz <= 0) fsz = 1;
+				i64 fal = type_align_of(ttyp[i]); if (fal <= 0) fal = 1;
+				x64Value v = x64_build_expr(p, results[i]);
+				i32 t = x64_alloc_local(p, fsz, fal); toff[i] = t;
+				x64_store_value(p, x64addr(x64_rbp_mem(t), ttyp[i]), v);
+			}
+		}
+
+		x64_run_deferred(p); // defers AFTER all results are built into temps, before ABI write
+
+		for (int i = 0; i < nres; i++) {
+			i64 fsz = type_size_of(ttyp[i]);
+			bool is_last = (i == nres - 1);
+			if (!is_last) {
+				if (fsz == 0) continue;
+				int s = p->first_partial_ret_slot + i;
+				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_rbp_off(s)));
+				x64_copy_fixed(p, x64_mem(X64Reg_RAX, 0), x64_rbp_mem(toff[i]), fsz);
+			} else if (fsz == 0) {
+				// zero-sized last result: nothing
+			} else if (p->returns_by_pointer) {
+				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_rbp_off(0)));
+				x64_copy_fixed(p, x64_mem(X64Reg_RAX, 0), x64_rbp_mem(toff[i]), fsz);
+			} else if (x64_is_float(ttyp[i])) {
+				if (x64_is_double(ttyp[i])) x64_emit_movsd_rm(&p->asm_, X64XmmReg_XMM0, x64_rbp_mem(toff[i]));
+				else                         x64_emit_movss_rm(&p->asm_, X64XmmReg_XMM0, x64_rbp_mem(toff[i]));
+			} else {
+				x64_emit_mov_rm(&p->asm_, x64_op_size_of(ttyp[i]), X64Reg_RAX, x64_rbp_mem(toff[i]));
+			}
+		}
+	}
+
+	x64_proc_emit_epilogue(p);
+	x64_emit_ret(&p->asm_);
+}
+
 gb_internal void x64_build_stmt(x64Procedure *p, Ast *stmt) {
 	if (stmt == nullptr) return;
 
@@ -470,105 +609,7 @@ gb_internal void x64_build_stmt(x64Procedure *p, Ast *stmt) {
 	} case_end;
 
 	case_ast_node(rets, ReturnStmt, stmt); {
-		Type *pt = p->type;
-		GB_ASSERT(pt->kind == Type_Proc);
-
-		x64_run_deferred(p);
-
-		int res_count = (int)rets->results.count;
-
-		Type *results_tuple = pt->Proc.results;
-		int   nres = (results_tuple != nullptr) ? (int)results_tuple->Tuple.variables.count : 0;
-
-		if (res_count == 0) {
-			// bare return — write named return locals back per the result ABI
-			x64_emit_named_returns(p);
-		} else if (nres <= 1) {
-			x64Value v  = x64_build_expr(p, rets->results[0]);
-			Type    *rt = (nres == 1) ? results_tuple->Tuple.variables[0]->type : nullptr;
-			if (rt == nullptr || type_size_of(rt) == 0) {
-				// void / zero-sized: nothing to return
-			} else if (p->returns_by_pointer) {
-				i64 rsz = type_size_of(rt);
-				if (v.kind != x64Value_Mem) {
-					i32 so = x64_alloc_local(p, rsz, type_align_of(rt));
-					x64_store_value(p, x64addr(x64_rbp_mem(so), rt), v);
-					v = x64v_mem(rt, x64_rbp_mem(so));
-				}
-				x64_emit_lea(&p->asm_, X64Reg_RAX, v.mem);          // RAX = &src
-				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RDX,
-				                x64_rbp_mem(x64_param_rbp_off(0)));  // RDX = sret ptr
-				x64_copy_fixed(p, x64_mem(X64Reg_RDX, 0), x64_mem(X64Reg_RAX, 0), rsz);
-			} else if (x64_is_float(rt)) {
-				x64_value_to_xmm(p, v, X64XmmReg_XMM0);
-			} else {
-				x64_value_to_reg(p, v, X64Reg_RAX);
-			}
-		} else {
-			// Split returns (mirror LLVM): results[0..N-2] go through hidden pointer args,
-			// result[N-1] in sret/RAX. Build all N into stack temps first (building clobbers
-			// RAX and the hidden-ptr regs; the ptrs survive in their homed shadow slots).
-			Array<i32>   toff; array_init(&toff, temporary_allocator(), nres, nres);
-			Array<Type*> ttyp; array_init(&ttyp, temporary_allocator(), nres, nres);
-			for (int i = 0; i < nres; i++) ttyp[i] = results_tuple->Tuple.variables[i]->type;
-
-			if (res_count == 1) {
-				// `return multi_valued_call()` — one expression yields the whole tuple.
-				x64Value tv = x64_build_expr(p, rets->results[0]);
-				i64 tsz = type_size_of(results_tuple);
-				if (tv.kind != x64Value_Mem) {
-					i32 so = x64_alloc_local(p, tsz, type_align_of(results_tuple));
-					x64_store_value(p, x64addr(x64_rbp_mem(so), results_tuple), tv);
-					tv = x64v_mem(results_tuple, x64_rbp_mem(so));
-				}
-				i32 base = x64_alloc_local(p, 8, 8);
-				x64_emit_lea(&p->asm_, X64Reg_RAX, tv.mem);
-				x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(base), X64Reg_RAX);
-				i64 foff = 0;
-				for (int i = 0; i < nres; i++) {
-					i64 fsz = type_size_of(ttyp[i]); if (fsz <= 0) fsz = 1;
-					i64 fal = type_align_of(ttyp[i]); if (fal <= 0) fal = 1;
-					foff = (foff + (fal - 1)) & ~(fal - 1);
-					i32 t = x64_alloc_local(p, fsz, fal); toff[i] = t;
-					x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(base));
-					x64_copy_fixed(p, x64_rbp_mem(t), x64_mem(X64Reg_RAX, (i32)foff), fsz);
-					foff += fsz;
-				}
-			} else {
-				// `return v0, v1, ...` — one expression per result.
-				for (int i = 0; i < nres && i < res_count; i++) {
-					i64 fsz = type_size_of(ttyp[i]); if (fsz <= 0) fsz = 1;
-					i64 fal = type_align_of(ttyp[i]); if (fal <= 0) fal = 1;
-					x64Value v = x64_build_expr(p, rets->results[i]);
-					i32 t = x64_alloc_local(p, fsz, fal); toff[i] = t;
-					x64_store_value(p, x64addr(x64_rbp_mem(t), ttyp[i]), v);
-				}
-			}
-
-			for (int i = 0; i < nres; i++) {
-				i64 fsz = type_size_of(ttyp[i]);
-				bool is_last = (i == nres - 1);
-				if (!is_last) {
-					if (fsz == 0) continue;
-					int s = p->first_partial_ret_slot + i;
-					x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_rbp_off(s)));
-					x64_copy_fixed(p, x64_mem(X64Reg_RAX, 0), x64_rbp_mem(toff[i]), fsz);
-				} else if (fsz == 0) {
-					// zero-sized last result: nothing
-				} else if (p->returns_by_pointer) {
-					x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_rbp_off(0)));
-					x64_copy_fixed(p, x64_mem(X64Reg_RAX, 0), x64_rbp_mem(toff[i]), fsz);
-				} else if (x64_is_float(ttyp[i])) {
-					if (x64_is_double(ttyp[i])) x64_emit_movsd_rm(&p->asm_, X64XmmReg_XMM0, x64_rbp_mem(toff[i]));
-					else                         x64_emit_movss_rm(&p->asm_, X64XmmReg_XMM0, x64_rbp_mem(toff[i]));
-				} else {
-					x64_emit_mov_rm(&p->asm_, x64_op_size_of(ttyp[i]), X64Reg_RAX, x64_rbp_mem(toff[i]));
-				}
-			}
-		}
-
-		x64_proc_emit_epilogue(p);
-		x64_emit_ret(&p->asm_);
+		x64_build_return_stmt(p, rets->results);
 	} case_end;
 
 	case_ast_node(ifs, IfStmt, stmt); {
@@ -859,6 +900,101 @@ gb_internal void x64_build_stmt(x64Procedure *p, Ast *stmt) {
 			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(loop_idx_off));
 			x64_emit_inc_r(&p->asm_, X64OpSize_64, X64Reg_RAX);
 			x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(loop_idx_off), X64Reg_RAX);
+			x64_emit_jmp(&p->asm_, lbl_loop);
+
+		} else if (iter_type->kind == Type_BitSet) {
+			// Iterate set bits low→high (mirrors lb_build_range_stmt Type_BitSet): remaining =
+			// set & valid-mask; each step the element = ctz(remaining)+lower, then clear the
+			// lowest set bit (remaining &= remaining-1). bit_set is an integer ≤8 bytes.
+			i64 lower = iter_type->BitSet.lower;
+			i64 nbits = iter_type->BitSet.upper - lower + 1; if (nbits < 0) nbits = 0;
+			u64 all_mask = (nbits >= 64) ? ~(u64)0 : (((u64)1 << nbits) - 1);
+
+			i32 rem_off = x64_alloc_local(p, 8, 8);
+			x64_value_to_reg(p, x64_build_expr(p, iter_expr), X64Reg_RAX);
+			if (all_mask != ~(u64)0) {
+				x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RCX, (i64)all_mask);
+				x64_emit_and_rr(&p->asm_, X64OpSize_64, X64Reg_RAX, X64Reg_RCX);
+			}
+			x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(rem_off), X64Reg_RAX);
+
+			x64_label_bind(&p->asm_, lbl_loop);
+			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(rem_off));
+			x64_emit_test_rr(&p->asm_, X64OpSize_64, X64Reg_RAX, X64Reg_RAX);
+			x64_emit_jcc(&p->asm_, X64Cc_E, lbl_end);
+
+			// element value = index of lowest set bit + lower
+			x64_emit_bsf_rr(&p->asm_, X64OpSize_64, X64Reg_RCX, X64Reg_RAX);
+			if (lower != 0) x64_emit_add_ri(&p->asm_, X64OpSize_64, X64Reg_RCX, (i32)lower);
+			if (elem_e) x64_emit_mov_mr(&p->asm_, x64_op_size_of(elem_e->type), x64_rbp_mem(elem_off), X64Reg_RCX);
+
+			// remaining &= remaining - 1 (clear lowest set bit); RAX still holds remaining
+			x64_emit_lea(&p->asm_, X64Reg_RCX, x64_mem(X64Reg_RAX, -1));
+			x64_emit_and_rr(&p->asm_, X64OpSize_64, X64Reg_RAX, X64Reg_RCX);
+			x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(rem_off), X64Reg_RAX);
+
+			if (ridx_e) {
+				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(loop_idx_off));
+				x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(ridx_off), X64Reg_RAX);
+			}
+
+			x64_build_stmt(p, rs->body);
+
+			x64_label_bind(&p->asm_, lbl_post);
+			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(loop_idx_off));
+			x64_emit_inc_r(&p->asm_, X64OpSize_64, X64Reg_RAX);
+			x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(loop_idx_off), X64Reg_RAX);
+			x64_emit_jmp(&p->asm_, lbl_loop);
+
+		} else if (iter_type->kind == Type_Tuple) {
+			// Iterator-proc range `for v, i in f(&it)`: f returns (vals…, ok: bool). The call is
+			// re-run each iteration to advance the iterator; the LAST tuple field is the loop
+			// condition, preceding fields are the values (mirrors lb_build_range_tuple). This is
+			// what os.read_directory's `for fi, index in read_directory_iterator(&it)` needs.
+			int tcount = (int)iter_type->Tuple.variables.count;
+
+			x64_label_bind(&p->asm_, lbl_loop);
+			x64Value tup = x64_build_expr(p, iter_expr);   // re-call each iteration → tuple buffer
+			i32 tup_off  = x64_alloc_local(p, 8, 8);       // pin base (field reads/body clobber regs)
+			x64_emit_lea(&p->asm_, X64Reg_RAX, tup.mem);
+			x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(tup_off), X64Reg_RAX);
+
+			// Field offsets (packed-with-alignment, same layout the AssignStmt tuple unpack uses).
+			Array<i64> foffs; array_init(&foffs, temporary_allocator(), tcount, tcount);
+			i64 foff = 0;
+			for (int i = 0; i < tcount; i++) {
+				Type *ft = iter_type->Tuple.variables[i]->type;
+				i64 fsz = type_size_of(ft);  if (fsz <= 0) fsz = 1;
+				i64 fal = type_align_of(ft); if (fal <= 0) fal = 1;
+				foff = align_formula(foff, fal);
+				foffs[i] = foff;
+				foff += fsz;
+			}
+
+			// Condition = last field (ok: bool) — end the loop when false.
+			Type     *cond_t  = iter_type->Tuple.variables[tcount-1]->type;
+			X64OpSize cond_sz = x64_op_size_of(cond_t);
+			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(tup_off));
+			x64_emit_mov_rm(&p->asm_, cond_sz, X64Reg_RCX, x64_mem(X64Reg_RAX, (i32)foffs[tcount-1]));
+			x64_emit_test_rr(&p->asm_, cond_sz, X64Reg_RCX, X64Reg_RCX);
+			x64_emit_jcc(&p->asm_, X64Cc_E, lbl_end);
+
+			// Bind value (field 0) and optional index (field 1).
+			if (elem_e) {
+				Type *ft = iter_type->Tuple.variables[0]->type;
+				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(tup_off));
+				x64Value fv = x64_load_addr(p, x64addr(x64_mem(X64Reg_RAX, (i32)foffs[0]), ft));
+				x64_store_value(p, x64addr(x64_rbp_mem(elem_off), ft), fv);
+			}
+			if (ridx_e && tcount >= 2) {
+				Type *ft = iter_type->Tuple.variables[1]->type;
+				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(tup_off));
+				x64Value fv = x64_load_addr(p, x64addr(x64_mem(X64Reg_RAX, (i32)foffs[1]), ft));
+				x64_store_value(p, x64addr(x64_rbp_mem(ridx_off), ft), fv);
+			}
+
+			x64_build_stmt(p, rs->body);
+			x64_label_bind(&p->asm_, lbl_post);
 			x64_emit_jmp(&p->asm_, lbl_loop);
 
 		} else {

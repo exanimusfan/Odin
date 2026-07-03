@@ -313,6 +313,20 @@ gb_internal i32        x64_param_rbp_off  (int slot); // → RBP + 16 + slot*8
 gb_internal x64Addr    x64_entity_addr    (x64Procedure *p, Entity *e);
 gb_internal void       x64_store_value    (x64Procedure *p, x64Addr dst, x64Value src);
 gb_internal x64Value   x64_load_addr      (x64Procedure *p, x64Addr addr);
+// Conversion (mirrors lb_emit_conv): the single authority for value→type conversion. Every
+// store/return/arg site routes through here so a conversion always actually converts.
+gb_internal x64Value   x64_emit_conv      (x64Procedure *p, x64Value src, Type *from, Type *to);
+// Bit reinterpret (mirrors lb_emit_transmute) — same size, no numeric conversion.
+gb_internal x64Value   x64_emit_transmute (x64Procedure *p, x64Value value, Type *t);
+// Binary arithmetic / comparison on pre-built operands (mirror lb_emit_arith / lb_emit_comp).
+gb_internal x64Value   x64_emit_arith     (x64Procedure *p, TokenKind op, x64Value lhs, x64Value rhs, Type *type);
+gb_internal x64Value   x64_emit_comp      (x64Procedure *p, TokenKind op, x64Value lhs, x64Value rhs);
+// A type used as a value → its typeid (mirrors lb_typeid).
+gb_internal x64Value   x64_typeid         (Type *type);
+// Construct a union value (variant `src` → `union_type`) at `dst` (mirrors lb_emit_store_union_variant).
+gb_internal void       x64_store_union_variant(x64Procedure *p, X64Mem dst, x64Value src, Type *union_type);
+// Box `src` into an `any` {data, typeid} at `dst` (the to-`any` case of lb_emit_conv).
+gb_internal void       x64_box_any        (x64Procedure *p, X64Mem dst, x64Value src, Type *src_type);
 
 // Memory helpers (defined in stmt.cpp, used earlier in expr.cpp)
 gb_internal void      x64_zero_mem(x64Procedure *p, X64Mem dst, i64 size);
@@ -343,6 +357,9 @@ gb_internal x64Procedure::LoopInfo *x64_find_loop(x64Procedure *p, String label)
 gb_internal void      x64_build_stmt(x64Procedure *p, Ast *stmt);
 gb_internal x64Value  x64_build_expr(x64Procedure *p, Ast *expr);
 gb_internal x64Addr   x64_build_addr(x64Procedure *p, Ast *expr);
+// CallExpr lowering, split out of x64_build_expr (mirrors lb_build_call_expr). Mutually
+// recursive with x64_build_expr, hence the forward decl.
+gb_internal x64Value  x64_build_call_expr(x64Procedure *p, Ast *expr);
 
 gb_internal void      x64_compile_procedure (x64Module *m, Entity *e, Ast *body);
 gb_internal void      x64_build_nested_proc (x64Procedure *p, Ast *proc_lit, Entity *e);

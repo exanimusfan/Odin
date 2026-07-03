@@ -331,3 +331,10 @@ gb_internal void x64_emit_lock_xchg_mr    (X64Assembler *a, X64OpSize sz, X64Mem
 gb_internal void x64_emit_mfence(X64Assembler *a);
 gb_internal void x64_emit_sfence(X64Assembler *a);
 gb_internal void x64_emit_lfence(X64Assembler *a);
+
+// No-operand / fixed-encoding instructions
+gb_internal void x64_emit_pause (X64Assembler *a); // F3 90      — spin-loop hint (cpu_relax)
+gb_internal void x64_emit_ud2   (X64Assembler *a); // 0F 0B      — undefined instruction (trap)
+gb_internal void x64_emit_rdtsc (X64Assembler *a); // 0F 31      — EDX:EAX = timestamp counter
+gb_internal void x64_emit_cpuid (X64Assembler *a); // 0F A2      — CPUID(EAX leaf, ECX subleaf) -> EAX/EBX/ECX/EDX
+gb_internal void x64_emit_xgetbv(X64Assembler *a); // 0F 01 D0   — EDX:EAX = XCR[ECX]

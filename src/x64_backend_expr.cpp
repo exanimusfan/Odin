@@ -28,7 +28,9 @@ gb_internal void x64_emit_float_const(x64Procedure *p, Type *t, f64 fval, f32 fv
 
 // Materialise a string into a {data,len} stack struct. Byte data is INTERNED
 // (one .rdata global per unique string — mirrors lb_find_or_add_entity_string_ptr).
-gb_internal x64Value x64_const_string(x64Procedure *p, String sv) {
+// {ptr, len} for a string / []u8 / []T constant. `elem_size` > 1 means a non-u8 slice (#load
+// to []u32 etc.): len is the ELEMENT count = bytes / elem_size (mirrors LLVM's data_len /= sz).
+gb_internal x64Value x64_const_string(x64Procedure *p, String sv, i64 elem_size = 1) {
 	x64Module *m = p->module;
 	i32 str_off = x64_alloc_local(p, 16, 8);
 	if (sv.len > 0) {
@@ -39,7 +41,8 @@ gb_internal x64Value x64_const_string(x64Procedure *p, String sv) {
 		x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RAX, 0); // empty → null data ptr
 		x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(str_off), X64Reg_RAX);
 	}
-	x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RAX, (i64)sv.len);
+	i64 len = (elem_size > 1) ? sv.len / elem_size : sv.len;
+	x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RAX, len);
 	x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(str_off + 8), X64Reg_RAX);
 	return x64v_mem(t_string, x64_rbp_mem(str_off));
 }
@@ -824,17 +827,38 @@ gb_internal x64Addr x64_build_addr(x64Procedure *p, Ast *expr) {
 					return x64addr(m, x64_typed(s.entity->type));
 				}
 			}
-		} else if (field != nullptr) {
-			field_type = field->type;
-		} else {
-			// Built-in pseudo-field on slice / string / dynamic array / map.
-			// Layout (64-bit): data@0(8), len@8(8), cap@16(8), allocator@24(16+).
+		} else if (st->kind == Type_Slice || st->kind == Type_DynamicArray || is_type_string(st)) {
+			// Built-in pseudo-field on slice / string / dynamic array (data@0, len@8, cap@16,
+			// allocator@24). The checker may resolve the selector to the underlying Raw_* field
+			// entity (field != nullptr), but `st` is the aggregate type, not its Raw_ struct, so
+			// the struct-offset path can't run — apply the offset BY NAME regardless of `field`.
+			// (Gating on field==nullptr read .allocator at 0, the data ptr: _make stored it via
+			// the ^Raw_Dynamic_Array struct field @24, every read here saw @0 → make/delete crash.)
 			String fname = sel->selector->Ident.token.string;
 			if      (fname == "data")      { field_off =  0; }
 			else if (fname == "len")       { field_off =  8; }
 			else if (fname == "cap")       { field_off = 16; }
 			else if (fname == "allocator") { field_off = 24; }
-			// field_type stays as the tav.type of the full selector expression
+			if (field != nullptr) field_type = field->type;
+		} else if (st->kind == Type_Map) {
+			// Raw_Map: data@0, len@8, allocator@16 (no cap field) — allocator sits earlier than in
+			// a dynamic array. Same field!=nullptr gap as the aggregate bases above.
+			String fname = sel->selector->Ident.token.string;
+			if      (fname == "data")      { field_off =  0; }
+			else if (fname == "len")       { field_off =  8; }
+			else if (fname == "allocator") { field_off = 16; }
+			if (field != nullptr) field_type = field->type;
+		} else if (is_type_quaternion(st)) {
+			// quaternion components via .x/.y/.z/.w selectors (real/imag/jmag/kmag are builtins, not
+			// fields). Layout {imag@0, jmag, kmag, real} (esz=size/4) → x/y/z/w == imag/jmag/kmag/real.
+			// Without this .y/.z/.w resolved to offset 0 (same non-struct field gap as above).
+			i64 esz = type_size_of(st) / 4;
+			String fname = sel->selector->Ident.token.string;
+			if      (fname == "y") field_off = 1 * esz;
+			else if (fname == "z") field_off = 2 * esz;
+			else if (fname == "w") field_off = 3 * esz;
+		} else if (field != nullptr) {
+			field_type = field->type;
 		}
 
 		X64Mem m = base.mem;
@@ -1051,12 +1075,422 @@ gb_internal x64Value x64_build_atomic(x64Procedure *p, Ast *expr, i32 id) {
 	return x64v_reg(T, X64Reg_RAX); // old value
 }
 
+// Scalar compiler intrinsics (intrinsics.odin) lowered inline, mirroring lb_build_builtin_proc.
+// These are NOT runtime calls in LLVM either (LLVM lowers them to llvm.* intrinsics) — without
+// them they silently no-op and return garbage (e.g. overflow_add → 0 broke the temp arena).
+gb_internal bool x64_is_simple_intrinsic(i32 id) {
+	switch (id) {
+	case BuiltinProc_count_ones: case BuiltinProc_count_zeros:
+	case BuiltinProc_count_trailing_zeros: case BuiltinProc_count_leading_zeros:
+	case BuiltinProc_count_trailing_ones:  case BuiltinProc_count_leading_ones:
+	case BuiltinProc_reverse_bits: case BuiltinProc_byte_swap:
+	case BuiltinProc_overflow_add: case BuiltinProc_overflow_sub: case BuiltinProc_overflow_mul:
+	case BuiltinProc_saturating_add: case BuiltinProc_saturating_sub:
+	case BuiltinProc_sqrt: case BuiltinProc_fused_mul_add:
+	case BuiltinProc_cpu_relax: case BuiltinProc_trap: case BuiltinProc_debug_trap:
+	case BuiltinProc_read_cycle_counter: case BuiltinProc_read_cycle_counter_frequency:
+	case BuiltinProc_expect: case BuiltinProc_likely: case BuiltinProc_unlikely:
+	case BuiltinProc_volatile_load:     case BuiltinProc_volatile_store:
+	case BuiltinProc_non_temporal_load: case BuiltinProc_non_temporal_store:
+	case BuiltinProc_unaligned_load:    case BuiltinProc_unaligned_store:
+	case BuiltinProc_prefetch_read_instruction:  case BuiltinProc_prefetch_read_data:
+	case BuiltinProc_prefetch_write_instruction: case BuiltinProc_prefetch_write_data:
+	case BuiltinProc_x86_cpuid: case BuiltinProc_x86_xgetbv:
+		return true;
+	}
+	return false;
+}
+
+// Zero-extend RAX from `bytes` to a full 64-bit register so bit-count ops see clean upper bits.
+gb_internal void x64_zext_rax(x64Procedure *p, i64 bytes) {
+	X64Assembler *a = &p->asm_;
+	if      (bytes == 1) x64_emit_movzx_rr(a, X64OpSize_8,  X64Reg_RAX, X64Reg_RAX);
+	else if (bytes == 2) x64_emit_movzx_rr(a, X64OpSize_16, X64Reg_RAX, X64Reg_RAX);
+	else if (bytes == 4) x64_emit_mov_rr  (a, X64OpSize_32, X64Reg_RAX, X64Reg_RAX);
+}
+
+gb_internal x64Value x64_build_intrinsic(x64Procedure *p, Ast *expr, i32 id) {
+	ast_node(ce, CallExpr, expr);
+	X64Assembler *a = &p->asm_;
+
+	// --- control / misc (no integer operand) ---
+	switch (id) {
+	case BuiltinProc_cpu_relax:  x64_emit_pause(a); return x64v_none();
+	case BuiltinProc_debug_trap: x64_emit_int3(a);  return x64v_none();
+	case BuiltinProc_trap:       x64_emit_ud2(a);   return x64v_none();
+	case BuiltinProc_read_cycle_counter: {
+		x64_emit_rdtsc(a);                                          // EDX:EAX
+		x64_emit_mov_rr(a, X64OpSize_32, X64Reg_RAX, X64Reg_RAX);   // zero-extend low 32
+		x64_emit_shl_ri(a, X64OpSize_64, X64Reg_RDX, 32);
+		x64_emit_or_rr (a, X64OpSize_64, X64Reg_RAX, X64Reg_RDX);
+		return x64v_reg(x64_typed(expr->tav.type), X64Reg_RAX);
+	}
+	case BuiltinProc_read_cycle_counter_frequency:
+		return x64v_imm(x64_typed(expr->tav.type), 0);             // unknown on x86 (mirrors LLVM)
+	case BuiltinProc_expect: case BuiltinProc_likely: case BuiltinProc_unlikely:
+		return x64_build_expr(p, ce->args[0]);                     // hint only — pass the value through
+	case BuiltinProc_prefetch_read_instruction:  case BuiltinProc_prefetch_read_data:
+	case BuiltinProc_prefetch_write_instruction: case BuiltinProc_prefetch_write_data:
+		x64_build_expr(p, ce->args[0]);                            // evaluate ptr; prefetch is a hint → no-op
+		return x64v_none();
+	}
+
+	// --- memory load/store intrinsics (volatile/non_temporal/unaligned ≈ plain load/store on x86) ---
+	if (id == BuiltinProc_volatile_load || id == BuiltinProc_non_temporal_load || id == BuiltinProc_unaligned_load) {
+		Type *T = x64_typed(type_deref(x64_typed(ce->args[0]->tav.type)));
+		x64Value dv = x64_build_expr(p, ce->args[0]);
+		x64_value_to_reg(p, dv, X64Reg_RAX);
+		return x64_load_addr(p, x64addr(x64_mem(X64Reg_RAX, 0), T));
+	}
+	if (id == BuiltinProc_volatile_store || id == BuiltinProc_non_temporal_store || id == BuiltinProc_unaligned_store) {
+		Type *T = x64_typed(type_deref(x64_typed(ce->args[0]->tav.type)));
+		x64Value dv = x64_build_expr(p, ce->args[0]);
+		i32 poff = x64_alloc_local(p, 8, 8);
+		x64_value_to_reg(p, dv, X64Reg_RAX);
+		x64_emit_mov_mr(a, X64OpSize_64, x64_rbp_mem(poff), X64Reg_RAX);
+		x64Value vv = x64_build_expr(p, ce->args[1]);
+		x64_emit_mov_rm(a, X64OpSize_64, X64Reg_R8, x64_rbp_mem(poff)); // R8 = ptr (copy clobbers RSI/RDI/RCX, not R8)
+		x64_store_value(p, x64addr(x64_mem(X64Reg_R8, 0), T), vv);
+		return x64v_none();
+	}
+
+	// --- x86 CPUID / XGETBV (return a small result struct) ---
+	if (id == BuiltinProc_x86_cpuid) {
+		Type *st = x64_typed(expr->tav.type);
+		x64Value a0 = x64_build_expr(p, ce->args[0]); i32 o0 = x64_alloc_local(p, 8, 8);
+		x64_value_to_reg(p, a0, X64Reg_RAX); x64_emit_mov_mr(a, X64OpSize_64, x64_rbp_mem(o0), X64Reg_RAX);
+		x64Value a1 = x64_build_expr(p, ce->args[1]); i32 o1 = x64_alloc_local(p, 8, 8);
+		x64_value_to_reg(p, a1, X64Reg_RAX); x64_emit_mov_mr(a, X64OpSize_64, x64_rbp_mem(o1), X64Reg_RAX);
+		i32 t = x64_alloc_local(p, type_size_of(st), type_align_of(st));
+		x64_emit_mov_rm(a, X64OpSize_32, X64Reg_RAX, x64_rbp_mem(o0)); // leaf
+		x64_emit_mov_rm(a, X64OpSize_32, X64Reg_RCX, x64_rbp_mem(o1)); // subleaf
+		x64_emit_push_r(a, X64Reg_RBX);                                // RBX is callee-saved; CPUID writes it
+		x64_emit_cpuid(a);
+		x64_emit_mov_mr(a, X64OpSize_32, x64_rbp_mem(t + (i32)type_offset_of(st, 0)), X64Reg_RAX);
+		x64_emit_mov_mr(a, X64OpSize_32, x64_rbp_mem(t + (i32)type_offset_of(st, 1)), X64Reg_RBX);
+		x64_emit_mov_mr(a, X64OpSize_32, x64_rbp_mem(t + (i32)type_offset_of(st, 2)), X64Reg_RCX);
+		x64_emit_mov_mr(a, X64OpSize_32, x64_rbp_mem(t + (i32)type_offset_of(st, 3)), X64Reg_RDX);
+		x64_emit_pop_r(a, X64Reg_RBX);
+		return x64v_mem(st, x64_rbp_mem(t));
+	}
+	if (id == BuiltinProc_x86_xgetbv) {
+		Type *st = x64_typed(expr->tav.type);
+		x64Value a0 = x64_build_expr(p, ce->args[0]);
+		x64_value_to_reg(p, a0, X64Reg_RCX);
+		i32 t = x64_alloc_local(p, type_size_of(st), type_align_of(st));
+		x64_emit_xgetbv(a);
+		x64_emit_mov_mr(a, X64OpSize_32, x64_rbp_mem(t + (i32)type_offset_of(st, 0)), X64Reg_RAX);
+		x64_emit_mov_mr(a, X64OpSize_32, x64_rbp_mem(t + (i32)type_offset_of(st, 1)), X64Reg_RDX);
+		return x64v_mem(st, x64_rbp_mem(t));
+	}
+
+	// --- floating-point ---
+	if (id == BuiltinProc_sqrt) {
+		Type *t = x64_typed(expr->tav.type);
+		x64Value xv = x64_build_expr(p, ce->args[0]);
+		x64_value_to_xmm(p, xv, X64XmmReg_XMM0);
+		if (x64_is_double(t)) x64_emit_sqrtsd(a, X64XmmReg_XMM0, X64XmmReg_XMM0);
+		else                  x64_emit_sqrtss(a, X64XmmReg_XMM0, X64XmmReg_XMM0);
+		return x64v_xmm(t, X64XmmReg_XMM0);
+	}
+	if (id == BuiltinProc_fused_mul_add) {
+		Type *t = x64_typed(expr->tav.type);
+		bool dbl = x64_is_double(t);
+		i32 s0 = x64_alloc_local(p, 8, 8), s1 = x64_alloc_local(p, 8, 8), s2 = x64_alloc_local(p, 8, 8);
+		x64_value_to_xmm(p, x64_build_expr(p, ce->args[0]), X64XmmReg_XMM0);
+		if (dbl) x64_emit_movsd_mr(a, x64_rbp_mem(s0), X64XmmReg_XMM0); else x64_emit_movss_mr(a, x64_rbp_mem(s0), X64XmmReg_XMM0);
+		x64_value_to_xmm(p, x64_build_expr(p, ce->args[1]), X64XmmReg_XMM0);
+		if (dbl) x64_emit_movsd_mr(a, x64_rbp_mem(s1), X64XmmReg_XMM0); else x64_emit_movss_mr(a, x64_rbp_mem(s1), X64XmmReg_XMM0);
+		x64_value_to_xmm(p, x64_build_expr(p, ce->args[2]), X64XmmReg_XMM0);
+		if (dbl) x64_emit_movsd_mr(a, x64_rbp_mem(s2), X64XmmReg_XMM0); else x64_emit_movss_mr(a, x64_rbp_mem(s2), X64XmmReg_XMM0);
+		if (dbl) {
+			x64_emit_movsd_rm(a, X64XmmReg_XMM0, x64_rbp_mem(s0)); x64_emit_movsd_rm(a, X64XmmReg_XMM1, x64_rbp_mem(s1));
+			x64_emit_mulsd(a, X64XmmReg_XMM0, X64XmmReg_XMM1);     x64_emit_movsd_rm(a, X64XmmReg_XMM1, x64_rbp_mem(s2));
+			x64_emit_addsd(a, X64XmmReg_XMM0, X64XmmReg_XMM1);
+		} else {
+			x64_emit_movss_rm(a, X64XmmReg_XMM0, x64_rbp_mem(s0)); x64_emit_movss_rm(a, X64XmmReg_XMM1, x64_rbp_mem(s1));
+			x64_emit_mulss(a, X64XmmReg_XMM0, X64XmmReg_XMM1);     x64_emit_movss_rm(a, X64XmmReg_XMM1, x64_rbp_mem(s2));
+			x64_emit_addss(a, X64XmmReg_XMM0, X64XmmReg_XMM1);
+		}
+		return x64v_xmm(t, X64XmmReg_XMM0);
+	}
+
+	// --- integer: 2-operand (overflow_* / saturating_*) ---
+	if (id == BuiltinProc_overflow_add || id == BuiltinProc_overflow_sub || id == BuiltinProc_overflow_mul ||
+	    id == BuiltinProc_saturating_add || id == BuiltinProc_saturating_sub) {
+		Type *main = x64_typed(expr->tav.type);
+		bool tup = main != nullptr && main->kind == Type_Tuple;
+		Type *ot = tup ? x64_typed(main->Tuple.variables[0]->type) : main;
+		X64OpSize sz = x64_op_size_of(ot);
+		i64 width = 8 * type_size_of(ot); if (width <= 0) width = 64;
+		bool uns = !x64_is_signed_integer(ot);
+
+		x64Value xv = x64_build_expr(p, ce->args[0]);
+		i32 xoff = x64_alloc_local(p, 8, 8);
+		x64_value_to_reg(p, xv, X64Reg_RAX);
+		x64_emit_mov_mr(a, X64OpSize_64, x64_rbp_mem(xoff), X64Reg_RAX);
+		x64Value yv = x64_build_expr(p, ce->args[1]);
+		x64_value_to_reg(p, yv, X64Reg_RCX);
+		x64_emit_mov_rm(a, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(xoff)); // RAX=x, RCX=y
+
+		bool is_add = (id == BuiltinProc_overflow_add || id == BuiltinProc_saturating_add);
+		bool is_sub = (id == BuiltinProc_overflow_sub || id == BuiltinProc_saturating_sub);
+
+		if (id == BuiltinProc_overflow_add || id == BuiltinProc_overflow_sub || id == BuiltinProc_overflow_mul) {
+			if      (is_add) x64_emit_add_rr(a, sz, X64Reg_RAX, X64Reg_RCX);
+			else if (is_sub) x64_emit_sub_rr(a, sz, X64Reg_RAX, X64Reg_RCX);
+			else if (uns)    x64_emit_mul_r (a, sz, X64Reg_RCX);  // RDX:RAX = RAX*RCX
+			else             x64_emit_imul_r(a, sz, X64Reg_RCX);
+			X64Cc cc = uns ? X64Cc_C : X64Cc_O; // unsigned wrap = carry, signed = overflow
+			x64_emit_setcc_r(a, cc, X64Reg_RDX);
+			if (!tup) return x64v_reg(ot, X64Reg_RAX);
+			i32 t = x64_alloc_local(p, type_size_of(main), type_align_of(main));
+			x64_emit_mov_mr(a, sz, x64_rbp_mem(t), X64Reg_RAX);  // field 0 = result
+			i64 vsz  = type_size_of(ot);     if (vsz  <= 0) vsz  = 1;
+			i64 b_al = type_align_of(t_bool); if (b_al <= 0) b_al = 1;
+			i64 off1 = (vsz + (b_al - 1)) & ~(b_al - 1);
+			x64_emit_mov_mr(a, X64OpSize_8, x64_rbp_mem(t + (i32)off1), X64Reg_RDX); // field 1 = did_overflow
+			return x64v_mem(main, x64_rbp_mem(t));
+		}
+
+		// saturating
+		if (uns) {
+			if (is_add) {
+				x64_emit_add_rr(a, sz, X64Reg_RAX, X64Reg_RCX);
+				x64_emit_setcc_r(a, X64Cc_C, X64Reg_RDX);
+				x64_emit_movzx_rr(a, X64OpSize_8, X64Reg_RDX, X64Reg_RDX);
+				x64_emit_neg_r(a, X64OpSize_64, X64Reg_RDX);            // -1 on carry, else 0
+				x64_emit_or_rr (a, sz, X64Reg_RAX, X64Reg_RDX);        // carry → all-ones (MAX)
+			} else {
+				x64_emit_sub_rr(a, sz, X64Reg_RAX, X64Reg_RCX);
+				x64_emit_setcc_r(a, X64Cc_C, X64Reg_RDX);
+				x64_emit_movzx_rr(a, X64OpSize_8, X64Reg_RDX, X64Reg_RDX);
+				x64_emit_neg_r(a, X64OpSize_64, X64Reg_RDX);
+				x64_emit_not_r(a, X64OpSize_64, X64Reg_RDX);            // 0 on borrow, else all-ones
+				x64_emit_and_rr(a, sz, X64Reg_RAX, X64Reg_RDX);        // borrow → 0 (MIN)
+			}
+			return x64v_reg(ot, X64Reg_RAX);
+		}
+		// signed saturating: on overflow clamp to INT_MAX/INT_MIN by sign of the (wrapped) sum
+		if (is_add) x64_emit_add_rr(a, sz, X64Reg_RAX, X64Reg_RCX);
+		else        x64_emit_sub_rr(a, sz, X64Reg_RAX, X64Reg_RCX);
+		x64_emit_setcc_r(a, X64Cc_O, X64Reg_RDX);                      // DL = overflow (before flags clobbered)
+		x64_emit_mov_rr(a, X64OpSize_64, X64Reg_R8, X64Reg_RAX);
+		x64_emit_sar_ri(a, sz, X64Reg_R8, (u8)(width - 1));            // R8 = 0 / -1 by sum sign
+		i64 imin = (i64)((u64)1 << (u64)(width - 1));
+		x64_emit_mov_ri(a, X64OpSize_64, X64Reg_RCX, imin);
+		x64_emit_xor_rr(a, sz, X64Reg_R8, X64Reg_RCX);                 // R8 = INT_MAX (pos) / INT_MIN (neg)
+		x64_emit_test_rr(a, X64OpSize_8, X64Reg_RDX, X64Reg_RDX);
+		x64_emit_cmov_rr(a, X64Cc_NZ, X64OpSize_64, X64Reg_RAX, X64Reg_R8);
+		return x64v_reg(ot, X64Reg_RAX);
+	}
+
+	// --- integer: 1-operand bit ops ---
+	Type *t = x64_typed(expr->tav.type);
+	i64 bytes = type_size_of(t); if (bytes <= 0) bytes = 8;
+	i64 width = 8 * bytes;
+	X64OpSize wsz = (bytes >= 8) ? X64OpSize_64 : X64OpSize_32;
+	x64Value xv = x64_build_expr(p, ce->args[0]);
+	x64_value_to_reg(p, xv, X64Reg_RAX);
+	if (bytes != 1 && bytes != 2 && bytes != 4 && bytes != 8) return x64v_none(); // i128/u128: not lowered (no 128b GPR)
+
+	switch (id) {
+	case BuiltinProc_count_ones:
+		x64_zext_rax(p, bytes);
+		x64_emit_popcnt_rr(a, wsz, X64Reg_RAX, X64Reg_RAX);
+		return x64v_reg(t, X64Reg_RAX);
+	case BuiltinProc_count_zeros:
+		x64_zext_rax(p, bytes);
+		x64_emit_popcnt_rr(a, wsz, X64Reg_RAX, X64Reg_RAX);
+		x64_emit_mov_ri(a, X64OpSize_32, X64Reg_RCX, width);
+		x64_emit_sub_rr(a, X64OpSize_32, X64Reg_RCX, X64Reg_RAX);
+		x64_emit_mov_rr(a, X64OpSize_32, X64Reg_RAX, X64Reg_RCX);
+		return x64v_reg(t, X64Reg_RAX);
+	case BuiltinProc_count_trailing_zeros:
+		x64_zext_rax(p, bytes);
+		if      (bytes == 1) x64_emit_or_ri(a, X64OpSize_32, X64Reg_RAX, 0x100);    // x==0 → tz=8=width
+		else if (bytes == 2) x64_emit_or_ri(a, X64OpSize_32, X64Reg_RAX, 0x10000);  // x==0 → tz=16
+		x64_emit_tzcnt_rr(a, wsz, X64Reg_RAX, X64Reg_RAX);
+		return x64v_reg(t, X64Reg_RAX);
+	case BuiltinProc_count_leading_zeros:
+		x64_zext_rax(p, bytes);
+		x64_emit_lzcnt_rr(a, wsz, X64Reg_RAX, X64Reg_RAX);
+		if (bytes < 8 && (32 - width) != 0) x64_emit_sub_ri(a, X64OpSize_32, X64Reg_RAX, (i32)(32 - width));
+		return x64v_reg(t, X64Reg_RAX);
+	case BuiltinProc_count_trailing_ones:
+		x64_zext_rax(p, bytes);                                    // upper bits 0 → become 1 after NOT → caps tz at width
+		x64_emit_not_r(a, X64OpSize_64, X64Reg_RAX);
+		x64_emit_tzcnt_rr(a, X64OpSize_64, X64Reg_RAX, X64Reg_RAX);
+		return x64v_reg(t, X64Reg_RAX);
+	case BuiltinProc_count_leading_ones:
+		x64_zext_rax(p, bytes);
+		if      (bytes == 8) x64_emit_not_r(a, X64OpSize_64, X64Reg_RAX);
+		else                 x64_emit_xor_ri(a, X64OpSize_32, X64Reg_RAX, (i32)((u32)((u64)1 << width) - 1)); // flip low `width` bits
+		x64_emit_lzcnt_rr(a, wsz, X64Reg_RAX, X64Reg_RAX);
+		if (bytes < 8 && (32 - width) != 0) x64_emit_sub_ri(a, X64OpSize_32, X64Reg_RAX, (i32)(32 - width));
+		return x64v_reg(t, X64Reg_RAX);
+	case BuiltinProc_byte_swap:
+		if      (bytes >= 4) x64_emit_bswap_r(a, (X64OpSize)bytes, X64Reg_RAX);
+		else if (bytes == 2) x64_emit_rol_ri(a, X64OpSize_16, X64Reg_RAX, 8);
+		return x64v_reg(t, X64Reg_RAX);
+	case BuiltinProc_reverse_bits: {
+		// full 64-bit bit-reverse (swap 1s/2s/4s + bswap), then shift the result down to `width`
+		struct { i64 m; u8 s; } steps[3] = {
+			{ (i64)0x5555555555555555ull, 1 },
+			{ (i64)0x3333333333333333ull, 2 },
+			{ (i64)0x0F0F0F0F0F0F0F0Full, 4 },
+		};
+		for (isize i = 0; i < 3; i++) {
+			x64_emit_mov_ri(a, X64OpSize_64, X64Reg_RDX, steps[i].m);
+			x64_emit_mov_rr(a, X64OpSize_64, X64Reg_RCX, X64Reg_RAX);
+			x64_emit_shr_ri(a, X64OpSize_64, X64Reg_RAX, steps[i].s);
+			x64_emit_and_rr(a, X64OpSize_64, X64Reg_RAX, X64Reg_RDX);
+			x64_emit_and_rr(a, X64OpSize_64, X64Reg_RCX, X64Reg_RDX);
+			x64_emit_shl_ri(a, X64OpSize_64, X64Reg_RCX, steps[i].s);
+			x64_emit_or_rr (a, X64OpSize_64, X64Reg_RAX, X64Reg_RCX);
+		}
+		x64_emit_bswap_r(a, X64OpSize_64, X64Reg_RAX);
+		if (width < 64) x64_emit_shr_ri(a, X64OpSize_64, X64Reg_RAX, (u8)(64 - width));
+		return x64v_reg(t, X64Reg_RAX);
+	}
+	}
+	return x64v_none();
+}
+
+// Value-producing compiler builtins (complex/quaternion math, swizzle, unreachable) — mirror
+// lb_build_builtin_proc. These build aggregates/fields directly (no runtime call).
+gb_internal bool x64_is_value_builtin(i32 id) {
+	switch (id) {
+	case BuiltinProc_unreachable:
+	case BuiltinProc_complex: case BuiltinProc_quaternion:
+	case BuiltinProc_real: case BuiltinProc_imag: case BuiltinProc_jmag: case BuiltinProc_kmag:
+	case BuiltinProc_conj: case BuiltinProc_swizzle: case BuiltinProc_expand_values:
+		return true;
+	}
+	return false;
+}
+
+// Flip the IEEE sign bit of the float at [base+foff] (esz = 4 → f32, 8 → f64) via an integer XOR
+// of the high dword — used to negate a complex/quaternion imaginary component (conj).
+gb_internal void x64_negate_float_mem(x64Procedure *p, i32 base_off, i64 foff, i64 esz) {
+	i32 dword = (i32)(base_off + foff + (esz == 8 ? 4 : 0));
+	x64_emit_xor_mi(&p->asm_, X64OpSize_32, x64_rbp_mem(dword), (i32)0x80000000);
+}
+
+gb_internal x64Value x64_build_value_builtin(x64Procedure *p, Ast *expr, i32 id) {
+	ast_node(ce, CallExpr, expr);
+
+	if (id == BuiltinProc_unreachable) { x64_emit_ud2(&p->asm_); return x64v_none(); }
+
+	if (id == BuiltinProc_complex) {
+		Type *ct = x64_typed(expr->tav.type);
+		Type *ft = x64_typed(base_complex_elem_type(ct));
+		i64 esz = type_size_of(ft);
+		i32 off = x64_alloc_local(p, type_size_of(ct), type_align_of(ct));
+		x64_store_value(p, x64addr(x64_rbp_mem(off),            ft), x64_build_expr(p, ce->args[0])); // real @0
+		x64_store_value(p, x64addr(x64_rbp_mem(off + (i32)esz), ft), x64_build_expr(p, ce->args[1])); // imag @esz
+		return x64v_mem(ct, x64_rbp_mem(off));
+	}
+
+	if (id == BuiltinProc_quaternion) {
+		Type *qt = x64_typed(expr->tav.type);
+		Type *ft = x64_typed(base_complex_elem_type(qt));
+		i64 esz = type_size_of(ft);
+		i32 off = x64_alloc_local(p, type_size_of(qt), type_align_of(qt));
+		for (isize i = 0; i < ce->args.count; i++) {
+			ast_node(fv, FieldValue, ce->args[i]);
+			String nm = fv->field->Ident.token.string;   // @QuaternionLayout: x/imag=0 y/jmag=1 z/kmag=2 w/real=3
+			i32 idx = (nm == "x" || nm == "imag") ? 0 : (nm == "y" || nm == "jmag") ? 1 :
+			          (nm == "z" || nm == "kmag") ? 2 : 3;
+			x64_store_value(p, x64addr(x64_rbp_mem(off + idx*(i32)esz), ft), x64_build_expr(p, fv->value));
+		}
+		return x64v_mem(qt, x64_rbp_mem(off));
+	}
+
+	if (id == BuiltinProc_real || id == BuiltinProc_imag || id == BuiltinProc_jmag || id == BuiltinProc_kmag) {
+		Type *vt = base_type(x64_typed(ce->args[0]->tav.type));
+		Type *ft = x64_typed(expr->tav.type);
+		i64 esz = type_size_of(base_complex_elem_type(vt));
+		bool cplx = is_type_complex(vt);
+		i32 idx = (id == BuiltinProc_real) ? (cplx ? 0 : 3) :  // complex: {real@0, imag@1}; quaternion @QuaternionLayout {x/imag@0,y/jmag@1,z/kmag@2,w/real@3}
+		          (id == BuiltinProc_imag) ? (cplx ? 1 : 0) :
+		          (id == BuiltinProc_jmag) ? 1 : 2;
+		i32 voff = x64_alloc_local(p, type_size_of(vt), type_align_of(vt));
+		x64_store_value(p, x64addr(x64_rbp_mem(voff), vt), x64_build_expr(p, ce->args[0]));
+		return x64v_mem(ft, x64_rbp_mem(voff + idx*(i32)esz));
+	}
+
+	if (id == BuiltinProc_conj) {
+		Type *vt = x64_typed(expr->tav.type);
+		Type *bt = base_type(vt);
+		i64 esz = type_size_of(base_complex_elem_type(bt));
+		i32 off = x64_alloc_local(p, type_size_of(vt), type_align_of(vt));
+		x64_store_value(p, x64addr(x64_rbp_mem(off), vt), x64_build_expr(p, ce->args[0]));
+		if (is_type_complex(bt)) {
+			x64_negate_float_mem(p, off, esz, esz);                       // imag @esz
+		} else { // quaternion: negate x,y,z (imag parts), keep w (real)
+			x64_negate_float_mem(p, off, 0,       esz);
+			x64_negate_float_mem(p, off, esz,     esz);
+			x64_negate_float_mem(p, off, 2*esz,   esz);
+		}
+		return x64v_mem(vt, x64_rbp_mem(off));
+	}
+
+	if (id == BuiltinProc_expand_values) { // struct/array → tuple of its fields (mirrors lb_expand_values)
+		Type *rt = x64_typed(expr->tav.type);
+		Type *st = base_type(x64_typed(ce->args[0]->tav.type));
+		i32 soff = x64_alloc_local(p, type_size_of(st), type_align_of(st));
+		x64_store_value(p, x64addr(x64_rbp_mem(soff), st), x64_build_expr(p, ce->args[0]));
+		bool is_struct = st->kind == Type_Struct;
+		i64 esz = is_struct ? 0 : type_size_of(base_array_type(st));
+		if (rt == nullptr || rt->kind != Type_Tuple) { // single value → field 0 (offset 0)
+			Type *ft = is_struct ? x64_typed(st->Struct.fields[0]->type) : x64_typed(base_array_type(st));
+			return x64v_mem(ft, x64_rbp_mem(soff));
+		}
+		i32 toff = x64_alloc_local(p, type_size_of(rt), type_align_of(rt));
+		i64 foff = 0;
+		for (isize i = 0; i < rt->Tuple.variables.count; i++) {
+			Type *ft = rt->Tuple.variables[i]->type;
+			i64 fal = type_align_of(ft); if (fal <= 0) fal = 1;
+			foff = align_formula(foff, fal);
+			i64 src_off = is_struct ? type_offset_of(st, st->Struct.fields[i]->Variable.field_index) : (i64)i*esz;
+			x64_store_value(p, x64addr(x64_rbp_mem(toff + (i32)foff), ft),
+			                x64v_mem(ft, x64_rbp_mem(soff + (i32)src_off)));
+			foff += type_size_of(ft);
+		}
+		return x64v_mem(rt, x64_rbp_mem(toff));
+	}
+
+	if (id == BuiltinProc_swizzle) { // array form: swizzle(arr, i0, i1, ...) → [arr[i0], arr[i1], ...]
+		Type *rt = x64_typed(expr->tav.type);
+		Type *et = x64_typed(base_array_type(rt));
+		i64 esz = type_size_of(et);
+		Type *st = base_type(x64_typed(ce->args[0]->tav.type));
+		i32 soff = x64_alloc_local(p, type_size_of(st), type_align_of(st));
+		x64_store_value(p, x64addr(x64_rbp_mem(soff), st), x64_build_expr(p, ce->args[0]));
+		i32 roff = x64_alloc_local(p, type_size_of(rt), type_align_of(rt));
+		for (isize i = 1; i < ce->args.count; i++) {
+			i64 idx = exact_value_to_i64(ce->args[i]->tav.value);
+			x64_store_value(p, x64addr(x64_rbp_mem(roff + (i32)((i-1)*esz)), et),
+			                x64v_mem(et, x64_rbp_mem(soff + (i32)(idx*esz))));
+		}
+		return x64v_mem(rt, x64_rbp_mem(roff));
+	}
+
+	return x64v_none();
+}
+
 // cstring → string (mirrors runtime.cstring_to_string): nil → "" ({0,0}), else
 // {data=ptr, len=strlen(ptr)}, inlined as a NUL byte-scan (SIMD-widen later). Without
 // this, `string(cstr)` kept only the ptr and left len=0 (os.args[i] came out empty).
-gb_internal x64Value x64_cstring_to_string(x64Procedure *p, x64Value src) {
+// cstring → string / cstring16 → string16: scan for the NUL terminator to compute the length,
+// then build a {data, len} value. `elem_size` is the code-unit size (1 = byte/UTF-8, 2 = u16/
+// UTF-16) and `len` is in ELEMENTS. Mirrors the runtime cstring_to_string / cstring16_to_string16
+// calls LLVM emits (lb_emit_conv); inlined here to avoid a runtime-proc dependency.
+gb_internal x64Value x64_cstring_to_string(x64Procedure *p, x64Value src, i64 elem_size, Type *result_type) {
 	x64_value_to_reg(p, src, X64Reg_RAX); // RAX = cstring data ptr
 	i32 off = x64_alloc_local(p, 16, 8);  // string result: data@0, len@8
+	X64OpSize cmp_sz = (elem_size == 2) ? X64OpSize_16 : X64OpSize_8;
 
 	isize l_nil  = x64_label_alloc(&p->asm_);
 	isize l_loop = x64_label_alloc(&p->asm_);
@@ -1069,12 +1503,14 @@ gb_internal x64Value x64_cstring_to_string(x64Procedure *p, x64Value src) {
 	x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(off), X64Reg_RAX); // data = ptr
 	x64_emit_mov_rr(&p->asm_, X64OpSize_64, X64Reg_RCX, X64Reg_RAX);       // cursor = ptr
 	x64_label_bind(&p->asm_, l_loop);
-	x64_emit_cmp_mi(&p->asm_, X64OpSize_8, x64_mem(X64Reg_RCX, 0), 0);     // [cursor] == 0?
+	x64_emit_cmp_mi(&p->asm_, cmp_sz, x64_mem(X64Reg_RCX, 0), 0);          // code unit == 0?
 	x64_emit_jcc(&p->asm_, X64Cc_E, l_done);
-	x64_emit_inc_r(&p->asm_, X64OpSize_64, X64Reg_RCX);
+	if (elem_size == 2) x64_emit_add_ri(&p->asm_, X64OpSize_64, X64Reg_RCX, 2);
+	else                x64_emit_inc_r(&p->asm_, X64OpSize_64, X64Reg_RCX);
 	x64_emit_jmp(&p->asm_, l_loop);
 	x64_label_bind(&p->asm_, l_done);
-	x64_emit_sub_rr(&p->asm_, X64OpSize_64, X64Reg_RCX, X64Reg_RAX);       // len = cursor - ptr
+	x64_emit_sub_rr(&p->asm_, X64OpSize_64, X64Reg_RCX, X64Reg_RAX);       // byte span = cursor - ptr
+	if (elem_size == 2) x64_emit_shr_ri(&p->asm_, X64OpSize_64, X64Reg_RCX, 1); // → element count
 	x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(off + 8), X64Reg_RCX);
 	x64_emit_jmp(&p->asm_, l_end);
 
@@ -1083,7 +1519,130 @@ gb_internal x64Value x64_cstring_to_string(x64Procedure *p, x64Value src) {
 	x64_emit_mov_mi(&p->asm_, X64OpSize_64, x64_rbp_mem(off + 8), 0); // len  = 0
 
 	x64_label_bind(&p->asm_, l_end);
-	return x64v_mem(t_string, x64_rbp_mem(off));
+	return x64v_mem(result_type, x64_rbp_mem(off));
+}
+
+// A type used as a value → its typeid (mirrors lb_typeid): the canonical type hash, matching
+// typeid_of and the emitted Type_Info.id.
+gb_internal x64Value x64_typeid(Type *type) {
+	return x64v_imm(t_typeid, (i64)type_hash_canonical_type(default_type(type)));
+}
+
+// A register-sized scalar: fits in a GPR and is moved/extended (not memcpy'd). Used by
+// x64_emit_conv to decide the int/ptr path vs an aggregate reinterpret.
+gb_internal bool x64_is_reg_scalar(Type *bt) {
+	if (bt == nullptr) return false;
+	if (type_size_of(bt) > 8) return false;
+	if (x64_is_float(bt))     return false;
+	return x64_is_integer(bt) || is_type_boolean(bt) || is_type_rune(bt) || bt->kind == Type_Enum ||
+	       is_type_pointer(bt) || is_type_multi_pointer(bt) || is_type_proc(bt) ||
+	       is_type_bit_set(bt) || is_type_typeid(bt);
+}
+
+// THE conversion authority — mirrors lb_emit_conv (llvm_backend_expr.cpp). The result's type IS
+// `to`. Every store/return/arg/cast site routes through here, so a conversion always actually
+// converts. Cases mirror lb_emit_conv's order; exotic ones x64 can't yet do (complex/quaternion,
+// SIMD, matrix, endian byte-swap, 128-bit) fall to the reinterpret tail rather than PANIC.
+gb_internal x64Value x64_emit_conv(x64Procedure *p, x64Value src, Type *from, Type *to) {
+	if (to == nullptr) return src;
+	if (from != nullptr && are_types_identical(from, to)) { src.type = x64_typed(to); return src; }
+
+	Type *dst_base = base_type(to);
+	Type *src_base = (from != nullptr) ? base_type(from) : nullptr;
+
+	// Identical underlying representation, distinct named/typed wrappers → reinterpret.
+	if (src_base != nullptr && are_types_identical(src_base, dst_base)) {
+		src.type = x64_typed(to);
+		return src;
+	}
+
+	// cstring → string / cstring16 → string16 (ptr → {ptr, strlen}).
+	if (src_base != nullptr && is_type_cstring(src_base) && is_type_string(dst_base)) {
+		return x64_cstring_to_string(p, src, 1, x64_typed(to));
+	}
+	if (src_base != nullptr && is_type_cstring16(src_base) && is_type_string16(dst_base)) {
+		return x64_cstring_to_string(p, src, 2, x64_typed(to));
+	}
+
+	// float ↔ float / int ↔ float.
+	if (x64_is_float(dst_base) && src_base != nullptr && x64_is_float(src_base)) {
+		x64_value_to_xmm(p, src, X64XmmReg_XMM0);
+		if (x64_is_double(dst_base) && !x64_is_double(src_base))      x64_emit_cvtss2sd(&p->asm_, X64XmmReg_XMM0, X64XmmReg_XMM0);
+		else if (!x64_is_double(dst_base) && x64_is_double(src_base)) x64_emit_cvtsd2ss(&p->asm_, X64XmmReg_XMM0, X64XmmReg_XMM0);
+		return x64v_xmm(x64_typed(to), X64XmmReg_XMM0);
+	}
+	if (x64_is_integer(dst_base) && src_base != nullptr && x64_is_float(src_base)) {
+		x64_value_to_xmm(p, src, X64XmmReg_XMM0);
+		if (x64_is_double(src_base)) x64_emit_cvttsd2si(&p->asm_, X64Reg_RAX, X64OpSize_64, X64XmmReg_XMM0);
+		else                         x64_emit_cvttss2si(&p->asm_, X64Reg_RAX, X64OpSize_64, X64XmmReg_XMM0);
+		return x64v_reg(x64_typed(to), X64Reg_RAX);
+	}
+	if (x64_is_float(dst_base) && src_base != nullptr && x64_is_integer(src_base)) {
+		x64_value_to_reg(p, src, X64Reg_RAX);
+		if (x64_is_double(dst_base)) x64_emit_cvtsi2sd(&p->asm_, X64XmmReg_XMM0, X64Reg_RAX, X64OpSize_64);
+		else                         x64_emit_cvtsi2ss(&p->asm_, X64XmmReg_XMM0, X64Reg_RAX, X64OpSize_64);
+		return x64v_xmm(x64_typed(to), X64XmmReg_XMM0);
+	}
+
+	// Variant → union construction (set value@0 + tag). Mirrors lb's union dst case.
+	if (dst_base->kind == Type_Union && from != nullptr && union_is_variant_of(dst_base, from)) {
+		i32 off = x64_alloc_local(p, type_size_of(to), type_align_of(to));
+		x64_store_union_variant(p, x64_rbp_mem(off), src, x64_typed(to));
+		return x64v_mem(x64_typed(to), x64_rbp_mem(off));
+	}
+
+	// `using`-field subtype (struct{using f: T} → T). Must precede the pointer/scalar paths.
+	if (from != nullptr && check_is_assignable_to_using_subtype(from, to)) {
+		return x64_apply_using_subtype(p, src, to);
+	}
+
+	// value → any (box {data, typeid}).
+	if (is_type_any(dst_base)) {
+		i32 off = x64_alloc_local(p, type_size_of(to), type_align_of(to));
+		x64_box_any(p, x64_rbp_mem(off), src, from);
+		return x64v_mem(x64_typed(to), x64_rbp_mem(off));
+	}
+
+	// Same-size reinterpret of a value larger than a register ([]u8↔string, []u16↔string16,
+	// struct/transmute): keep all bytes in place, just retype. The register path would truncate.
+	i64 cast_dsz = type_size_of(x64_typed(to));
+	i64 cast_ssz = (from != nullptr) ? type_size_of(x64_typed(from)) : cast_dsz;
+	if (cast_dsz > 8 && cast_dsz == cast_ssz) {
+		src.type = x64_typed(to);
+		return src;
+	}
+
+	// Scalar reinterpret/resize: int↔int (width/sign), bool↔int, ptr↔uintptr, ptr↔ptr, proc↔ptr,
+	// bit_set↔int, typeid↔int, enum↔int. Load to a GPR, sign/zero-extend on widen, retype.
+	if (x64_is_reg_scalar(src_base) && x64_is_reg_scalar(dst_base)) {
+		X64OpSize src_sz = x64_op_size_of(src_base);
+		X64OpSize dst_sz = x64_op_size_of(dst_base);
+		x64_value_to_reg(p, src, X64Reg_RAX);
+		if ((int)dst_sz > (int)src_sz && x64_is_signed_integer(src_base) && src_sz < X64OpSize_64) {
+			x64_emit_movsx_rr(&p->asm_, src_sz, X64Reg_RAX, X64Reg_RAX);
+		} else if ((int)dst_sz > (int)src_sz && src_sz <= X64OpSize_16) {
+			x64_emit_movzx_rr(&p->asm_, src_sz, X64Reg_RAX, X64Reg_RAX);
+		}
+		return x64v_reg(x64_typed(to), X64Reg_RAX);
+	}
+
+	// Fallback: reinterpret (retype, preserve kind/bits). x64 is incomplete vs lb_emit_conv's
+	// PANIC; retyping matches the prior store behavior for unhandled pairs (no regression).
+	src.type = x64_typed(to);
+	return src;
+}
+
+// Bit reinterpret of `value` as type `t` (mirrors lb_emit_transmute). Same byte size; NO numeric
+// conversion (unlike x64_emit_conv): spill the bits and reload as `t`, so int↔float go through
+// memory rather than a value-changing cvt/move.
+gb_internal x64Value x64_emit_transmute(x64Procedure *p, x64Value value, Type *t) {
+	Type *tt = x64_typed(t);
+	if (value.type != nullptr && are_types_identical(value.type, tt)) return value;
+	Type *st = (value.type != nullptr) ? value.type : tt;
+	i64 sz = type_size_of(tt); if (sz <= 0) sz = 8;
+	i32 off = x64_alloc_local(p, sz, type_align_of(tt));
+	x64_store_value(p, x64addr(x64_rbp_mem(off), st), value); // store source bits (own representation)
+	return x64v_mem(tt, x64_rbp_mem(off));                    // reload as `t` on use
 }
 
 // soa_zip(f0=slice0, ...) → #soa[]T (mirrors lb_soa_zip): each slice's .data (off 0)
@@ -1232,6 +1791,197 @@ gb_internal x64Value x64_reconstruct_call_result(x64Procedure *p, Type *ct, int 
 	return x64v_mem(tuple, x64_rbp_mem(tup));
 }
 
+// Arithmetic binary op on pre-built (spilled) operands — mirrors lb_emit_arith. lhs/rhs are stable
+// (loaded from memory, no build between them). Handles float (add/sub/mul/quo) and integer/bit_set
+// arith (bit_set: + → union/OR, - → difference/AND-NOT). `type` is the result type.
+gb_internal x64Value x64_emit_arith(x64Procedure *p, TokenKind op, x64Value lhs, x64Value rhs, Type *type) {
+	Type *lt          = x64_typed(lhs.type ? lhs.type : type);
+	Type *result_type = x64_typed(type ? type : lt);
+
+	if (x64_is_float(lt)) {
+		x64_value_to_xmm(p, lhs, X64XmmReg_XMM0);
+		x64_value_to_xmm(p, rhs, X64XmmReg_XMM1);
+		bool is_d = x64_is_double(lt);
+		switch (op) {
+		case Token_Add: if (is_d) x64_emit_addsd(&p->asm_, X64XmmReg_XMM0, X64XmmReg_XMM1); else x64_emit_addss(&p->asm_, X64XmmReg_XMM0, X64XmmReg_XMM1); return x64v_xmm(result_type, X64XmmReg_XMM0);
+		case Token_Sub: if (is_d) x64_emit_subsd(&p->asm_, X64XmmReg_XMM0, X64XmmReg_XMM1); else x64_emit_subss(&p->asm_, X64XmmReg_XMM0, X64XmmReg_XMM1); return x64v_xmm(result_type, X64XmmReg_XMM0);
+		case Token_Mul: if (is_d) x64_emit_mulsd(&p->asm_, X64XmmReg_XMM0, X64XmmReg_XMM1); else x64_emit_mulss(&p->asm_, X64XmmReg_XMM0, X64XmmReg_XMM1); return x64v_xmm(result_type, X64XmmReg_XMM0);
+		case Token_Quo: if (is_d) x64_emit_divsd(&p->asm_, X64XmmReg_XMM0, X64XmmReg_XMM1); else x64_emit_divss(&p->asm_, X64XmmReg_XMM0, X64XmmReg_XMM1); return x64v_xmm(result_type, X64XmmReg_XMM0);
+		default: GB_PANIC("x64 float arith op %d not supported", op);
+		}
+	}
+
+	x64_value_to_reg(p, lhs, X64Reg_RAX);
+	x64_value_to_reg(p, rhs, X64Reg_RCX);
+	X64OpSize sz = x64_op_size_of(lt);
+	bool signed_ = x64_is_signed_integer(lt);
+	Type *lbt = base_type(lt);
+	if (lbt != nullptr && lbt->kind == Type_BitSet) {
+		if      (op == Token_Add) op = Token_Or;     // union
+		else if (op == Token_Sub) op = Token_AndNot; // difference
+	}
+	switch (op) {
+	case Token_Add:  x64_emit_add_rr(&p->asm_, sz, X64Reg_RAX, X64Reg_RCX); return x64v_reg(result_type, X64Reg_RAX);
+	case Token_Sub:  x64_emit_sub_rr(&p->asm_, sz, X64Reg_RAX, X64Reg_RCX); return x64v_reg(result_type, X64Reg_RAX);
+	case Token_Mul:
+		if (signed_) x64_emit_imul_rr(&p->asm_, sz, X64Reg_RAX, X64Reg_RCX);
+		else         x64_emit_mul_r  (&p->asm_, sz, X64Reg_RCX);
+		return x64v_reg(result_type, X64Reg_RAX);
+	case Token_Quo:
+		if (signed_) { if (sz==X64OpSize_64) x64_emit_cqo(&p->asm_); else x64_emit_cdq(&p->asm_); x64_emit_idiv_r(&p->asm_, sz, X64Reg_RCX); }
+		else         { x64_emit_xor_rr(&p->asm_, X64OpSize_32, X64Reg_RDX, X64Reg_RDX); x64_emit_div_r(&p->asm_, sz, X64Reg_RCX); }
+		return x64v_reg(result_type, X64Reg_RAX);
+	case Token_Mod: case Token_ModMod:
+		if (signed_) { if (sz==X64OpSize_64) x64_emit_cqo(&p->asm_); else x64_emit_cdq(&p->asm_); x64_emit_idiv_r(&p->asm_, sz, X64Reg_RCX); }
+		else         { x64_emit_xor_rr(&p->asm_, X64OpSize_32, X64Reg_RDX, X64Reg_RDX); x64_emit_div_r(&p->asm_, sz, X64Reg_RCX); }
+		x64_emit_mov_rr(&p->asm_, X64OpSize_64, X64Reg_RAX, X64Reg_RDX);
+		return x64v_reg(result_type, X64Reg_RAX);
+	case Token_And:    x64_emit_and_rr(&p->asm_, sz, X64Reg_RAX, X64Reg_RCX); return x64v_reg(result_type, X64Reg_RAX);
+	case Token_Or:     x64_emit_or_rr (&p->asm_, sz, X64Reg_RAX, X64Reg_RCX); return x64v_reg(result_type, X64Reg_RAX);
+	case Token_Xor:    x64_emit_xor_rr(&p->asm_, sz, X64Reg_RAX, X64Reg_RCX); return x64v_reg(result_type, X64Reg_RAX);
+	case Token_AndNot: x64_emit_not_r(&p->asm_, sz, X64Reg_RCX); x64_emit_and_rr(&p->asm_, sz, X64Reg_RAX, X64Reg_RCX); return x64v_reg(result_type, X64Reg_RAX);
+	case Token_Shl:  x64_emit_shl_rcl(&p->asm_, sz, X64Reg_RAX); return x64v_reg(result_type, X64Reg_RAX);
+	case Token_Shr:  if (signed_) x64_emit_sar_rcl(&p->asm_, sz, X64Reg_RAX); else x64_emit_shr_rcl(&p->asm_, sz, X64Reg_RAX); return x64v_reg(result_type, X64Reg_RAX);
+	default: GB_PANIC("x64 integer arith op %d not supported", op);
+	}
+	return x64v_none();
+}
+
+// Comparison binary op on pre-built (spilled) operands — mirrors lb_emit_comp. Handles strings
+// (runtime string_*), aggregates (array/struct/union memory compare), and float/int/bit_set
+// scalar comparisons. Nil comparison is handled by the caller (AST-based, before this). Returns bool.
+gb_internal x64Value x64_emit_comp(x64Procedure *p, TokenKind op, x64Value lhs, x64Value rhs) {
+	Type *lt  = x64_typed(lhs.type ? lhs.type : t_int);
+	Type *lbt = base_type(lt);
+
+	// String comparison → runtime helpers string_eq/ne/lt/gt/le/ge (compare content, not the data
+	// ptr). A `string` arg is 16B → indirect, so pass the ADDRESS of each spilled operand.
+	if (is_type_string(lbt)) {
+		String name = {};
+		switch (op) {
+		case Token_CmpEq: name = str_lit("string_eq"); break;
+		case Token_NotEq: name = str_lit("string_ne"); break;
+		case Token_Lt:    name = str_lit("string_lt"); break;
+		case Token_Gt:    name = str_lit("string_gt"); break;
+		case Token_LtEq:  name = str_lit("string_le"); break;
+		case Token_GtEq:  name = str_lit("string_ge"); break;
+		default: break;
+		}
+		if (name.len != 0) {
+			AstPackage *rt = p->module->gen->info->runtime_package;
+			Entity *e = (rt != nullptr) ? scope_lookup_current(rt->scope, string_interner_insert(name)) : nullptr;
+			if (e != nullptr && e->kind == Entity_Procedure) {
+				if (!e->Procedure.is_foreign && e->min_dep_count.load(std::memory_order_relaxed) == 0) {
+					x64_enqueue_oncall(p, e); // called by name; on-demand path won't see it
+				}
+				x64Value lm = x64_spill_value(p, lhs, t_string);
+				x64Value rm = x64_spill_value(p, rhs, t_string);
+				i32 lp = x64_alloc_local(p, 8, 8);
+				x64_emit_lea(&p->asm_, X64Reg_RAX, lm.mem);
+				x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(lp), X64Reg_RAX);
+				i32 rp = x64_alloc_local(p, 8, 8);
+				x64_emit_lea(&p->asm_, X64Reg_RAX, rm.mem);
+				x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(rp), X64Reg_RAX);
+				x64Value cargs[2];
+				cargs[0] = x64v_mem(t_rawptr, x64_rbp_mem(lp));
+				cargs[1] = x64v_mem(t_rawptr, x64_rbp_mem(rp));
+				return x64_emit_call(p, x64_get_entity_name(e), e->type, cargs, 2);
+			}
+		}
+	}
+
+	// Aggregate equality (array/struct/union) via flat byte compare. Gated on is_type_simple_compare.
+	if (op == Token_CmpEq || op == Token_NotEq) {
+		bool is_agg = lbt != nullptr &&
+		    (lbt->kind == Type_Array || lbt->kind == Type_EnumeratedArray ||
+		     lbt->kind == Type_Struct || lbt->kind == Type_Union);
+		if (is_agg && is_type_simple_compare(lt)) {
+			if (lhs.kind != x64Value_Mem) lhs = x64_spill_value(p, lhs, lt);
+			if (rhs.kind != x64Value_Mem) rhs = x64_spill_value(p, rhs, lt);
+			x64_emit_lea(&p->asm_, X64Reg_RAX, lhs.mem); // RAX = &lhs (stays through the loop)
+			x64_emit_lea(&p->asm_, X64Reg_RCX, rhs.mem); // RCX = &rhs
+			isize lbl_ne   = x64_label_alloc(&p->asm_);
+			isize lbl_done = x64_label_alloc(&p->asm_);
+			i64 total = type_size_of(lt);
+			i64 off = 0;
+			X64OpSize chunks[4] = { X64OpSize_64, X64OpSize_32, X64OpSize_16, X64OpSize_8 };
+			i64 widths[4]       = { 8, 4, 2, 1 };
+			for (int ci = 0; ci < 4; ci++) {
+				while (total - off >= widths[ci]) {
+					x64_emit_mov_rm(&p->asm_, chunks[ci], X64Reg_R8, x64_mem(X64Reg_RAX, (i32)off));
+					x64_emit_mov_rm(&p->asm_, chunks[ci], X64Reg_R9, x64_mem(X64Reg_RCX, (i32)off));
+					x64_emit_cmp_rr(&p->asm_, chunks[ci], X64Reg_R8, X64Reg_R9);
+					x64_emit_jcc(&p->asm_, X64Cc_NE, lbl_ne);
+					off += widths[ci];
+				}
+			}
+			x64_emit_mov_ri(&p->asm_, X64OpSize_32, X64Reg_RAX, (op == Token_CmpEq) ? 1 : 0);
+			x64_emit_jmp(&p->asm_, lbl_done);
+			x64_label_bind(&p->asm_, lbl_ne);
+			x64_emit_mov_ri(&p->asm_, X64OpSize_32, X64Reg_RAX, (op == Token_CmpEq) ? 0 : 1);
+			x64_label_bind(&p->asm_, lbl_done);
+			return x64v_reg(t_bool, X64Reg_RAX);
+		}
+	}
+
+	// Float comparison.
+	if (x64_is_float(lbt)) {
+		x64_value_to_xmm(p, lhs, X64XmmReg_XMM0);
+		x64_value_to_xmm(p, rhs, X64XmmReg_XMM1);
+		if (x64_is_double(lbt)) x64_emit_ucomisd(&p->asm_, X64XmmReg_XMM0, X64XmmReg_XMM1);
+		else                    x64_emit_ucomiss(&p->asm_, X64XmmReg_XMM0, X64XmmReg_XMM1);
+		X64Cc cc = X64Cc_E;
+		switch (op) {
+		case Token_CmpEq: cc = X64Cc_E;  break;
+		case Token_NotEq: cc = X64Cc_NE; break;
+		case Token_Lt:    cc = X64Cc_B;  break;
+		case Token_LtEq:  cc = X64Cc_BE; break;
+		case Token_Gt:    cc = X64Cc_A;  break;
+		case Token_GtEq:  cc = X64Cc_AE; break;
+		default: break;
+		}
+		x64_emit_setcc_r(&p->asm_, cc, X64Reg_RAX);
+		x64_emit_movzx_rr(&p->asm_, X64OpSize_8, X64Reg_RAX, X64Reg_RAX);
+		return x64v_reg(t_bool, X64Reg_RAX);
+	}
+
+	// Integer / bit_set comparison.
+	x64_value_to_reg(p, lhs, X64Reg_RAX);
+	x64_value_to_reg(p, rhs, X64Reg_RCX);
+	X64OpSize sz = x64_op_size_of(lt);
+	bool signed_ = x64_is_signed_integer(lt);
+	if (lbt != nullptr && lbt->kind == Type_BitSet &&
+	    (op == Token_Lt || op == Token_LtEq || op == Token_Gt || op == Token_GtEq)) {
+		bool subset = (op == Token_Lt || op == Token_LtEq); // ⊆ vs ⊇
+		bool strict = (op == Token_Lt || op == Token_Gt);   // proper subset/superset
+		x64_emit_mov_rr(&p->asm_, X64OpSize_64, X64Reg_RDX, X64Reg_RAX);
+		x64_emit_and_rr(&p->asm_, sz, X64Reg_RDX, X64Reg_RCX);            // RDX = a & b
+		x64_emit_cmp_rr(&p->asm_, sz, X64Reg_RDX, subset ? X64Reg_RAX : X64Reg_RCX);
+		x64_emit_setcc_r(&p->asm_, X64Cc_E, X64Reg_R8);                  // (a&b)==a → ⊆ (or ==b → ⊇)
+		if (strict) {                                                    // && a != b
+			x64_emit_cmp_rr(&p->asm_, sz, X64Reg_RAX, X64Reg_RCX);
+			x64_emit_setcc_r(&p->asm_, X64Cc_NE, X64Reg_R9);
+			x64_emit_and_rr(&p->asm_, X64OpSize_8, X64Reg_R8, X64Reg_R9);
+		}
+		x64_emit_movzx_rr(&p->asm_, X64OpSize_8, X64Reg_RAX, X64Reg_R8);
+		return x64v_reg(t_bool, X64Reg_RAX);
+	}
+	X64Cc cc = X64Cc_E;
+	switch (op) {
+	case Token_CmpEq: cc = X64Cc_E;  break;
+	case Token_NotEq: cc = X64Cc_NE; break;
+	case Token_Lt:    cc = signed_ ? X64Cc_L  : X64Cc_B;  break;
+	case Token_LtEq:  cc = signed_ ? X64Cc_LE : X64Cc_BE; break;
+	case Token_Gt:    cc = signed_ ? X64Cc_G  : X64Cc_A;  break;
+	case Token_GtEq:  cc = signed_ ? X64Cc_GE : X64Cc_AE; break;
+	default: GB_PANIC("x64 comparison op %d not supported", op);
+	}
+	x64_emit_cmp_rr(&p->asm_, sz, X64Reg_RAX, X64Reg_RCX);
+	x64_emit_setcc_r(&p->asm_, cc, X64Reg_RAX);
+	x64_emit_movzx_rr(&p->asm_, X64OpSize_8, X64Reg_RAX, X64Reg_RAX);
+	return x64v_reg(t_bool, X64Reg_RAX);
+}
+
 gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 	expr = unparen_expr(expr);
 	GB_ASSERT(expr != nullptr);
@@ -1257,7 +2007,7 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 	// A type used as a value → its typeid (mirrors lb_typeid). Canonical hash, matching
 	// typeid_of and the emitted Type_Info.id.
 	if (tav.mode == Addressing_Type && tav.type != nullptr) {
-		return x64v_imm(t_typeid, (i64)type_hash_canonical_type(default_type(tav.type)));
+		return x64_typeid(tav.type);
 	}
 
 	// ── Compile-time constants ──────────────────────────────────────────
@@ -1291,7 +2041,24 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 			}
 		}
 
-		if (x64_is_float(ct)) {
+		// Complex/quaternion constants: emit once into .rdata via the shared x64_const_value (the
+		// SINGLE owner of complex/quaternion layout — also used by module globals and by &CONST in
+		// x64_build_addr) and load it. Keyed on TYPE and placed BEFORE the float branch, because
+		// x64_is_float() is TRUE for complex (BasicFlag_Complex) and would otherwise grab it and
+		// emit a single scalar 0.0 word (→ real=0, imag=stale).
+		if (is_type_complex(ct) || is_type_quaternion(ct)) {
+			x64Module *m = p->module;
+			i64 sz = x64_type_size(x64_typed(tav.type)); if (sz <= 0) sz = 8;
+			i64 al = x64_type_align(x64_typed(tav.type)); if (al <= 0) al = 8;
+			u32 goff = x64_const_reserve(m->rdata, al, sz);
+			x64_const_value(m, m->rdata, goff, x64_typed(tav.type), ev, tav.type);
+			String sym = x64_const_new_name(m, "__$ccg$");
+			x64_const_define_symbol(m, sym, 2 /*.rdata*/, goff);
+			x64_emit_lea_sym(&p->asm_, X64Reg_RAX, sym);
+			return x64v_mem(x64_typed(tav.type), x64_mem(X64Reg_RAX, 0));
+		}
+
+		if (x64_is_float(ct) && !is_type_complex(ct) && !is_type_quaternion(ct)) {
 			f64 fv = (ev.kind == ExactValue_Float)   ? ev.value_float :
 			         (ev.kind == ExactValue_Integer)  ? (f64)big_int_to_i64(&ev.value_integer) : 0.0;
 			x64_emit_float_const(p, ct, fv, (f32)fv);
@@ -1299,7 +2066,8 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 		}
 
 		if (ev.kind == ExactValue_String) {
-			return x64_const_string(p, ev.value_string);
+			i64 esz = is_type_slice(ct) ? type_size_of(ct->Slice.elem) : 1;
+			return x64_const_string(p, ev.value_string, esz);
 		}
 
 		// Constant typeid (type in a typeid context, e.g. poly param to struct_fields_zipped(T)).
@@ -1307,7 +2075,7 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 		// misses the table. Without this it fell through to 0 → nil.
 		if (ev.kind == ExactValue_Typeid) {
 			Type *tt = ev.value_typeid ? ev.value_typeid : tav.type;
-			return x64v_imm(t_typeid, (i64)type_hash_canonical_type(default_type(tt)));
+			return x64_typeid(tt);
 		}
 
 		// Proc value used as data (e.g. stored into a struct field). Top-level procs are
@@ -1411,7 +2179,7 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 		case Entity_TypeName:
 			// A type name used as a VALUE is its typeid (e.g. poly param `T` to a `typeid`
 			// arg). e->type is the bound type in an instantiation. Canonical hash.
-			return x64v_imm(t_typeid, (i64)type_hash_canonical_type(default_type(e->type)));
+			return x64_typeid(e->type);
 		default:
 			return x64v_none();
 		}
@@ -1568,275 +2336,86 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 			return x64v_reg(t_bool, X64Reg_RAX);
 		}
 
-		// Aggregate equality (arrays / simple comparable structs). The scalar path below
-		// compares only one register's worth, so `[3]u32` etc. compared wrong (the
-		// BINDINGS_VERSION mismatch). Compare both operands' memory (mirrors lb_emit_comp's
-		// array path). Gated on is_type_simple_compare so a flat byte/word compare is valid.
+		// `x == nil` / `x != nil` for a TAGGED union: nil ⇔ tag == 0. The tag sits AFTER the
+		// variant block (Union.variant_block_size), so the scalar path below (which compares the
+		// first word — the variant DATA) reads a nil union with stale data bytes as non-nil. Other
+		// nilable types (pointer/slice/map/dynarray/maybe-pointer union) have their discriminant in
+		// the first word, so the scalar path handles them. (mirrors lb_emit_comp_against_nil.)
 		if (op == Token_CmpEq || op == Token_NotEq) {
-			Type *lbt = base_type(ltype);
-			bool is_agg = lbt != nullptr &&
-			    (lbt->kind == Type_Array || lbt->kind == Type_EnumeratedArray ||
-			     lbt->kind == Type_Struct || lbt->kind == Type_Union);
-			if (is_agg && is_type_simple_compare(ltype)) {
-				// &lhs (spill before building &rhs, which reuses RAX), then &rhs.
-				x64Addr la = x64_build_addr(p, be->left);
-				x64_emit_lea(&p->asm_, X64Reg_RAX, la.mem);
-				i32 lp_off = x64_alloc_local(p, 8, 8);
-				x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(lp_off), X64Reg_RAX);
-
-				x64Addr ra = x64_build_addr(p, be->right);
-				x64_emit_lea(&p->asm_, X64Reg_RAX, ra.mem);
-				i32 rp_off = x64_alloc_local(p, 8, 8);
-				x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(rp_off), X64Reg_RAX);
-
-				// RAX = &lhs, RCX = &rhs; compare `size` bytes in 8/4/2/1 chunks via
-				// R8/R9, branching to lbl_ne on the first mismatch.
-				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(lp_off));
-				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RCX, x64_rbp_mem(rp_off));
-
-				isize lbl_ne   = x64_label_alloc(&p->asm_);
-				isize lbl_done = x64_label_alloc(&p->asm_);
-				i64 total = type_size_of(ltype);
-				i64 off = 0;
-				while (total - off >= 8) {
-					x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_R8, x64_mem(X64Reg_RAX, (i32)off));
-					x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_R9, x64_mem(X64Reg_RCX, (i32)off));
-					x64_emit_cmp_rr(&p->asm_, X64OpSize_64, X64Reg_R8, X64Reg_R9);
-					x64_emit_jcc(&p->asm_, X64Cc_NE, lbl_ne);
-					off += 8;
+			Ast *nn = nullptr;
+			if      (is_type_untyped_nil(be->left->tav.type))  nn = be->right;
+			else if (is_type_untyped_nil(be->right->tav.type)) nn = be->left;
+			Type *nbt = nn ? base_type(nn->tav.type) : nullptr;
+			if (nbt != nullptr && nbt->kind == Type_Union &&
+			    !is_type_union_maybe_pointer(nbt) && type_size_of(nbt) > 0) {
+				// Build the VALUE (handles call results / non-lvalues — can't take &of an rvalue);
+				// a tagged union is an aggregate so this is a Mem, but spill defensively.
+				x64Value uv = x64_build_expr(p, nn);
+				if (uv.kind != x64Value_Mem) {
+					i32 off = x64_alloc_local(p, type_size_of(nbt), type_align_of(nbt));
+					x64_store_value(p, x64addr(x64_rbp_mem(off), nbt), uv);
+					uv = x64v_mem(nbt, x64_rbp_mem(off));
 				}
-				while (total - off >= 4) {
-					x64_emit_mov_rm(&p->asm_, X64OpSize_32, X64Reg_R8, x64_mem(X64Reg_RAX, (i32)off));
-					x64_emit_mov_rm(&p->asm_, X64OpSize_32, X64Reg_R9, x64_mem(X64Reg_RCX, (i32)off));
-					x64_emit_cmp_rr(&p->asm_, X64OpSize_32, X64Reg_R8, X64Reg_R9);
-					x64_emit_jcc(&p->asm_, X64Cc_NE, lbl_ne);
-					off += 4;
+				if (nbt->Union.kind == UnionType_shared_nil) {
+					// #shared_nil (e.g. os.Error): nil ⇔ the variant DATA block (offset 0,
+					// variant_block_size bytes) is all-zero. The TAG is unreliable (a variant→
+					// shared_nil conversion may not set it) and by definition each variant's nil
+					// IS its zero value, so the data word is authoritative. OR every byte.
+					i64 vbs = nbt->Union.variant_block_size; if (vbs <= 0) vbs = type_size_of(nbt);
+					x64_emit_xor_rr(&p->asm_, X64OpSize_32, X64Reg_RCX, X64Reg_RCX);
+					i64 b = 0;
+					while (vbs - b >= 8) { x64_emit_or_chunk(p, uv, b, X64OpSize_64, false); b += 8; }
+					if (vbs - b >= 4)    { x64_emit_or_chunk(p, uv, b, X64OpSize_32, false); b += 4; }
+					if (vbs - b >= 2)    { x64_emit_or_chunk(p, uv, b, X64OpSize_16, true);  b += 2; }
+					if (vbs - b >= 1)    { x64_emit_or_chunk(p, uv, b, X64OpSize_8,  true); }
+					x64_emit_test_rr(&p->asm_, X64OpSize_64, X64Reg_RCX, X64Reg_RCX);
+					x64_emit_setcc_r(&p->asm_, (op == Token_CmpEq) ? X64Cc_E : X64Cc_NE, X64Reg_RAX);
+					x64_emit_movzx_rr(&p->asm_, X64OpSize_8, X64Reg_RAX, X64Reg_RAX);
+					return x64v_reg(t_bool, X64Reg_RAX);
 				}
-				while (total - off >= 2) {
-					x64_emit_mov_rm(&p->asm_, X64OpSize_16, X64Reg_R8, x64_mem(X64Reg_RAX, (i32)off));
-					x64_emit_mov_rm(&p->asm_, X64OpSize_16, X64Reg_R9, x64_mem(X64Reg_RCX, (i32)off));
-					x64_emit_cmp_rr(&p->asm_, X64OpSize_16, X64Reg_R8, X64Reg_R9);
-					x64_emit_jcc(&p->asm_, X64Cc_NE, lbl_ne);
-					off += 2;
-				}
-				while (total - off >= 1) {
-					x64_emit_mov_rm(&p->asm_, X64OpSize_8, X64Reg_R8, x64_mem(X64Reg_RAX, (i32)off));
-					x64_emit_mov_rm(&p->asm_, X64OpSize_8, X64Reg_R9, x64_mem(X64Reg_RCX, (i32)off));
-					x64_emit_cmp_rr(&p->asm_, X64OpSize_8, X64Reg_R8, X64Reg_R9);
-					x64_emit_jcc(&p->asm_, X64Cc_NE, lbl_ne);
-					off += 1;
-				}
-				// All chunks equal.
-				x64_emit_mov_ri(&p->asm_, X64OpSize_32, X64Reg_RAX, (op == Token_CmpEq) ? 1 : 0);
-				x64_emit_jmp(&p->asm_, lbl_done);
-				x64_label_bind(&p->asm_, lbl_ne);
-				x64_emit_mov_ri(&p->asm_, X64OpSize_32, X64Reg_RAX, (op == Token_CmpEq) ? 0 : 1);
-				x64_label_bind(&p->asm_, lbl_done);
-				return x64v_reg(t_bool, X64Reg_RAX);
-			}
-		}
-
-		x64Value lhs = x64_build_expr(p, be->left);
-
-		// Float binary ops
-		if (x64_is_float(ltype)) {
-			x64_value_to_xmm(p, lhs, X64XmmReg_XMM0);
-			// Save XMM0 (LHS) to an RBP-relative local — NOT [rsp]: if the RHS
-			// contains a call, the callee's shadow-space writes would clobber it.
-			i32 lhs_off = x64_alloc_local(p, 8, 8);
-			if (x64_is_double(ltype)) x64_emit_movsd_mr(&p->asm_, x64_rbp_mem(lhs_off), X64XmmReg_XMM0);
-			else                       x64_emit_movss_mr(&p->asm_, x64_rbp_mem(lhs_off), X64XmmReg_XMM0);
-
-			x64Value rhs = x64_build_expr(p, be->right);
-			x64_value_to_xmm(p, rhs, X64XmmReg_XMM1);
-
-			// Restore LHS into XMM0
-			if (x64_is_double(ltype)) x64_emit_movsd_rm(&p->asm_, X64XmmReg_XMM0, x64_rbp_mem(lhs_off));
-			else                       x64_emit_movss_rm(&p->asm_, X64XmmReg_XMM0, x64_rbp_mem(lhs_off));
-
-			bool is_d = x64_is_double(ltype);
-			switch (op) {
-			case Token_Add:
-				if (is_d) x64_emit_addsd(&p->asm_, X64XmmReg_XMM0, X64XmmReg_XMM1);
-				else       x64_emit_addss(&p->asm_, X64XmmReg_XMM0, X64XmmReg_XMM1);
-				return x64v_xmm(result_type, X64XmmReg_XMM0);
-			case Token_Sub:
-				if (is_d) x64_emit_subsd(&p->asm_, X64XmmReg_XMM0, X64XmmReg_XMM1);
-				else       x64_emit_subss(&p->asm_, X64XmmReg_XMM0, X64XmmReg_XMM1);
-				return x64v_xmm(result_type, X64XmmReg_XMM0);
-			case Token_Mul:
-				if (is_d) x64_emit_mulsd(&p->asm_, X64XmmReg_XMM0, X64XmmReg_XMM1);
-				else       x64_emit_mulss(&p->asm_, X64XmmReg_XMM0, X64XmmReg_XMM1);
-				return x64v_xmm(result_type, X64XmmReg_XMM0);
-			case Token_Quo:
-				if (is_d) x64_emit_divsd(&p->asm_, X64XmmReg_XMM0, X64XmmReg_XMM1);
-				else       x64_emit_divss(&p->asm_, X64XmmReg_XMM0, X64XmmReg_XMM1);
-				return x64v_xmm(result_type, X64XmmReg_XMM0);
-			default: {
-				// Float comparison
-				if (is_d) x64_emit_ucomisd(&p->asm_, X64XmmReg_XMM0, X64XmmReg_XMM1);
-				else       x64_emit_ucomiss(&p->asm_, X64XmmReg_XMM0, X64XmmReg_XMM1);
-				X64Cc cc = X64Cc_E;
-				switch (op) {
-				case Token_CmpEq: cc = X64Cc_E;  break;
-				case Token_NotEq: cc = X64Cc_NE; break;
-				case Token_Lt:    cc = X64Cc_B;  break;
-				case Token_LtEq:  cc = X64Cc_BE; break;
-				case Token_Gt:    cc = X64Cc_A;  break;
-				case Token_GtEq:  cc = X64Cc_AE; break;
-				default: break;
-				}
-				x64_emit_setcc_r(&p->asm_, cc, X64Reg_RAX);
+				// Regular tagged union: nil ⇔ tag == 0. The tag sits AFTER the variant block.
+				i64       tag_off = nbt->Union.variant_block_size;
+				i64       tag_sz  = union_tag_size(nbt);
+				X64OpSize tsz = tag_sz <= 1 ? X64OpSize_8  : tag_sz == 2 ? X64OpSize_16 :
+				                tag_sz == 4 ? X64OpSize_32 : X64OpSize_64;
+				X64Mem tag_m = uv.mem; tag_m.disp += (i32)tag_off;
+				if (tsz == X64OpSize_64) x64_emit_mov_rm  (&p->asm_, X64OpSize_64, X64Reg_RCX, tag_m);
+				else                     x64_emit_movzx_rm(&p->asm_, tsz,          X64Reg_RCX, tag_m);
+				x64_emit_test_rr(&p->asm_, X64OpSize_64, X64Reg_RCX, X64Reg_RCX);
+				x64_emit_setcc_r(&p->asm_, (op == Token_CmpEq) ? X64Cc_E : X64Cc_NE, X64Reg_RAX);
 				x64_emit_movzx_rr(&p->asm_, X64OpSize_8, X64Reg_RAX, X64Reg_RAX);
 				return x64v_reg(t_bool, X64Reg_RAX);
 			}
-			}
 		}
 
-		// Integer binary ops.
-		// Spill the LHS to an RBP-relative local (NOT push/[rsp]): if the RHS
-		// contains a call, the callee homes its params into the caller's shadow
-		// space, which overlaps a pushed value and would corrupt the LHS.
-		i32 lhs_off = x64_alloc_local(p, 8, 8);
-		x64_value_to_reg(p, lhs, X64Reg_RAX);
-		x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(lhs_off), X64Reg_RAX);
-
-		x64Value rhs = x64_build_expr(p, be->right);
-		x64_value_to_reg(p, rhs, X64Reg_RCX);
-
-		x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(lhs_off));
-
-		X64OpSize sz = x64_op_size_of(ltype);
-		bool signed_ = x64_is_signed_integer(ltype);
-
-		// bit_set semantics (integer-backed): `+`=union (OR), `-`=difference (AND-NOT);
-		// `<=`/`>=`=subset/superset, `<`/`>` their strict forms; `==`/`!=`/`&`/`|`/`~` already
-		// match integer eq/ne/and/or/xor. Mirrors lb_emit_arith (Add→Or, Sub→AndNot) and
-		// lb_emit_comp ((a&b)==a etc.). RAX=lhs, RCX=rhs here.
-		{
-			Type *lbt2 = base_type(ltype);
-			if (lbt2 != nullptr && lbt2->kind == Type_BitSet) {
-				switch (op) {
-				case Token_Add: op = Token_Or;     break;
-				case Token_Sub: op = Token_AndNot; break;
-				case Token_Lt: case Token_LtEq: case Token_Gt: case Token_GtEq: {
-					bool subset = (op == Token_Lt || op == Token_LtEq); // ⊆ vs ⊇
-					bool strict = (op == Token_Lt || op == Token_Gt);   // < / >  (proper subset/superset)
-					x64_emit_mov_rr(&p->asm_, X64OpSize_64, X64Reg_RDX, X64Reg_RAX);
-					x64_emit_and_rr(&p->asm_, sz, X64Reg_RDX, X64Reg_RCX);            // RDX = a & b
-					x64_emit_cmp_rr(&p->asm_, sz, X64Reg_RDX, subset ? X64Reg_RAX : X64Reg_RCX);
-					x64_emit_setcc_r(&p->asm_, X64Cc_E, X64Reg_R8);                  // (a&b)==(a|b) → ⊆/⊇
-					if (strict) {                                                    // && a != b
-						x64_emit_cmp_rr(&p->asm_, sz, X64Reg_RAX, X64Reg_RCX);
-						x64_emit_setcc_r(&p->asm_, X64Cc_NE, X64Reg_R9);
-						x64_emit_and_rr(&p->asm_, X64OpSize_8, X64Reg_R8, X64Reg_R9);
-					}
-					x64_emit_movzx_rr(&p->asm_, X64OpSize_8, X64Reg_RAX, X64Reg_R8);
-					return x64v_reg(t_bool, X64Reg_RAX);
-				}
-				}
-			}
-		}
-
-#define EMIT_CMP_CC(cc) \
-	x64_emit_cmp_rr(&p->asm_, sz, X64Reg_RAX, X64Reg_RCX); \
-	x64_emit_setcc_r(&p->asm_, cc, X64Reg_RAX); \
-	x64_emit_movzx_rr(&p->asm_, X64OpSize_8, X64Reg_RAX, X64Reg_RAX); \
-	return x64v_reg(t_bool, X64Reg_RAX)
-
-		switch (op) {
-		case Token_Add:  x64_emit_add_rr(&p->asm_, sz, X64Reg_RAX, X64Reg_RCX); return x64v_reg(result_type, X64Reg_RAX);
-		case Token_Sub:  x64_emit_sub_rr(&p->asm_, sz, X64Reg_RAX, X64Reg_RCX); return x64v_reg(result_type, X64Reg_RAX);
-		case Token_Mul:
-			if (signed_) x64_emit_imul_rr(&p->asm_, sz, X64Reg_RAX, X64Reg_RCX);
-			else         x64_emit_mul_r  (&p->asm_, sz, X64Reg_RCX);
-			return x64v_reg(result_type, X64Reg_RAX);
-		case Token_Quo:
-			if (signed_) { if (sz==X64OpSize_64) x64_emit_cqo(&p->asm_); else x64_emit_cdq(&p->asm_); x64_emit_idiv_r(&p->asm_, sz, X64Reg_RCX); }
-			else         { x64_emit_xor_rr(&p->asm_, X64OpSize_32, X64Reg_RDX, X64Reg_RDX); x64_emit_div_r(&p->asm_, sz, X64Reg_RCX); }
-			return x64v_reg(result_type, X64Reg_RAX);
-		case Token_Mod: case Token_ModMod:
-			if (signed_) { if (sz==X64OpSize_64) x64_emit_cqo(&p->asm_); else x64_emit_cdq(&p->asm_); x64_emit_idiv_r(&p->asm_, sz, X64Reg_RCX); }
-			else         { x64_emit_xor_rr(&p->asm_, X64OpSize_32, X64Reg_RDX, X64Reg_RDX); x64_emit_div_r(&p->asm_, sz, X64Reg_RCX); }
-			x64_emit_mov_rr(&p->asm_, X64OpSize_64, X64Reg_RAX, X64Reg_RDX);
-			return x64v_reg(result_type, X64Reg_RAX);
-		case Token_And:    x64_emit_and_rr(&p->asm_, sz, X64Reg_RAX, X64Reg_RCX); return x64v_reg(result_type, X64Reg_RAX);
-		case Token_Or:     x64_emit_or_rr (&p->asm_, sz, X64Reg_RAX, X64Reg_RCX); return x64v_reg(result_type, X64Reg_RAX);
-		case Token_Xor:    x64_emit_xor_rr(&p->asm_, sz, X64Reg_RAX, X64Reg_RCX); return x64v_reg(result_type, X64Reg_RAX);
-		case Token_AndNot: x64_emit_not_r(&p->asm_, sz, X64Reg_RCX); x64_emit_and_rr(&p->asm_, sz, X64Reg_RAX, X64Reg_RCX); return x64v_reg(result_type, X64Reg_RAX);
-		case Token_Shl:  x64_emit_shl_rcl(&p->asm_, sz, X64Reg_RAX);              return x64v_reg(result_type, X64Reg_RAX);
-		case Token_Shr:
-			if (signed_) x64_emit_sar_rcl(&p->asm_, sz, X64Reg_RAX);
-			else         x64_emit_shr_rcl(&p->asm_, sz, X64Reg_RAX);
-			return x64v_reg(result_type, X64Reg_RAX);
-		case Token_CmpEq: { EMIT_CMP_CC(X64Cc_E);  }
-		case Token_NotEq: { EMIT_CMP_CC(X64Cc_NE); }
-		case Token_Lt:    { EMIT_CMP_CC(signed_ ? X64Cc_L  : X64Cc_B);  }
-		case Token_LtEq:  { EMIT_CMP_CC(signed_ ? X64Cc_LE : X64Cc_BE); }
-		case Token_Gt:    { EMIT_CMP_CC(signed_ ? X64Cc_G  : X64Cc_A);  }
-		case Token_GtEq:  { EMIT_CMP_CC(signed_ ? X64Cc_GE : X64Cc_AE); }
-		default:
-			GB_PANIC("x64 integer binary op %d not supported", op);
-		}
-#undef EMIT_CMP_CC
+		// Generic binary op: build BOTH operands (spilled, so they're stable), then dispatch to
+		// x64_emit_comp (string/aggregate/float/int comparisons) or x64_emit_arith. The special
+		// cases above (&&/||, in/not_in, x==nil) returned already. Mirrors lb_build_expr's
+		// BinaryExpr -> lb_emit_arith / lb_emit_comp.
+		x64Value lhs = x64_spill_value(p, x64_build_expr(p, be->left), ltype);
+		x64Value rhs = x64_spill_value(p, x64_build_expr(p, be->right), x64_typed(be->right->tav.type));
+		bool is_cmp = op == Token_CmpEq || op == Token_NotEq || op == Token_Lt ||
+		              op == Token_Gt    || op == Token_LtEq  || op == Token_GtEq;
+		if (is_cmp) return x64_emit_comp(p, op, lhs, rhs);
+		return x64_emit_arith(p, op, lhs, rhs, result_type);
 	} case_end;
 
 	// ── Type cast ─────────────────────────────────────────────────────────
 	case_ast_node(tc, TypeCast, expr); {
+		// cast(T)x converts (x64_emit_conv); transmute(T)x reinterprets bits (x64_emit_transmute).
+		// Mirrors lb_build_expr's TypeCast switch on tc->token.kind.
 		x64Value src = x64_build_expr(p, tc->expr);
-		Type *dst_base = base_type(tav.type);
-		Type *src_base = base_type(tc->expr->tav.type);
-		X64OpSize src_sz = x64_op_size_of(src_base);
-
-		// cstring → string: representation change (ptr → {ptr, strlen}). The generic
-		// int/ptr path below would keep only the ptr and leave len = 0.
-		if (is_type_cstring(src_base) && is_type_string(dst_base)) {
-			return x64_cstring_to_string(p, src);
+		switch (tc->token.kind) {
+		case Token_cast:      return x64_emit_conv(p, src, tc->expr->tav.type, tav.type);
+		case Token_transmute: return x64_emit_transmute(p, src, tav.type);
 		}
-
-		// Same-size reinterpret of a value larger than a register (e.g.
-		// transmute([]byte)string, transmute(T)struct): keep all bytes in place
-		// and just retype. The register-based path below would truncate to 8 bytes.
-		i64 cast_dsz = type_size_of(x64_typed(tav.type));
-		i64 cast_ssz = type_size_of(x64_typed(tc->expr->tav.type));
-		if (cast_dsz > 8 && cast_dsz == cast_ssz) {
-			src.type = x64_typed(tav.type);
-			return src;
-		}
-
-		if (x64_is_float(dst_base) && x64_is_float(src_base)) {
-			x64_value_to_xmm(p, src, X64XmmReg_XMM0);
-			if (x64_is_double(dst_base) && !x64_is_double(src_base))
-				x64_emit_cvtss2sd(&p->asm_, X64XmmReg_XMM0, X64XmmReg_XMM0);
-			else if (!x64_is_double(dst_base) && x64_is_double(src_base))
-				x64_emit_cvtsd2ss(&p->asm_, X64XmmReg_XMM0, X64XmmReg_XMM0);
-			return x64v_xmm(x64_typed(tav.type), X64XmmReg_XMM0);
-		}
-		if (x64_is_integer(dst_base) && x64_is_float(src_base)) {
-			x64_value_to_xmm(p, src, X64XmmReg_XMM0);
-			if (x64_is_double(src_base)) x64_emit_cvttsd2si(&p->asm_, X64Reg_RAX, X64OpSize_64, X64XmmReg_XMM0);
-			else                          x64_emit_cvttss2si(&p->asm_, X64Reg_RAX, X64OpSize_64, X64XmmReg_XMM0);
-			return x64v_reg(x64_typed(tav.type), X64Reg_RAX);
-		}
-		if (x64_is_float(dst_base) && x64_is_integer(src_base)) {
-			x64_value_to_reg(p, src, X64Reg_RAX);
-			if (x64_is_double(dst_base)) x64_emit_cvtsi2sd(&p->asm_, X64XmmReg_XMM0, X64Reg_RAX, X64OpSize_64);
-			else                          x64_emit_cvtsi2ss(&p->asm_, X64XmmReg_XMM0, X64Reg_RAX, X64OpSize_64);
-			return x64v_xmm(x64_typed(tav.type), X64XmmReg_XMM0);
-		}
-		// Int/ptr → int/ptr (widen or truncate)
-		x64_value_to_reg(p, src, X64Reg_RAX);
-		X64OpSize dst_sz = x64_op_size_of(dst_base);
-		if ((int)dst_sz > (int)src_sz && x64_is_signed_integer(src_base) && src_sz < X64OpSize_64) {
-			x64_emit_movsx_rr(&p->asm_, src_sz, X64Reg_RAX, X64Reg_RAX);
-		} else if ((int)dst_sz > (int)src_sz && src_sz <= X64OpSize_16) {
-			x64_emit_movzx_rr(&p->asm_, src_sz, X64Reg_RAX, X64Reg_RAX);
-		}
-		return x64v_reg(x64_typed(tav.type), X64Reg_RAX);
+		GB_PANIC("Invalid AST TypeCast");
 	} case_end;
 
 	case_ast_node(ac, AutoCast, expr); {
-		return x64_build_expr(p, ac->expr);
+		// auto_cast x — convert the operand to the context-inferred type (was a no-op before).
+		x64Value src = x64_build_expr(p, ac->expr);
+		return x64_emit_conv(p, src, ac->expr->tav.type, tav.type);
 	} case_end;
 
 	// ── DerefExpr (*ptr) ─────────────────────────────────────────────────
@@ -1870,6 +2449,30 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 				return x64v_none(); // constant (caught above), type, etc.
 			}
 		}
+		// Multi-component swizzle (v.xyz / v.xy / v.wzyx): swizzle_count>0 means a NEW vector,
+		// gathered from the selected element indices (swizzle_indices packs 2 bits each — mirrors
+		// lb_build_addr). Single-component .x (count==0) stays on the addressable build_addr path
+		// below. Read-only here; swizzle-as-lvalue (`v.xy = …`) is not yet supported.
+		if (se->swizzle_count > 0) {
+			bool  via_ptr = is_type_pointer(se->expr->tav.type);
+			Type *src_t   = base_type(via_ptr ? type_deref(se->expr->tav.type) : se->expr->tav.type);
+			Type *elem    = src_t->kind == Type_SimdVector ? src_t->SimdVector.elem : src_t->Array.elem;
+			i64       esz = type_size_of(elem);
+			X64OpSize osz = x64_op_size_of(elem);
+			if (via_ptr) {
+				x64Value pv = x64_build_expr(p, se->expr);
+				x64_value_to_reg(p, pv, X64Reg_RCX);            // RCX = &array
+			} else {
+				x64_emit_lea(&p->asm_, X64Reg_RCX, x64_build_addr(p, se->expr).mem);
+			}
+			i32 off = x64_alloc_local(p, x64_type_size(tav.type), x64_type_align(tav.type));
+			for (u8 i = 0; i < se->swizzle_count; i++) {
+				u8 idx = (se->swizzle_indices >> (i*2)) & 3;
+				x64_emit_mov_rm(&p->asm_, osz, X64Reg_RAX, x64_mem(X64Reg_RCX, (i32)(idx*esz)));
+				x64_emit_mov_mr(&p->asm_, osz, x64_rbp_mem(off + (i32)(i*esz)), X64Reg_RAX);
+			}
+			return x64v_mem(x64_typed(tav.type), x64_rbp_mem(off));
+		}
 		// Struct/union field access or other non-import selector
 		x64Addr addr = x64_build_addr(p, expr);
 		return x64_load_addr(p, addr);
@@ -1883,702 +2486,16 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 
 	// ── CallExpr ─────────────────────────────────────────────────────────
 	case_ast_node(ce, CallExpr, expr); {
-		// Skip type-conversion call form (int(x), f64(x), etc.)
-		if (ce->proc->tav.mode == Addressing_Type) {
-			if (ce->args.count >= 1) {
-				x64Value cv = x64_build_expr(p, ce->args[0]);
-				// cstring → string changes representation (8B ptr → {ptr,len}); the
-				// rest are same-representation reinterprets handled by the cv as-is.
-				if (is_type_cstring(base_type(ce->args[0]->tav.type)) &&
-				    is_type_string(base_type(tav.type))) {
-					return x64_cstring_to_string(p, cv);
-				}
-				return cv;
-			}
-			return x64v_none();
-		}
-		// Builtin calls (len, cap, copy, etc.) — mostly unimplemented, but a few
-		// matter because LLVM lowers them to real runtime calls whose results are
-		// consumed.
-		if (ce->proc->tav.mode == Addressing_Builtin) {
-			Entity *be = entity_of_node(unparen_expr(ce->proc));
-			// Atomic intrinsics (intrinsics.atomic_*) — LOCK-prefixed ops / MOV / CMPXCHG.
-			// Without these all atomics silently no-op (sync.Mutex/Sema, thread flags) → hangs.
-			if (be != nullptr && be->kind == Entity_Builtin && x64_is_atomic_builtin(be->Builtin.id)) {
-				return x64_build_atomic(p, expr, be->Builtin.id);
-			}
-			// soa_zip(...) → #soa[]T (mirrors lb_soa_zip). reflect.struct_fields_zipped
-			// builds its result this way; without it the #soa return is garbage.
-			if (be != nullptr && be->kind == Entity_Builtin && be->Builtin.id == BuiltinProc_soa_zip) {
-				return x64_soa_zip(p, expr);
-			}
-			// intrinsics.__entry_point() -> run @(init) procs (mirrors LLVM's
-			// _startup_runtime body) then call info->entry_point (user main).
-			if (be != nullptr && be->kind == Entity_Builtin &&
-			    be->Builtin.id == BuiltinProc___entry_point) {
-				CheckerInfo *cinfo = p->module->gen->info;
+		return x64_build_call_expr(p, expr);
+	} case_end;
 
-				// Global var init is NOT done here: it runs in __$startup_runtime (called
-				// before __entry_point, emitted AFTER the on-demand closure so it sees every
-				// global's storage and inits all in dependency order, mirroring LLVM). By
-				// now the globals are already set.
-				for (Entity *ie : cinfo->init_procedures) x64_call_no_arg(p, ie);
-				x64_call_no_arg(p, cinfo->entry_point);
-				return x64v_none();
-			}
-			if (be != nullptr && be->kind == Entity_Builtin &&
-			    be->Builtin.id == BuiltinProc_type_info_of && ce->args.count >= 1) {
-				Ast *arg0 = ce->args[0];
-				// Compile-time `type_info_of(T)` (a pointer into the type table) not yet
-				// supported. Runtime `type_info_of(id)` → runtime.__type_info_of(id) (mirrors LLVM).
-				if (arg0->tav.mode != Addressing_Type) {
-					AstPackage *rt_pkg = p->module->gen->info->runtime_package;
-					Entity *tio = (rt_pkg != nullptr)
-					    ? scope_lookup_current(rt_pkg->scope,
-					          string_interner_insert(str_lit("__type_info_of")))
-					    : nullptr;
-					if (tio != nullptr && tio->kind == Entity_Procedure) {
-						// Evaluate the typeid arg and spill it before the call setup.
-						x64Value idv = x64_build_expr(p, arg0);
-						i32 id_off = x64_alloc_local(p, 8, 8);
-						x64_value_to_reg(p, idv, X64Reg_RAX);
-						x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(id_off), X64Reg_RAX);
-						x64Value cargs[1];
-						cargs[0] = x64v_mem(t_typeid, x64_rbp_mem(id_off));
-						return x64_emit_call(p, x64_get_entity_name(tio), tio->type, cargs, 1);
-					}
-				}
-			}
-			// len/cap: slice/string {data@0, len@8}; dynamic array adds cap@16.
-			if (be != nullptr && be->kind == Entity_Builtin &&
-			    (be->Builtin.id == BuiltinProc_len || be->Builtin.id == BuiltinProc_cap) &&
-			    ce->args.count >= 1) {
-				Ast  *arg0 = ce->args[0];
-				Type *at   = arg0->tav.type ? base_type(arg0->tav.type) : nullptr;
-				x64Value av = x64_build_expr(p, arg0);
-				if (at != nullptr && is_type_pointer(at)) {
-					x64_value_to_reg(p, av, X64Reg_RAX);
-					Type *deref = type_deref(at);
-					av = x64v_mem(deref, x64_mem(X64Reg_RAX, 0));
-					at = base_type(deref);
-				}
-				if (av.kind == x64Value_Mem && at != nullptr) {
-					i32 off = -1;
-					if (is_type_slice(at) || is_type_string(at)) {
-						off = 8; // cap(slice) == len
-					} else if (is_type_dynamic_array(at)) {
-						off = (be->Builtin.id == BuiltinProc_cap) ? 16 : 8;
-					}
-					if (off >= 0) {
-						X64Mem m = av.mem;
-						m.disp += off;
-						x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, m);
-						return x64v_reg(t_int, X64Reg_RAX);
-					}
-				}
-				return x64v_none();
-			}
-			// min / max — fold over args (mirrors lb_emit_min / lb_emit_max).
-			if (be != nullptr && be->kind == Entity_Builtin &&
-			    (be->Builtin.id == BuiltinProc_min || be->Builtin.id == BuiltinProc_max) &&
-			    ce->args.count >= 1) {
-				bool is_min = be->Builtin.id == BuiltinProc_min;
-				Type *rt = tav.type ? x64_typed(tav.type) : x64_typed(ce->args[0]->tav.type);
-				if (rt == nullptr) return x64v_none();
-
-				if (x64_is_float(rt)) {
-					bool dbl = x64_is_double(rt);
-					i32 acc = x64_alloc_local(p, 8, 8);
-					x64_store_value(p, x64addr(x64_rbp_mem(acc), rt), x64_build_expr(p, ce->args[0]));
-					for (isize i = 1; i < ce->args.count; i++) {
-						i32 boff = x64_alloc_local(p, 8, 8);
-						x64_store_value(p, x64addr(x64_rbp_mem(boff), rt), x64_build_expr(p, ce->args[i]));
-						if (dbl) { x64_emit_movsd_rm(&p->asm_, X64XmmReg_XMM0, x64_rbp_mem(acc));
-						           x64_emit_movsd_rm(&p->asm_, X64XmmReg_XMM1, x64_rbp_mem(boff));
-						           x64_emit_ucomisd(&p->asm_, X64XmmReg_XMM0, X64XmmReg_XMM1); }
-						else     { x64_emit_movss_rm(&p->asm_, X64XmmReg_XMM0, x64_rbp_mem(acc));
-						           x64_emit_movss_rm(&p->asm_, X64XmmReg_XMM1, x64_rbp_mem(boff));
-						           x64_emit_ucomiss(&p->asm_, X64XmmReg_XMM0, X64XmmReg_XMM1); }
-						// min: keep acc if acc<bi (below); max: keep if acc>bi (above).
-						isize keep = x64_label_alloc(&p->asm_);
-						x64_emit_jcc(&p->asm_, is_min ? X64Cc_B : X64Cc_A, keep);
-						if (dbl) { x64_emit_movsd_rm(&p->asm_, X64XmmReg_XMM0, x64_rbp_mem(boff));
-						           x64_emit_movsd_mr(&p->asm_, x64_rbp_mem(acc), X64XmmReg_XMM0); }
-						else     { x64_emit_movss_rm(&p->asm_, X64XmmReg_XMM0, x64_rbp_mem(boff));
-						           x64_emit_movss_mr(&p->asm_, x64_rbp_mem(acc), X64XmmReg_XMM0); }
-						x64_label_bind(&p->asm_, keep);
-					}
-					return x64v_mem(rt, x64_rbp_mem(acc));
-				}
-
-				// Integer / pointer / enum: cmov-based fold.
-				X64OpSize osz = x64_op_size_of(rt);
-				bool sgn = x64_is_signed_integer(rt);
-				// Replace acc with b when: min → acc>b ; max → acc<b.
-				X64Cc cc = is_min ? (sgn ? X64Cc_G : X64Cc_A)
-				                  : (sgn ? X64Cc_L : X64Cc_B);
-				i32 acc = x64_alloc_local(p, 8, 8);
-				x64_value_to_reg(p, x64_build_expr(p, ce->args[0]), X64Reg_RAX);
-				x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(acc), X64Reg_RAX);
-				for (isize i = 1; i < ce->args.count; i++) {
-					x64_value_to_reg(p, x64_build_expr(p, ce->args[i]), X64Reg_RCX);
-					x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(acc));
-					x64_emit_cmp_rr(&p->asm_, osz, X64Reg_RAX, X64Reg_RCX);
-					x64_emit_cmov_rr(&p->asm_, cc, osz, X64Reg_RAX, X64Reg_RCX);
-					x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(acc), X64Reg_RAX);
-				}
-				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(acc));
-				return x64v_reg(rt, X64Reg_RAX);
-			}
-			// clamp(x, lo, hi) == min(max(x, lo), hi) (mirrors lb_emit_clamp).
-			if (be != nullptr && be->kind == Entity_Builtin &&
-			    be->Builtin.id == BuiltinProc_clamp && ce->args.count >= 3) {
-				Type *rt = tav.type ? x64_typed(tav.type) : x64_typed(ce->args[0]->tav.type);
-				if (rt == nullptr) return x64v_none();
-				i64 sz = type_size_of(rt); if (sz <= 0) sz = 8;
-				i64 al = type_align_of(rt); if (al <= 0) al = 8;
-				// Spill each arg as it's built (later builds clobber registers).
-				i32 x_off  = x64_alloc_local(p, sz, al);
-				x64_store_value(p, x64addr(x64_rbp_mem(x_off),  rt), x64_build_expr(p, ce->args[0]));
-				i32 lo_off = x64_alloc_local(p, sz, al);
-				x64_store_value(p, x64addr(x64_rbp_mem(lo_off), rt), x64_build_expr(p, ce->args[1]));
-				i32 hi_off = x64_alloc_local(p, sz, al);
-				x64_store_value(p, x64addr(x64_rbp_mem(hi_off), rt), x64_build_expr(p, ce->args[2]));
-				x64Value m = x64_emit_minmax2(p, rt, x64v_mem(rt, x64_rbp_mem(x_off)),
-				                              x64v_mem(rt, x64_rbp_mem(lo_off)), false); // max(x, lo)
-				return x64_emit_minmax2(p, rt, m,
-				                        x64v_mem(rt, x64_rbp_mem(hi_off)), true);       // min(., hi)
-			}
-			// abs(x): unsigned → x; float → clear sign bit; signed → (x<0)?-x:x.
-			if (be != nullptr && be->kind == Entity_Builtin &&
-			    be->Builtin.id == BuiltinProc_abs && ce->args.count >= 1) {
-				Type *rt = tav.type ? x64_typed(tav.type) : x64_typed(ce->args[0]->tav.type);
-				x64Value xv = x64_build_expr(p, ce->args[0]);
-				if (rt == nullptr) return xv;
-				if (x64_is_integer(rt) && !x64_is_signed_integer(rt)) return xv; // unsigned
-				if (x64_is_float(rt)) {
-					i64 fsz = type_size_of(rt); if (fsz <= 0) fsz = 8;
-					i32 off = x64_alloc_local(p, fsz, fsz);
-					x64_store_value(p, x64addr(x64_rbp_mem(off), rt), xv);
-					if (fsz == 8) {
-						x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(off));
-						x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RCX, (i64)0x7FFFFFFFFFFFFFFFll);
-						x64_emit_and_rr(&p->asm_, X64OpSize_64, X64Reg_RAX, X64Reg_RCX);
-						x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(off), X64Reg_RAX);
-					} else {
-						x64_emit_mov_rm(&p->asm_, X64OpSize_32, X64Reg_RAX, x64_rbp_mem(off));
-						x64_emit_mov_ri(&p->asm_, X64OpSize_32, X64Reg_RCX, (i64)0x7FFFFFFFll);
-						x64_emit_and_rr(&p->asm_, X64OpSize_32, X64Reg_RAX, X64Reg_RCX);
-						x64_emit_mov_mr(&p->asm_, X64OpSize_32, x64_rbp_mem(off), X64Reg_RAX);
-					}
-					return x64v_mem(rt, x64_rbp_mem(off));
-				}
-				X64OpSize osz = x64_op_size_of(rt);
-				x64_value_to_reg(p, xv, X64Reg_RAX);
-				x64_emit_mov_rr(&p->asm_, X64OpSize_64, X64Reg_RCX, X64Reg_RAX);
-				x64_emit_neg_r(&p->asm_, osz, X64Reg_RCX);          // RCX = -x
-				x64_emit_test_rr(&p->asm_, osz, X64Reg_RAX, X64Reg_RAX);
-				x64_emit_cmov_rr(&p->asm_, X64Cc_S, osz, X64Reg_RAX, X64Reg_RCX); // x<0 → -x
-				return x64v_reg(rt, X64Reg_RAX);
-			}
-			// typeid_of(T): compile-time type → its typeid (canonical type hash).
-			if (be != nullptr && be->kind == Entity_Builtin &&
-			    be->Builtin.id == BuiltinProc_typeid_of && ce->args.count >= 1) {
-				Type *at = ce->args[0]->tav.type;
-				if (at == nullptr) at = type_of_expr(ce->args[0]);
-				Type *dt = default_type(at);
-				return x64v_imm(t_typeid, (i64)type_hash_canonical_type(dt));
-			}
-			// ptr_offset(ptr, n): ptr + n*size_of(elem). ptr_sub(p0,p1): (p0-p1)/size.
-			if (be != nullptr && be->kind == Entity_Builtin &&
-			    (be->Builtin.id == BuiltinProc_ptr_offset || be->Builtin.id == BuiltinProc_ptr_sub) &&
-			    ce->args.count >= 2) {
-				Type *pt   = x64_typed(ce->args[0]->tav.type);
-				Type *pbt  = base_type(pt);
-				Type *elem = pbt && pbt->kind == Type_MultiPointer ? pbt->MultiPointer.elem :
-				             pbt && pbt->kind == Type_Pointer       ? pbt->Pointer.elem : nullptr;
-				i64 esz = elem ? type_size_of(elem) : 1; if (esz <= 0) esz = 1;
-
-				i32 a0 = x64_alloc_local(p, 8, 8);
-				x64_value_to_reg(p, x64_build_expr(p, ce->args[0]), X64Reg_RAX);
-				x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(a0), X64Reg_RAX);
-				x64_value_to_reg(p, x64_build_expr(p, ce->args[1]), X64Reg_RCX);
-
-				if (be->Builtin.id == BuiltinProc_ptr_offset) {
-					if (esz > 1) x64_emit_imul_rri(&p->asm_, X64OpSize_64, X64Reg_RCX, X64Reg_RCX, (i32)esz);
-					x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(a0));
-					x64_emit_add_rr(&p->asm_, X64OpSize_64, X64Reg_RAX, X64Reg_RCX);
-					return x64v_reg(pt, X64Reg_RAX);
-				}
-				// ptr_sub: byte difference / element size (signed).
-				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(a0));
-				x64_emit_sub_rr(&p->asm_, X64OpSize_64, X64Reg_RAX, X64Reg_RCX);
-				if (esz > 1) {
-					x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RCX, (i64)esz);
-					x64_emit_cqo(&p->asm_);
-					x64_emit_idiv_r(&p->asm_, X64OpSize_64, X64Reg_RCX);
-				}
-				return x64v_reg(t_int, X64Reg_RAX);
-			}
-			// intrinsics.mem_copy / mem_copy_non_overlapping (dst, src, len).
-			// LLVM lowers these to llvm.memmove / llvm.memcpy. len is runtime, so
-			// we emit a REP MOVSB (with backward direction for the overlapping
-			// memmove case when dst > src).
-			if (be != nullptr && be->kind == Entity_Builtin &&
-			    (be->Builtin.id == BuiltinProc_mem_copy ||
-			     be->Builtin.id == BuiltinProc_mem_copy_non_overlapping) &&
-			    ce->args.count >= 3) {
-				bool overlapping = be->Builtin.id == BuiltinProc_mem_copy;
-				// Evaluate and spill each arg (later evals clobber RAX).
-				i32 dst_off = x64_alloc_local(p, 8, 8);
-				x64_value_to_reg(p, x64_build_expr(p, ce->args[0]), X64Reg_RAX);
-				x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(dst_off), X64Reg_RAX);
-				i32 src_off = x64_alloc_local(p, 8, 8);
-				x64_value_to_reg(p, x64_build_expr(p, ce->args[1]), X64Reg_RAX);
-				x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(src_off), X64Reg_RAX);
-				i32 len_off = x64_alloc_local(p, 8, 8);
-				x64_value_to_reg(p, x64_build_expr(p, ce->args[2]), X64Reg_RAX);
-				x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(len_off), X64Reg_RAX);
-
-				// RSI/RDI are nonvolatile in Win64 — save/restore them (LLVM's
-				// memmove preserves them; our inline REP MOVSB must too). The arg
-				// reloads below are RBP-based, unaffected by the pushes.
-				x64_emit_push_r(&p->asm_, X64Reg_RSI);
-				x64_emit_push_r(&p->asm_, X64Reg_RDI);
-				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RDI, x64_rbp_mem(dst_off));
-				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RSI, x64_rbp_mem(src_off));
-				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RCX, x64_rbp_mem(len_off));
-
-				isize lbl_fwd = x64_label_alloc(&p->asm_);
-				isize lbl_end = x64_label_alloc(&p->asm_);
-				if (overlapping) {
-					// if dst <= src → forward is safe; else copy backward.
-					x64_emit_cmp_rr(&p->asm_, X64OpSize_64, X64Reg_RDI, X64Reg_RSI);
-					x64_emit_jcc(&p->asm_, X64Cc_BE, lbl_fwd);
-					// backward: point RSI/RDI at last byte, set DF, rep movsb, clear DF.
-					x64_emit_add_rr(&p->asm_, X64OpSize_64, X64Reg_RSI, X64Reg_RCX);
-					x64_emit_sub_ri(&p->asm_, X64OpSize_64, X64Reg_RSI, 1);
-					x64_emit_add_rr(&p->asm_, X64OpSize_64, X64Reg_RDI, X64Reg_RCX);
-					x64_emit_sub_ri(&p->asm_, X64OpSize_64, X64Reg_RDI, 1);
-					x64_enc_b(&p->asm_, 0xFD); // STD
-					x64_enc_b(&p->asm_, 0xF3); // REP
-					x64_enc_b(&p->asm_, 0xA4); // MOVSB
-					x64_enc_b(&p->asm_, 0xFC); // CLD
-					x64_emit_jmp(&p->asm_, lbl_end);
-				}
-				x64_label_bind(&p->asm_, lbl_fwd);
-				x64_enc_b(&p->asm_, 0xF3); // REP
-				x64_enc_b(&p->asm_, 0xA4); // MOVSB
-				x64_label_bind(&p->asm_, lbl_end);
-				x64_emit_pop_r(&p->asm_, X64Reg_RDI);
-				x64_emit_pop_r(&p->asm_, X64Reg_RSI);
-				return x64v_none();
-			}
-			// intrinsics.mem_zero / mem_zero_volatile (ptr, len). len is runtime.
-			if (be != nullptr && be->kind == Entity_Builtin &&
-			    (be->Builtin.id == BuiltinProc_mem_zero ||
-			     be->Builtin.id == BuiltinProc_mem_zero_volatile) &&
-			    ce->args.count >= 2) {
-				i32 ptr_off = x64_alloc_local(p, 8, 8);
-				x64_value_to_reg(p, x64_build_expr(p, ce->args[0]), X64Reg_RAX);
-				x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(ptr_off), X64Reg_RAX);
-				i32 len_off = x64_alloc_local(p, 8, 8);
-				x64_value_to_reg(p, x64_build_expr(p, ce->args[1]), X64Reg_RAX);
-				x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(len_off), X64Reg_RAX);
-				// RDI is nonvolatile in Win64 — save/restore it around REP STOSB.
-				x64_emit_push_r(&p->asm_, X64Reg_RDI);
-				x64_emit_xor_rr(&p->asm_, X64OpSize_32, X64Reg_RAX, X64Reg_RAX);
-				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RDI, x64_rbp_mem(ptr_off));
-				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RCX, x64_rbp_mem(len_off));
-				x64_enc_b(&p->asm_, 0xF3); // REP
-				x64_enc_b(&p->asm_, 0xAA); // STOSB
-				x64_emit_pop_r(&p->asm_, X64Reg_RDI);
-				return x64v_none();
-			}
-			// raw_data(x): slice/dyn-array/string → .data ptr (offset 0);
-			// pointer/multipointer/cstring → the value itself (mirrors LLVM).
-			if (be != nullptr && be->kind == Entity_Builtin &&
-			    be->Builtin.id == BuiltinProc_raw_data && ce->args.count >= 1) {
-				Ast  *arg0 = ce->args[0];
-				Type *raw  = x64_typed(arg0->tav.type);
-				Type *at   = base_type(raw);
-				x64Value av = x64_build_expr(p, arg0);
-				bool load_data = at != nullptr &&
-				    (at->kind == Type_Slice || at->kind == Type_DynamicArray ||
-				     (at->kind == Type_Basic &&
-				      (at->Basic.kind == Basic_string || at->Basic.kind == Basic_string16)));
-				if (load_data) {
-					if (av.kind == x64Value_Mem) {
-						x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, av.mem);
-					} else {
-						x64_value_to_reg(p, av, X64Reg_RAX);
-						x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_mem(X64Reg_RAX, 0));
-					}
-					return x64v_reg(x64_typed(tav.type), X64Reg_RAX);
-				}
-				return av; // already a raw pointer (^T / [^]T / cstring)
-			}
-			return x64v_none();
-		}
-
-		// Resolve via entity_of_node, not entity_procedure_of (the latter is only set by
-		// BuiltinProc_procedure_of; null for normal/pkg-qualified calls).
-		Ast    *proc_node  = unparen_expr(ce->proc);
-		Entity *callee_ent = entity_of_node(proc_node);
-
-		Type   *callee_type_raw;
-		String  callee_sym = {};
-		bool    indirect   = false;
-
-		if (callee_ent != nullptr && callee_ent->kind == Entity_Procedure) {
-			// Skip LLVM intrinsics — not real linker symbols (e.g. llvm.sin.f64).
-			if (callee_ent->Procedure.is_foreign) {
-				String fl = callee_ent->Procedure.link_name;
-				if (fl.len >= 5 && gb_strncmp((char const *)fl.text, "llvm.", 5) == 0) {
-					return x64v_none();
-				}
-			}
-			callee_type_raw = callee_ent->type;
-			callee_sym      = x64_get_entity_name(callee_ent);
-
-			// On-demand: a proc nothing depends on (min_dep_count == 0) — a #force_inline
-			// runtime helper (bounds_check_error_loc, …) that LLVM inlines and never emits
-			// standalone. We don't inline, so queue it; the driver compiles it into its owner
-			// module after the parallel pass (exactly one external definition).
-			if (!callee_ent->Procedure.is_foreign &&
-			    callee_ent->min_dep_count.load(std::memory_order_relaxed) == 0) {
-				x64_enqueue_oncall(p, callee_ent);
-			}
-		} else {
-			callee_type_raw = ce->proc->tav.type;
-			indirect = true;
-		}
-
-		Type *ct = base_type(callee_type_raw);
-		if (ct == nullptr || ct->kind != Type_Proc) return x64v_none();
-
-		bool needs_rbp  = x64_returns_by_pointer(callee_type_raw);
-		bool needs_ctx  = ct->Proc.calling_convention == ProcCC_Odin;
-
-		int param_count = ct->Proc.params ? (int)ct->Proc.params->Tuple.variables.count : (int)ce->args.count;
-		// c_vararg can pass MORE args than params; size generously (params + all args).
-		int n_pos_max   = (int)(ce->split_args != nullptr ? ce->split_args->positional.count : ce->args.count);
-		int total_slots = (needs_rbp ? 1 : 0) + param_count + n_pos_max + (needs_ctx ? 1 : 0) + 8;
-		x64Value *args = gb_alloc_array(temporary_allocator(), x64Value, total_slots);
-		int slot = 0;
-
-		// Split returns (mirror LLVM): for N results, results[0..N-2] come back via hidden
-		// pointer args (after the params, before context); result[N-1] is the real return
-		// (sret slot 0 if by-pointer, else RAX/XMM0). Allocate the landing locals + pointer
-		// args up front. Pointers live in memory locals so arg-building (which hammers RAX)
-		// can't clobber them.
-		Type *last_rt   = x64_last_result_type(ct);
-		int   npartial  = x64_num_partial_returns(ct);
-		i32  *partial_off     = (npartial > 0) ? gb_alloc_array(temporary_allocator(), i32, npartial) : nullptr;
-		x64Value *partial_ptr = (npartial > 0) ? gb_alloc_array(temporary_allocator(), x64Value, npartial) : nullptr;
-		for (int i = 0; i < npartial; i++) {
-			Type *pty = ct->Proc.results->Tuple.variables[i]->type;
-			i64 psz = type_size_of(pty); if (psz <= 0) psz = 1;
-			i64 pal = type_align_of(pty); if (pal <= 0) pal = 1;
-			partial_off[i]  = x64_alloc_local(p, psz, pal);
-			i32 pptr_off    = x64_alloc_local(p, 8, 8);
-			x64_emit_lea(&p->asm_, X64Reg_RAX, x64_rbp_mem(partial_off[i]));
-			x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(pptr_off), X64Reg_RAX);
-			partial_ptr[i] = x64v_mem(alloc_type_pointer(pty), x64_rbp_mem(pptr_off));
-		}
-
-		// Hidden return pointer (sret) for the REAL (last) result, in param slot 0.
-		i32 ret_local_off = 0;
-		if (needs_rbp) {
-			ret_local_off = x64_alloc_local(p, type_size_of(last_rt), type_align_of(last_rt));
-			i32 ret_ptr_off = x64_alloc_local(p, 8, 8);
-			x64_emit_lea(&p->asm_, X64Reg_RAX, x64_rbp_mem(ret_local_off));
-			x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(ret_ptr_off), X64Reg_RAX);
-			args[slot++] = x64v_mem(alloc_type_pointer(last_rt), x64_rbp_mem(ret_ptr_off));
-		}
-
-		// Explicit args (mirror lb_build_call_expr_internal): build a PARAMETER-INDEXED value
-		// array from the checker-resolved split_args (positional, then named, then defaults),
-		// then lower each to ABI slots. Handles defaults/named anywhere relative to the
-		// variadic, and never indexes raw ce->args out of bounds.
-		{
-			TypeTuple *params = ct->Proc.params ? &ct->Proc.params->Tuple : nullptr;
-			int   n_params    = params ? (int)params->variables.count : 0;
-			bool  is_c_vararg = ct->Proc.c_vararg;
-			bool  vari_expand = (ce->ellipsis.pos.line != 0); // caller wrote ..slice
-
-			// Odin variadic param `..T`: the caller PACKS the trailing positional args into a
-			// []T backing array + {ptr,len} slice (mirrors lb_build_call_expr_internal). `..any`
-			// elements are each an `any` {data_ptr, typeid}; any other `..T` stores the T value
-			// directly. (c_vararg handled separately below.)
-			bool  has_variadic        = false;
-			bool  variadic_is_any     = false;
-			int   variadic_index      = ct->Proc.variadic ? (int)ct->Proc.variadic_index : -1;
-			Type *variadic_slice_type = nullptr;
-			Type *variadic_elem_type  = nullptr;
-			if (ct->Proc.variadic && !is_c_vararg && params &&
-			    variadic_index >= 0 && variadic_index < n_params) {
-				Entity *ve = params->variables[variadic_index];
-				Type   *st = base_type(ve->type);
-				if (st && st->kind == Type_Slice) {
-					has_variadic        = true;
-					variadic_slice_type = ve->type;
-					variadic_elem_type  = st->Slice.elem;
-					variadic_is_any     = is_type_any(variadic_elem_type);
-				}
-			}
-
-			// Checker-resolved arg lists (defaults/named already separated). Fall back
-			// to the raw arg list defensively.
-			Slice<Ast *> positional = (ce->split_args != nullptr) ? ce->split_args->positional : ce->args;
-
-			// Parameter-indexed values, each stabilised to memory/imm so a later arg
-			// evaluation (which reuses RAX) can't clobber it. None = not yet filled.
-			x64Value *pvals = gb_alloc_array(temporary_allocator(), x64Value, n_params > 0 ? n_params : 1);
-			for (int i = 0; i < n_params; i++) pvals[i] = x64v_none();
-
-			// C varargs are appended as their own ABI slots after the fixed params.
-			x64Value *cvar = is_c_vararg ? gb_alloc_array(temporary_allocator(), x64Value, positional.count + 1) : nullptr;
-			int cvar_count = 0;
-
-			// Pass 1: positional args (index i == parameter index).
-			for (isize i = 0; i < positional.count; i++) {
-				Ast *arg = positional[i];
-				if (has_variadic && (int)i == variadic_index) {
-					// Pack positional[variadic_index..] into a []T slice value.
-					int vari_count = (int)positional.count - variadic_index;
-					if (vari_count < 0) vari_count = 0;
-					if (vari_expand && vari_count >= 1) {
-						// caller wrote `..slice` — pass the existing slice directly
-						x64Value sv = x64_stabilize_value(p, x64_build_expr(p, positional[variadic_index]));
-						if (sv.type == nullptr) sv.type = variadic_slice_type;
-						pvals[variadic_index] = sv;
-					} else if (vari_count == 0) {
-						i32 slice_off = x64_alloc_local(p, 16, 8);
-						x64_emit_mov_mi(&p->asm_, X64OpSize_64, x64_rbp_mem(slice_off),     0);
-						x64_emit_mov_mi(&p->asm_, X64OpSize_64, x64_rbp_mem(slice_off + 8), 0);
-						pvals[variadic_index] = x64v_mem(variadic_slice_type, x64_rbp_mem(slice_off));
-					} else {
-						// Backing array of `variadic_elem_type[vari_count]`, then a {ptr,len}.
-						Type *et  = x64_typed(variadic_elem_type);
-						i64   esz = type_size_of(et); if (esz <= 0) esz = 1;
-						i64   eal = type_align_of(et); if (eal <= 0) eal = 1;
-						i32 arr_off = x64_alloc_local(p, (i64)vari_count * esz, gb_max(eal, (i64)8));
-						for (int vi = 0; vi < vari_count; vi++) {
-							i32 slot_off = arr_off + vi * (i32)esz;
-							if (variadic_is_any) {
-								// `any` element = {data_ptr → spilled value, typeid}
-								x64Value av = x64_build_expr(p, positional[variadic_index + vi]);
-								Type *at = av.type ? av.type : t_any;
-								at = x64_typed(at);
-								i64 asz = type_size_of(at); if (asz <= 0) asz = 1;
-								i64 aal = type_align_of(at); if (aal <= 0) aal = 1;
-								i32 val_off = x64_alloc_local(p, asz, aal);
-								x64_store_value(p, x64addr(x64_rbp_mem(val_off), at), av);
-								x64_emit_lea(&p->asm_, X64Reg_RAX, x64_rbp_mem(val_off));
-								x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(slot_off), X64Reg_RAX);
-								u64 tid = type_hash_canonical_type(at);
-								x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RAX, (i64)tid);
-								x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(slot_off + 8), X64Reg_RAX);
-							} else {
-								// `..T` element = the T value (mirrors LLVM lb_emit_conv to elem)
-								x64Value ev = x64_build_expr(p, positional[variadic_index + vi]);
-								ev = x64_apply_using_subtype(p, ev, et);
-								x64_store_value(p, x64addr(x64_rbp_mem(slot_off), et), ev);
-							}
-						}
-						i32 slice_off = x64_alloc_local(p, 16, 8);
-						x64_emit_lea(&p->asm_, X64Reg_RAX, x64_rbp_mem(arr_off));
-						x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(slice_off), X64Reg_RAX);
-						x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RAX, (i64)vari_count);
-						x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(slice_off + 8), X64Reg_RAX);
-						pvals[variadic_index] = x64v_mem(variadic_slice_type, x64_rbp_mem(slice_off));
-					}
-					break; // positional beyond variadic_index are consumed here
-				}
-				if (is_c_vararg && ct->Proc.variadic && variadic_index >= 0 && (int)i >= variadic_index) {
-					cvar[cvar_count++] = x64_stabilize_value(p, x64_build_expr(p, arg));
-					continue;
-				}
-				if (arg->tav.mode == Addressing_Type) {
-					// Poly type param ($T) → Entity_TypeName, no runtime slot. A runtime
-					// `typeid` VALUE param instead gets the type's typeid (built below).
-					if (i >= n_params || params->variables[i]->kind == Entity_TypeName) continue;
-				}
-				if (i >= n_params) continue;                    // safety (non-variadic overflow)
-				x64Value av = x64_stabilize_value(p, x64_build_expr(p, arg));
-				if (av.type == nullptr) av.type = params->variables[i]->type;
-				pvals[i] = av;
-			}
-
-			// Pass 2: named args → param-indexed slots.
-			if (ce->split_args != nullptr) {
-				for (isize ni = 0; ni < ce->split_args->named.count; ni++) {
-					Ast *fv_node = ce->split_args->named[ni];
-					if (fv_node->kind != Ast_FieldValue) continue;
-					ast_node(fv, FieldValue, fv_node);
-					if (!fv->field || fv->field->kind != Ast_Ident) continue;
-					isize pidx = lookup_procedure_parameter(ct, fv->field->Ident.token.string);
-					if (pidx < 0 || pidx >= n_params) continue;
-					x64Value av = x64_stabilize_value(p, x64_build_expr(p, fv->value));
-					if (av.type == nullptr) av.type = params->variables[pidx]->type;
-					pvals[pidx] = av;
-				}
-			}
-
-			// Pass 3: fill defaults for params still empty (mirrors LLVM's final loop
-			// over all params at llvm_backend_proc.cpp:5026).
-			for (int i = 0; i < n_params; i++) {
-				Entity *pe = params->variables[i];
-				if (has_variadic && i == variadic_index) {
-					if (pvals[i].kind == x64Value_None) { // empty variadic → nil slice
-						i32 slice_off = x64_alloc_local(p, 16, 8);
-						x64_emit_mov_mi(&p->asm_, X64OpSize_64, x64_rbp_mem(slice_off),     0);
-						x64_emit_mov_mi(&p->asm_, X64OpSize_64, x64_rbp_mem(slice_off + 8), 0);
-						pvals[i] = x64v_mem(variadic_slice_type, x64_rbp_mem(slice_off));
-					}
-					continue;
-				}
-				if (pe->kind != Entity_Variable) continue;
-				if (pvals[i].kind != x64Value_None) continue; // already positional/named
-				x64Value dv = x64v_none();
-				if (pe->Variable.param_value.kind != ParameterValue_Invalid) {
-					dv = x64_handle_param_value(p, pe->type, pe->Variable.param_value);
-				}
-				if (dv.kind == x64Value_None || dv.type == nullptr) {
-					dv = x64v_imm(pe->type ? pe->type : t_int, 0);
-				}
-				if (dv.type == nullptr) dv.type = pe->type;
-				pvals[i] = x64_stabilize_value(p, dv);
-			}
-
-			// Lower each parameter value to ABI slots in parameter order. Zero-sized
-			// params consume no slot; Win64 indirect aggregates are passed by pointer.
-			for (int i = 0; i < n_params; i++) {
-				Entity *pe = params->variables[i];
-				if (pe->kind == Entity_TypeName) continue;              // no runtime slot
-				Type *pt2 = pe->type;
-				if (pt2 != nullptr && type_size_of(pt2) == 0) continue; // zero-sized
-				x64Value v = pvals[i];
-				if (v.kind == x64Value_None) v = x64v_imm(pt2 ? pt2 : t_int, 0);
-				if (v.type == nullptr) v.type = pt2;
-				// `using`-field subtype: a Temp_Allocator passed where Allocator is wanted
-				// narrows to the embedded `allocator` field (mirrors lb_emit_conv subtype path).
-				v = x64_apply_using_subtype(p, v, pt2);
-				if (x64_arg_is_indirect(pt2)) {
-					if (v.kind != x64Value_Mem) {
-						i64 asz = type_size_of(pt2); if (asz <= 0) asz = 8;
-						i64 aal = type_align_of(pt2); if (aal <= 0) aal = 8;
-						i32 tmp = x64_alloc_local(p, asz, aal);
-						x64_zero_mem(p, x64_rbp_mem(tmp), asz); // covers imm/None defaults
-						v = x64v_mem(pt2, x64_rbp_mem(tmp));
-					}
-					i32 ptr = x64_alloc_local(p, 8, 8);
-					x64_emit_lea(&p->asm_, X64Reg_RAX, v.mem);
-					x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(ptr), X64Reg_RAX);
-					args[slot++] = x64v_mem(alloc_type_pointer(pt2), x64_rbp_mem(ptr));
-				} else {
-					args[slot++] = v;
-				}
-			}
-
-			// C varargs follow the fixed parameters as their own slots.
-			for (int i = 0; i < cvar_count; i++) args[slot++] = cvar[i];
-
-		}
-
-		// Split-return hidden pointers for results[0..N-2] — after params, before context
-		// (mirrors LLVM's arg order: [sret][params][partial-rets][context]).
-		for (int i = 0; i < npartial; i++) args[slot++] = partial_ptr[i];
-
-		// Context — keep as memory ref so x64_emit_call loads it fresh (arg-building
-		// above clobbers RAX, so we can't snapshot it here).
-		if (needs_ctx) {
-			args[slot++] = x64_context_ptr_value(p);
-		}
-
-		if (!indirect) {
-			x64Value rv = x64_emit_call(p, callee_sym, callee_type_raw, args, slot);
-
-			// Capture/assemble the result NOW, before the deferred-procedure block below
-			// (which allocates locals and clobbers RAX) can destroy a register result.
-			x64Value call_result = x64_reconstruct_call_result(p, ct, npartial, last_rt, needs_rbp, ret_local_off, partial_off, rv);
-
-			// @(deferred_*): register a deferred call at scope exit (mirrors lb_emit_call's
-			// deferred handling). Covers sync.guard's deferred_in unlock on return.
-			if (callee_ent != nullptr && entity_has_deferred_procedure(callee_ent)) {
-				DeferredProcedureKind dk = callee_ent->Procedure.deferred_procedure.kind;
-				Entity *dproc = callee_ent->Procedure.deferred_procedure.entity;
-				bool is_in_kind = (dk == DeferredProcedure_in || dk == DeferredProcedure_in_by_ptr);
-				if (dproc != nullptr && is_in_kind) {
-					bool   by_ptr = (dk == DeferredProcedure_in_by_ptr);
-					Type  *dct    = base_type(dproc->type);
-					bool   dctx   = dct != nullptr && dct->kind == Type_Proc &&
-					                dct->Proc.calling_convention == ProcCC_Odin;
-					int first_explicit = needs_rbp ? 1 : 0;
-					int last_explicit  = slot - (needs_ctx ? 1 : 0);
-					int dcount = last_explicit - first_explicit;
-					x64Value *dargs = gb_alloc_array(permanent_allocator(), x64Value, dcount + 1);
-					int di = 0;
-					for (int ai = first_explicit; ai < last_explicit; ai++) {
-						x64Value av = args[ai];
-						// Spill to a fresh local so the value survives until the
-						// deferred call is emitted (at return / scope exit).
-						Type *at = av.type ? av.type : t_rawptr;
-						i64 asz = type_size_of(at); if (asz <= 0) asz = 8;
-						i64 aal = type_align_of(at); if (aal <= 0) aal = 8;
-						i32 soff = x64_alloc_local(p, asz, aal);
-						x64_store_value(p, x64addr(x64_rbp_mem(soff), at), av);
-						x64Value sv = x64v_mem(at, x64_rbp_mem(soff));
-						if (by_ptr) {
-							i32 poff = x64_alloc_local(p, 8, 8);
-							x64_emit_lea(&p->asm_, X64Reg_RAX, x64_rbp_mem(soff));
-							x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(poff), X64Reg_RAX);
-							sv = x64v_mem(alloc_type_pointer(at), x64_rbp_mem(poff));
-						}
-						dargs[di++] = sv;
-					}
-					if (dctx) {
-						dargs[di++] = x64_context_ptr_value(p);
-					}
-					x64Procedure::DeferEntry de = {};
-					de.call_proc = dproc;
-					de.call_type = dproc->type;
-					de.call_args = dargs;
-					de.call_argc = di;
-					array_add(&p->deferred, de);
-				}
-			}
-
-			return call_result;
-		}
-
-		// Indirect call: load callee into R10, then set up args
-		x64Value proc_v = x64_build_expr(p, ce->proc);
-		x64_value_to_reg(p, proc_v, X64Reg_R10);
-
-		// Place args (re-use the same logic as direct call, minus CALL sym)
-		int reg_count = gb_min(slot, 4);
-		for (int i = reg_count - 1; i >= 0; i--) {
-			if (x64_arg_is_float(args[i].type)) x64_value_to_xmm(p, args[i], X64_XMM_ARG_REGS[i]);
-			else                                 x64_value_to_reg (p, args[i], X64_INT_ARG_REGS[i]);
-		}
-		for (int i = 4; i < slot; i++) {
-			x64_value_to_reg(p, args[i], X64Reg_RAX);
-			x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_mem(X64Reg_RSP, 32 + (i-4)*8), X64Reg_RAX);
-		}
-		x64_emit_call_r(&p->asm_, X64Reg_R10);
-
-		// Single-value register result (multi/sret handled inside reconstruct_call_result).
-		x64Value ind_rv = x64v_none();
-		if (!needs_rbp && ct->Proc.result_count == 1) {
-			Type *ret_t = ct->Proc.results->Tuple.variables[0]->type;
-			if (ret_t && type_size_of(ret_t) != 0) {
-				ind_rv = x64_is_float(ret_t) ? x64v_xmm(ret_t, X64XmmReg_XMM0)
-				                             : x64v_reg(ret_t, X64Reg_RAX);
-			}
-		}
-		return x64_reconstruct_call_result(p, ct, npartial, last_rt, needs_rbp, ret_local_off, partial_off, ind_rv);
+	// `recv->method(args)` (vtable/interface dispatch): the checker rewrote it into a normal
+	// CallExpr (`se->call`) whose proc is the `recv.method` field selector and whose arg[0] is
+	// `recv` — so just build that call (mirrors lb_build_expr SelectorCallExpr). NOTE: a
+	// side-effecting receiver (`f()->m()`) is built twice (proc field + arg0); LLVM caches via
+	// StateFlag_SelectorCallExpr. Fine for the usual variable receiver.
+	case_ast_node(se, SelectorCallExpr, expr); {
+		return x64_build_expr(p, se->call);
 	} case_end;
 
 	case_ast_node(te, TernaryIfExpr, expr); {
@@ -2606,12 +2523,24 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 		Type *src_bt  = base_type(src_raw);
 		if (src_bt == nullptr) return x64v_none();
 
-		x64Addr src_addr = x64_build_addr(p, se->expr);
-
-		// Stabilise effective address before any sub-expression clobbers registers
+		// Auto-deref a POINTER source: `p[lo:hi]` (p: ^[]T / ^[N]T / ^string) slices THROUGH the
+		// pointer (like IndexExpr; mirrors lb_build_addr). The effective aggregate address is the
+		// pointer VALUE, not &p. Without this `.data`/`.len` were read from &p / &p+8 (garbage len)
+		// — was os.read_directory→…→_split_iterator's `s[:]` (s: ^string) returning a huge len → hang.
+		bool via_ptr = is_type_pointer(src_bt);
 		i32 src_ea_off = x64_alloc_local(p, 8, 8);
-		x64_emit_lea(&p->asm_, X64Reg_RAX, src_addr.mem);
-		x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(src_ea_off), X64Reg_RAX);
+		if (via_ptr) {
+			x64Value pv = x64_build_expr(p, se->expr);          // the pointer = aggregate address
+			x64_value_to_reg(p, pv, X64Reg_RAX);
+			x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(src_ea_off), X64Reg_RAX);
+			src_raw = type_deref(src_raw);
+			src_bt  = base_type(src_raw);
+			if (src_bt == nullptr) return x64v_none();
+		} else {
+			x64Addr src_addr = x64_build_addr(p, se->expr);
+			x64_emit_lea(&p->asm_, X64Reg_RAX, src_addr.mem);
+			x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(src_ea_off), X64Reg_RAX);
+		}
 
 		Type *elem_t = t_u8;
 		i64   esz    = 1;
@@ -3000,4 +2929,723 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 		return x64v_none();
 	}
 	return x64v_none();
+}
+
+gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
+	expr = unparen_expr(expr);
+	ast_node(ce, CallExpr, expr);
+	TypeAndValue tav = expr->tav;
+		// Type-conversion call form (int(x), f64(x), etc.) — actually convert, same as
+		// cast(T)x (mirrors lb_emit_conv via x64_emit_conv). Returning the operand untouched
+		// skipped width/sign/float conversions and left the result mistyped.
+		if (ce->proc->tav.mode == Addressing_Type) {
+			if (ce->args.count >= 1) {
+				x64Value cv = x64_build_expr(p, ce->args[0]);
+				return x64_emit_conv(p, cv, ce->args[0]->tav.type, tav.type);
+			}
+			return x64v_none();
+		}
+		// Builtin calls (len, cap, copy, etc.) — mostly unimplemented, but a few
+		// matter because LLVM lowers them to real runtime calls whose results are
+		// consumed.
+		if (ce->proc->tav.mode == Addressing_Builtin) {
+			Entity *be = entity_of_node(unparen_expr(ce->proc));
+			// Atomic intrinsics (intrinsics.atomic_*) — LOCK-prefixed ops / MOV / CMPXCHG.
+			// Without these all atomics silently no-op (sync.Mutex/Sema, thread flags) → hangs.
+			if (be != nullptr && be->kind == Entity_Builtin && x64_is_atomic_builtin(be->Builtin.id)) {
+				return x64_build_atomic(p, expr, be->Builtin.id);
+			}
+			// Scalar compiler intrinsics (count_*, overflow_*, saturating_*, sqrt, byte_swap, ...).
+			if (be != nullptr && be->kind == Entity_Builtin && x64_is_simple_intrinsic(be->Builtin.id)) {
+				return x64_build_intrinsic(p, expr, be->Builtin.id);
+			}
+			// Value-producing builtins (complex/quaternion, real/imag/conj, swizzle, unreachable).
+			if (be != nullptr && be->kind == Entity_Builtin && x64_is_value_builtin(be->Builtin.id)) {
+				return x64_build_value_builtin(p, expr, be->Builtin.id);
+			}
+			// soa_zip(...) → #soa[]T (mirrors lb_soa_zip). reflect.struct_fields_zipped
+			// builds its result this way; without it the #soa return is garbage.
+			if (be != nullptr && be->kind == Entity_Builtin && be->Builtin.id == BuiltinProc_soa_zip) {
+				return x64_soa_zip(p, expr);
+			}
+			// intrinsics.__entry_point() -> run @(init) procs (mirrors LLVM's
+			// _startup_runtime body) then call info->entry_point (user main).
+			if (be != nullptr && be->kind == Entity_Builtin &&
+			    be->Builtin.id == BuiltinProc___entry_point) {
+				CheckerInfo *cinfo = p->module->gen->info;
+
+				// Global var init is NOT done here: it runs in __$startup_runtime (called
+				// before __entry_point, emitted AFTER the on-demand closure so it sees every
+				// global's storage and inits all in dependency order, mirroring LLVM). By
+				// now the globals are already set.
+				for (Entity *ie : cinfo->init_procedures) x64_call_no_arg(p, ie);
+				x64_call_no_arg(p, cinfo->entry_point);
+				return x64v_none();
+			}
+			if (be != nullptr && be->kind == Entity_Builtin &&
+			    be->Builtin.id == BuiltinProc_type_info_of && ce->args.count >= 1) {
+				Ast *arg0 = ce->args[0];
+				// Compile-time `type_info_of(T)` (a pointer into the type table) not yet
+				// supported. Runtime `type_info_of(id)` → runtime.__type_info_of(id) (mirrors LLVM).
+				if (arg0->tav.mode != Addressing_Type) {
+					AstPackage *rt_pkg = p->module->gen->info->runtime_package;
+					Entity *tio = (rt_pkg != nullptr)
+					    ? scope_lookup_current(rt_pkg->scope,
+					          string_interner_insert(str_lit("__type_info_of")))
+					    : nullptr;
+					if (tio != nullptr && tio->kind == Entity_Procedure) {
+						// Evaluate the typeid arg and spill it before the call setup.
+						x64Value idv = x64_build_expr(p, arg0);
+						i32 id_off = x64_alloc_local(p, 8, 8);
+						x64_value_to_reg(p, idv, X64Reg_RAX);
+						x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(id_off), X64Reg_RAX);
+						x64Value cargs[1];
+						cargs[0] = x64v_mem(t_typeid, x64_rbp_mem(id_off));
+						return x64_emit_call(p, x64_get_entity_name(tio), tio->type, cargs, 1);
+					}
+				}
+			}
+			// len/cap: slice/string {data@0, len@8}; dynamic array adds cap@16.
+			if (be != nullptr && be->kind == Entity_Builtin &&
+			    (be->Builtin.id == BuiltinProc_len || be->Builtin.id == BuiltinProc_cap) &&
+			    ce->args.count >= 1) {
+				Ast  *arg0 = ce->args[0];
+				Type *at   = arg0->tav.type ? base_type(arg0->tav.type) : nullptr;
+				x64Value av = x64_build_expr(p, arg0);
+				if (at != nullptr && is_type_pointer(at)) {
+					x64_value_to_reg(p, av, X64Reg_RAX);
+					Type *deref = type_deref(at);
+					av = x64v_mem(deref, x64_mem(X64Reg_RAX, 0));
+					at = base_type(deref);
+				}
+				if (av.kind == x64Value_Mem && at != nullptr) {
+					i32 off = -1;
+					if (is_type_slice(at) || is_type_string(at)) {
+						off = 8; // cap(slice) == len
+					} else if (is_type_dynamic_array(at)) {
+						off = (be->Builtin.id == BuiltinProc_cap) ? 16 : 8;
+					} else if (at->kind == Type_Struct && at->Struct.soa_kind != StructSoa_None) {
+						// #soa: fixed → compile-time soa_count; slice/dynamic → the __$len field
+						// AFTER the per-member [^] pointers (cap, dynamic only, follows __$len).
+						// Mirrors lb_soa_struct_len; without it len(#soa) fell to none → garbage,
+						// which propagates a huge length into reflect.struct_fields_zipped users.
+						if (at->Struct.soa_kind == StructSoa_Fixed) {
+							x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RAX, (i64)at->Struct.soa_count);
+							return x64v_reg(t_int, X64Reg_RAX);
+						}
+						Type *ebt = base_type(at->Struct.soa_elem);
+						int nmem = (ebt != nullptr && ebt->kind == Type_Struct) ? (int)ebt->Struct.fields.count : 0;
+						type_set_offsets(at);
+						int fi = nmem;
+						if (be->Builtin.id == BuiltinProc_cap && at->Struct.soa_kind == StructSoa_Dynamic) fi = nmem + 1;
+						if (fi < (int)at->Struct.fields.count) off = (i32)at->Struct.offsets[fi];
+					}
+					if (off >= 0) {
+						X64Mem m = av.mem;
+						m.disp += off;
+						x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, m);
+						return x64v_reg(t_int, X64Reg_RAX);
+					}
+				}
+				return x64v_none();
+			}
+			// min / max — fold over args (mirrors lb_emit_min / lb_emit_max).
+			if (be != nullptr && be->kind == Entity_Builtin &&
+			    (be->Builtin.id == BuiltinProc_min || be->Builtin.id == BuiltinProc_max) &&
+			    ce->args.count >= 1) {
+				bool is_min = be->Builtin.id == BuiltinProc_min;
+				Type *rt = tav.type ? x64_typed(tav.type) : x64_typed(ce->args[0]->tav.type);
+				if (rt == nullptr) return x64v_none();
+
+				if (x64_is_float(rt)) {
+					bool dbl = x64_is_double(rt);
+					i32 acc = x64_alloc_local(p, 8, 8);
+					x64_store_value(p, x64addr(x64_rbp_mem(acc), rt), x64_build_expr(p, ce->args[0]));
+					for (isize i = 1; i < ce->args.count; i++) {
+						i32 boff = x64_alloc_local(p, 8, 8);
+						x64_store_value(p, x64addr(x64_rbp_mem(boff), rt), x64_build_expr(p, ce->args[i]));
+						if (dbl) { x64_emit_movsd_rm(&p->asm_, X64XmmReg_XMM0, x64_rbp_mem(acc));
+						           x64_emit_movsd_rm(&p->asm_, X64XmmReg_XMM1, x64_rbp_mem(boff));
+						           x64_emit_ucomisd(&p->asm_, X64XmmReg_XMM0, X64XmmReg_XMM1); }
+						else     { x64_emit_movss_rm(&p->asm_, X64XmmReg_XMM0, x64_rbp_mem(acc));
+						           x64_emit_movss_rm(&p->asm_, X64XmmReg_XMM1, x64_rbp_mem(boff));
+						           x64_emit_ucomiss(&p->asm_, X64XmmReg_XMM0, X64XmmReg_XMM1); }
+						// min: keep acc if acc<bi (below); max: keep if acc>bi (above).
+						isize keep = x64_label_alloc(&p->asm_);
+						x64_emit_jcc(&p->asm_, is_min ? X64Cc_B : X64Cc_A, keep);
+						if (dbl) { x64_emit_movsd_rm(&p->asm_, X64XmmReg_XMM0, x64_rbp_mem(boff));
+						           x64_emit_movsd_mr(&p->asm_, x64_rbp_mem(acc), X64XmmReg_XMM0); }
+						else     { x64_emit_movss_rm(&p->asm_, X64XmmReg_XMM0, x64_rbp_mem(boff));
+						           x64_emit_movss_mr(&p->asm_, x64_rbp_mem(acc), X64XmmReg_XMM0); }
+						x64_label_bind(&p->asm_, keep);
+					}
+					return x64v_mem(rt, x64_rbp_mem(acc));
+				}
+
+				// Integer / pointer / enum: cmov-based fold.
+				X64OpSize osz = x64_op_size_of(rt);
+				bool sgn = x64_is_signed_integer(rt);
+				// Replace acc with b when: min → acc>b ; max → acc<b.
+				X64Cc cc = is_min ? (sgn ? X64Cc_G : X64Cc_A)
+				                  : (sgn ? X64Cc_L : X64Cc_B);
+				i32 acc = x64_alloc_local(p, 8, 8);
+				x64_value_to_reg(p, x64_build_expr(p, ce->args[0]), X64Reg_RAX);
+				x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(acc), X64Reg_RAX);
+				for (isize i = 1; i < ce->args.count; i++) {
+					x64_value_to_reg(p, x64_build_expr(p, ce->args[i]), X64Reg_RCX);
+					x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(acc));
+					x64_emit_cmp_rr(&p->asm_, osz, X64Reg_RAX, X64Reg_RCX);
+					x64_emit_cmov_rr(&p->asm_, cc, osz, X64Reg_RAX, X64Reg_RCX);
+					x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(acc), X64Reg_RAX);
+				}
+				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(acc));
+				return x64v_reg(rt, X64Reg_RAX);
+			}
+			// clamp(x, lo, hi) == min(max(x, lo), hi) (mirrors lb_emit_clamp).
+			if (be != nullptr && be->kind == Entity_Builtin &&
+			    be->Builtin.id == BuiltinProc_clamp && ce->args.count >= 3) {
+				Type *rt = tav.type ? x64_typed(tav.type) : x64_typed(ce->args[0]->tav.type);
+				if (rt == nullptr) return x64v_none();
+				i64 sz = type_size_of(rt); if (sz <= 0) sz = 8;
+				i64 al = type_align_of(rt); if (al <= 0) al = 8;
+				// Spill each arg as it's built (later builds clobber registers).
+				i32 x_off  = x64_alloc_local(p, sz, al);
+				x64_store_value(p, x64addr(x64_rbp_mem(x_off),  rt), x64_build_expr(p, ce->args[0]));
+				i32 lo_off = x64_alloc_local(p, sz, al);
+				x64_store_value(p, x64addr(x64_rbp_mem(lo_off), rt), x64_build_expr(p, ce->args[1]));
+				i32 hi_off = x64_alloc_local(p, sz, al);
+				x64_store_value(p, x64addr(x64_rbp_mem(hi_off), rt), x64_build_expr(p, ce->args[2]));
+				x64Value m = x64_emit_minmax2(p, rt, x64v_mem(rt, x64_rbp_mem(x_off)),
+				                              x64v_mem(rt, x64_rbp_mem(lo_off)), false); // max(x, lo)
+				return x64_emit_minmax2(p, rt, m,
+				                        x64v_mem(rt, x64_rbp_mem(hi_off)), true);       // min(., hi)
+			}
+			// abs(x): unsigned → x; float → clear sign bit; signed → (x<0)?-x:x.
+			if (be != nullptr && be->kind == Entity_Builtin &&
+			    be->Builtin.id == BuiltinProc_abs && ce->args.count >= 1) {
+				Type *rt = tav.type ? x64_typed(tav.type) : x64_typed(ce->args[0]->tav.type);
+				x64Value xv = x64_build_expr(p, ce->args[0]);
+				if (rt == nullptr) return xv;
+				if (x64_is_integer(rt) && !x64_is_signed_integer(rt)) return xv; // unsigned
+				if (x64_is_float(rt)) {
+					i64 fsz = type_size_of(rt); if (fsz <= 0) fsz = 8;
+					i32 off = x64_alloc_local(p, fsz, fsz);
+					x64_store_value(p, x64addr(x64_rbp_mem(off), rt), xv);
+					if (fsz == 8) {
+						x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(off));
+						x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RCX, (i64)0x7FFFFFFFFFFFFFFFll);
+						x64_emit_and_rr(&p->asm_, X64OpSize_64, X64Reg_RAX, X64Reg_RCX);
+						x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(off), X64Reg_RAX);
+					} else {
+						x64_emit_mov_rm(&p->asm_, X64OpSize_32, X64Reg_RAX, x64_rbp_mem(off));
+						x64_emit_mov_ri(&p->asm_, X64OpSize_32, X64Reg_RCX, (i64)0x7FFFFFFFll);
+						x64_emit_and_rr(&p->asm_, X64OpSize_32, X64Reg_RAX, X64Reg_RCX);
+						x64_emit_mov_mr(&p->asm_, X64OpSize_32, x64_rbp_mem(off), X64Reg_RAX);
+					}
+					return x64v_mem(rt, x64_rbp_mem(off));
+				}
+				X64OpSize osz = x64_op_size_of(rt);
+				x64_value_to_reg(p, xv, X64Reg_RAX);
+				x64_emit_mov_rr(&p->asm_, X64OpSize_64, X64Reg_RCX, X64Reg_RAX);
+				x64_emit_neg_r(&p->asm_, osz, X64Reg_RCX);          // RCX = -x
+				x64_emit_test_rr(&p->asm_, osz, X64Reg_RAX, X64Reg_RAX);
+				x64_emit_cmov_rr(&p->asm_, X64Cc_S, osz, X64Reg_RAX, X64Reg_RCX); // x<0 → -x
+				return x64v_reg(rt, X64Reg_RAX);
+			}
+			// typeid_of(T): compile-time type → its typeid (canonical type hash).
+			if (be != nullptr && be->kind == Entity_Builtin &&
+			    be->Builtin.id == BuiltinProc_typeid_of && ce->args.count >= 1) {
+				Type *at = ce->args[0]->tav.type;
+				if (at == nullptr) at = type_of_expr(ce->args[0]);
+				return x64_typeid(at);
+			}
+			// ptr_offset(ptr, n): ptr + n*size_of(elem). ptr_sub(p0,p1): (p0-p1)/size.
+			if (be != nullptr && be->kind == Entity_Builtin &&
+			    (be->Builtin.id == BuiltinProc_ptr_offset || be->Builtin.id == BuiltinProc_ptr_sub) &&
+			    ce->args.count >= 2) {
+				Type *pt   = x64_typed(ce->args[0]->tav.type);
+				Type *pbt  = base_type(pt);
+				Type *elem = pbt && pbt->kind == Type_MultiPointer ? pbt->MultiPointer.elem :
+				             pbt && pbt->kind == Type_Pointer       ? pbt->Pointer.elem : nullptr;
+				i64 esz = elem ? type_size_of(elem) : 1; if (esz <= 0) esz = 1;
+
+				i32 a0 = x64_alloc_local(p, 8, 8);
+				x64_value_to_reg(p, x64_build_expr(p, ce->args[0]), X64Reg_RAX);
+				x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(a0), X64Reg_RAX);
+				x64_value_to_reg(p, x64_build_expr(p, ce->args[1]), X64Reg_RCX);
+
+				if (be->Builtin.id == BuiltinProc_ptr_offset) {
+					if (esz > 1) x64_emit_imul_rri(&p->asm_, X64OpSize_64, X64Reg_RCX, X64Reg_RCX, (i32)esz);
+					x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(a0));
+					x64_emit_add_rr(&p->asm_, X64OpSize_64, X64Reg_RAX, X64Reg_RCX);
+					return x64v_reg(pt, X64Reg_RAX);
+				}
+				// ptr_sub: byte difference / element size (signed).
+				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(a0));
+				x64_emit_sub_rr(&p->asm_, X64OpSize_64, X64Reg_RAX, X64Reg_RCX);
+				if (esz > 1) {
+					x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RCX, (i64)esz);
+					x64_emit_cqo(&p->asm_);
+					x64_emit_idiv_r(&p->asm_, X64OpSize_64, X64Reg_RCX);
+				}
+				return x64v_reg(t_int, X64Reg_RAX);
+			}
+			// intrinsics.mem_copy / mem_copy_non_overlapping (dst, src, len).
+			// LLVM lowers these to llvm.memmove / llvm.memcpy. len is runtime, so
+			// we emit a REP MOVSB (with backward direction for the overlapping
+			// memmove case when dst > src).
+			if (be != nullptr && be->kind == Entity_Builtin &&
+			    (be->Builtin.id == BuiltinProc_mem_copy ||
+			     be->Builtin.id == BuiltinProc_mem_copy_non_overlapping) &&
+			    ce->args.count >= 3) {
+				bool overlapping = be->Builtin.id == BuiltinProc_mem_copy;
+				// Evaluate and spill each arg (later evals clobber RAX).
+				i32 dst_off = x64_alloc_local(p, 8, 8);
+				x64_value_to_reg(p, x64_build_expr(p, ce->args[0]), X64Reg_RAX);
+				x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(dst_off), X64Reg_RAX);
+				i32 src_off = x64_alloc_local(p, 8, 8);
+				x64_value_to_reg(p, x64_build_expr(p, ce->args[1]), X64Reg_RAX);
+				x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(src_off), X64Reg_RAX);
+				i32 len_off = x64_alloc_local(p, 8, 8);
+				x64_value_to_reg(p, x64_build_expr(p, ce->args[2]), X64Reg_RAX);
+				x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(len_off), X64Reg_RAX);
+
+				// RSI/RDI are nonvolatile in Win64 — save/restore them (LLVM's
+				// memmove preserves them; our inline REP MOVSB must too). The arg
+				// reloads below are RBP-based, unaffected by the pushes.
+				x64_emit_push_r(&p->asm_, X64Reg_RSI);
+				x64_emit_push_r(&p->asm_, X64Reg_RDI);
+				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RDI, x64_rbp_mem(dst_off));
+				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RSI, x64_rbp_mem(src_off));
+				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RCX, x64_rbp_mem(len_off));
+
+				isize lbl_fwd = x64_label_alloc(&p->asm_);
+				isize lbl_end = x64_label_alloc(&p->asm_);
+				if (overlapping) {
+					// if dst <= src → forward is safe; else copy backward.
+					x64_emit_cmp_rr(&p->asm_, X64OpSize_64, X64Reg_RDI, X64Reg_RSI);
+					x64_emit_jcc(&p->asm_, X64Cc_BE, lbl_fwd);
+					// backward: point RSI/RDI at last byte, set DF, rep movsb, clear DF.
+					x64_emit_add_rr(&p->asm_, X64OpSize_64, X64Reg_RSI, X64Reg_RCX);
+					x64_emit_sub_ri(&p->asm_, X64OpSize_64, X64Reg_RSI, 1);
+					x64_emit_add_rr(&p->asm_, X64OpSize_64, X64Reg_RDI, X64Reg_RCX);
+					x64_emit_sub_ri(&p->asm_, X64OpSize_64, X64Reg_RDI, 1);
+					x64_enc_b(&p->asm_, 0xFD); // STD
+					x64_enc_b(&p->asm_, 0xF3); // REP
+					x64_enc_b(&p->asm_, 0xA4); // MOVSB
+					x64_enc_b(&p->asm_, 0xFC); // CLD
+					x64_emit_jmp(&p->asm_, lbl_end);
+				}
+				x64_label_bind(&p->asm_, lbl_fwd);
+				x64_enc_b(&p->asm_, 0xF3); // REP
+				x64_enc_b(&p->asm_, 0xA4); // MOVSB
+				x64_label_bind(&p->asm_, lbl_end);
+				x64_emit_pop_r(&p->asm_, X64Reg_RDI);
+				x64_emit_pop_r(&p->asm_, X64Reg_RSI);
+				return x64v_none();
+			}
+			// intrinsics.mem_zero / mem_zero_volatile (ptr, len). len is runtime.
+			if (be != nullptr && be->kind == Entity_Builtin &&
+			    (be->Builtin.id == BuiltinProc_mem_zero ||
+			     be->Builtin.id == BuiltinProc_mem_zero_volatile) &&
+			    ce->args.count >= 2) {
+				i32 ptr_off = x64_alloc_local(p, 8, 8);
+				x64_value_to_reg(p, x64_build_expr(p, ce->args[0]), X64Reg_RAX);
+				x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(ptr_off), X64Reg_RAX);
+				i32 len_off = x64_alloc_local(p, 8, 8);
+				x64_value_to_reg(p, x64_build_expr(p, ce->args[1]), X64Reg_RAX);
+				x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(len_off), X64Reg_RAX);
+				// RDI is nonvolatile in Win64 — save/restore it around REP STOSB.
+				x64_emit_push_r(&p->asm_, X64Reg_RDI);
+				x64_emit_xor_rr(&p->asm_, X64OpSize_32, X64Reg_RAX, X64Reg_RAX);
+				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RDI, x64_rbp_mem(ptr_off));
+				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RCX, x64_rbp_mem(len_off));
+				x64_enc_b(&p->asm_, 0xF3); // REP
+				x64_enc_b(&p->asm_, 0xAA); // STOSB
+				x64_emit_pop_r(&p->asm_, X64Reg_RDI);
+				return x64v_none();
+			}
+			// raw_data(x): slice/dyn-array/string → .data ptr (offset 0);
+			// pointer/multipointer/cstring → the value itself (mirrors LLVM).
+			if (be != nullptr && be->kind == Entity_Builtin &&
+			    be->Builtin.id == BuiltinProc_raw_data && ce->args.count >= 1) {
+				Ast  *arg0 = ce->args[0];
+				Type *raw  = x64_typed(arg0->tav.type);
+				Type *at   = base_type(raw);
+				x64Value av = x64_build_expr(p, arg0);
+				bool load_data = at != nullptr &&
+				    (at->kind == Type_Slice || at->kind == Type_DynamicArray ||
+				     (at->kind == Type_Basic &&
+				      (at->Basic.kind == Basic_string || at->Basic.kind == Basic_string16)));
+				if (load_data) {
+					if (av.kind == x64Value_Mem) {
+						x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, av.mem);
+					} else {
+						x64_value_to_reg(p, av, X64Reg_RAX);
+						x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_mem(X64Reg_RAX, 0));
+					}
+					return x64v_reg(x64_typed(tav.type), X64Reg_RAX);
+				}
+				return av; // already a raw pointer (^T / [^]T / cstring)
+			}
+			return x64v_none();
+		}
+
+		// Resolve via entity_of_node, not entity_procedure_of (the latter is only set by
+		// BuiltinProc_procedure_of; null for normal/pkg-qualified calls).
+		Ast    *proc_node  = unparen_expr(ce->proc);
+		Entity *callee_ent = entity_of_node(proc_node);
+
+		Type   *callee_type_raw;
+		String  callee_sym = {};
+		bool    indirect   = false;
+
+		if (callee_ent != nullptr && callee_ent->kind == Entity_Procedure) {
+			// Skip LLVM intrinsics — not real linker symbols (e.g. llvm.sin.f64).
+			if (callee_ent->Procedure.is_foreign) {
+				String fl = callee_ent->Procedure.link_name;
+				if (fl.len >= 5 && gb_strncmp((char const *)fl.text, "llvm.", 5) == 0) {
+					return x64v_none();
+				}
+			}
+			callee_type_raw = callee_ent->type;
+			callee_sym      = x64_get_entity_name(callee_ent);
+
+			// On-demand: a proc nothing depends on (min_dep_count == 0) — a #force_inline
+			// runtime helper (bounds_check_error_loc, …) that LLVM inlines and never emits
+			// standalone. We don't inline, so queue it; the driver compiles it into its owner
+			// module after the parallel pass (exactly one external definition).
+			if (!callee_ent->Procedure.is_foreign &&
+			    callee_ent->min_dep_count.load(std::memory_order_relaxed) == 0) {
+				x64_enqueue_oncall(p, callee_ent);
+			}
+		} else {
+			callee_type_raw = ce->proc->tav.type;
+			indirect = true;
+		}
+
+		Type *ct = base_type(callee_type_raw);
+		if (ct == nullptr || ct->kind != Type_Proc) return x64v_none();
+
+		bool needs_rbp  = x64_returns_by_pointer(callee_type_raw);
+		bool needs_ctx  = ct->Proc.calling_convention == ProcCC_Odin;
+
+		int param_count = ct->Proc.params ? (int)ct->Proc.params->Tuple.variables.count : (int)ce->args.count;
+		// c_vararg can pass MORE args than params; size generously (params + all args).
+		int n_pos_max   = (int)(ce->split_args != nullptr ? ce->split_args->positional.count : ce->args.count);
+		int total_slots = (needs_rbp ? 1 : 0) + param_count + n_pos_max + (needs_ctx ? 1 : 0) + 8;
+		x64Value *args = gb_alloc_array(temporary_allocator(), x64Value, total_slots);
+		int slot = 0;
+
+		// Split returns (mirror LLVM): for N results, results[0..N-2] come back via hidden
+		// pointer args (after the params, before context); result[N-1] is the real return
+		// (sret slot 0 if by-pointer, else RAX/XMM0). Allocate the landing locals + pointer
+		// args up front. Pointers live in memory locals so arg-building (which hammers RAX)
+		// can't clobber them.
+		Type *last_rt   = x64_last_result_type(ct);
+		int   npartial  = x64_num_partial_returns(ct);
+		i32  *partial_off     = (npartial > 0) ? gb_alloc_array(temporary_allocator(), i32, npartial) : nullptr;
+		x64Value *partial_ptr = (npartial > 0) ? gb_alloc_array(temporary_allocator(), x64Value, npartial) : nullptr;
+		for (int i = 0; i < npartial; i++) {
+			Type *pty = ct->Proc.results->Tuple.variables[i]->type;
+			i64 psz = type_size_of(pty); if (psz <= 0) psz = 1;
+			i64 pal = type_align_of(pty); if (pal <= 0) pal = 1;
+			partial_off[i]  = x64_alloc_local(p, psz, pal);
+			i32 pptr_off    = x64_alloc_local(p, 8, 8);
+			x64_emit_lea(&p->asm_, X64Reg_RAX, x64_rbp_mem(partial_off[i]));
+			x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(pptr_off), X64Reg_RAX);
+			partial_ptr[i] = x64v_mem(alloc_type_pointer(pty), x64_rbp_mem(pptr_off));
+		}
+
+		// Hidden return pointer (sret) for the REAL (last) result, in param slot 0.
+		i32 ret_local_off = 0;
+		if (needs_rbp) {
+			ret_local_off = x64_alloc_local(p, type_size_of(last_rt), type_align_of(last_rt));
+			i32 ret_ptr_off = x64_alloc_local(p, 8, 8);
+			x64_emit_lea(&p->asm_, X64Reg_RAX, x64_rbp_mem(ret_local_off));
+			x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(ret_ptr_off), X64Reg_RAX);
+			args[slot++] = x64v_mem(alloc_type_pointer(last_rt), x64_rbp_mem(ret_ptr_off));
+		}
+
+		// Explicit args (mirror lb_build_call_expr_internal): build a PARAMETER-INDEXED value
+		// array from the checker-resolved split_args (positional, then named, then defaults),
+		// then lower each to ABI slots. Handles defaults/named anywhere relative to the
+		// variadic, and never indexes raw ce->args out of bounds.
+		{
+			TypeTuple *params = ct->Proc.params ? &ct->Proc.params->Tuple : nullptr;
+			int   n_params    = params ? (int)params->variables.count : 0;
+			bool  is_c_vararg = ct->Proc.c_vararg;
+			bool  vari_expand = (ce->ellipsis.pos.line != 0); // caller wrote ..slice
+
+			// Odin variadic param `..T`: the caller PACKS the trailing positional args into a
+			// []T backing array + {ptr,len} slice (mirrors lb_build_call_expr_internal). `..any`
+			// elements are each an `any` {data_ptr, typeid}; any other `..T` stores the T value
+			// directly. (c_vararg handled separately below.)
+			bool  has_variadic        = false;
+			int   variadic_index      = ct->Proc.variadic ? (int)ct->Proc.variadic_index : -1;
+			Type *variadic_slice_type = nullptr;
+			Type *variadic_elem_type  = nullptr;
+			if (ct->Proc.variadic && !is_c_vararg && params &&
+			    variadic_index >= 0 && variadic_index < n_params) {
+				Entity *ve = params->variables[variadic_index];
+				Type   *st = base_type(ve->type);
+				if (st && st->kind == Type_Slice) {
+					has_variadic        = true;
+					variadic_slice_type = ve->type;
+					variadic_elem_type  = st->Slice.elem;
+				}
+			}
+
+			// Checker-resolved arg lists (defaults/named already separated). Fall back
+			// to the raw arg list defensively.
+			Slice<Ast *> positional = (ce->split_args != nullptr) ? ce->split_args->positional : ce->args;
+
+			// Parameter-indexed values, each stabilised to memory/imm so a later arg
+			// evaluation (which reuses RAX) can't clobber it. None = not yet filled.
+			x64Value *pvals = gb_alloc_array(temporary_allocator(), x64Value, n_params > 0 ? n_params : 1);
+			for (int i = 0; i < n_params; i++) pvals[i] = x64v_none();
+
+			// C varargs are appended as their own ABI slots after the fixed params.
+			x64Value *cvar = is_c_vararg ? gb_alloc_array(temporary_allocator(), x64Value, positional.count + 1) : nullptr;
+			int cvar_count = 0;
+
+			// Pass 1: positional args (index i == parameter index).
+			for (isize i = 0; i < positional.count; i++) {
+				Ast *arg = positional[i];
+				if (has_variadic && (int)i == variadic_index) {
+					// Pack positional[variadic_index..] into a []T slice value.
+					int vari_count = (int)positional.count - variadic_index;
+					if (vari_count < 0) vari_count = 0;
+					if (vari_expand && vari_count >= 1) {
+						// caller wrote `..slice` — pass the existing slice directly
+						x64Value sv = x64_stabilize_value(p, x64_build_expr(p, positional[variadic_index]));
+						if (sv.type == nullptr) sv.type = variadic_slice_type;
+						pvals[variadic_index] = sv;
+					} else if (vari_count == 0) {
+						i32 slice_off = x64_alloc_local(p, 16, 8);
+						x64_emit_mov_mi(&p->asm_, X64OpSize_64, x64_rbp_mem(slice_off),     0);
+						x64_emit_mov_mi(&p->asm_, X64OpSize_64, x64_rbp_mem(slice_off + 8), 0);
+						pvals[variadic_index] = x64v_mem(variadic_slice_type, x64_rbp_mem(slice_off));
+					} else {
+						// Backing array of `variadic_elem_type[vari_count]`, then a {ptr,len}.
+						Type *et  = x64_typed(variadic_elem_type);
+						i64   esz = type_size_of(et); if (esz <= 0) esz = 1;
+						i64   eal = type_align_of(et); if (eal <= 0) eal = 1;
+						i32 arr_off = x64_alloc_local(p, (i64)vari_count * esz, gb_max(eal, (i64)8));
+						for (int vi = 0; vi < vari_count; vi++) {
+							i32 slot_off = arr_off + vi * (i32)esz;
+							// Each element converts to the variadic elem type (mirrors LLVM
+							// lb_emit_conv to elem): `..any` boxes the value into an {data,typeid}
+							// any (or passes an already-`any` through); `..T` converts to T. The
+							// store does the conversion (x64_store_value → x64_emit_conv).
+							x64Value ev = x64_build_expr(p, positional[variadic_index + vi]);
+							x64_store_value(p, x64addr(x64_rbp_mem(slot_off), et), ev);
+						}
+						i32 slice_off = x64_alloc_local(p, 16, 8);
+						x64_emit_lea(&p->asm_, X64Reg_RAX, x64_rbp_mem(arr_off));
+						x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(slice_off), X64Reg_RAX);
+						x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RAX, (i64)vari_count);
+						x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(slice_off + 8), X64Reg_RAX);
+						pvals[variadic_index] = x64v_mem(variadic_slice_type, x64_rbp_mem(slice_off));
+					}
+					break; // positional beyond variadic_index are consumed here
+				}
+				if (is_c_vararg && ct->Proc.variadic && variadic_index >= 0 && (int)i >= variadic_index) {
+					cvar[cvar_count++] = x64_stabilize_value(p, x64_build_expr(p, arg));
+					continue;
+				}
+				if (arg->tav.mode == Addressing_Type) {
+					// Poly type param ($T) → Entity_TypeName, no runtime slot. A runtime
+					// `typeid` VALUE param instead gets the type's typeid (built below).
+					if (i >= n_params || params->variables[i]->kind == Entity_TypeName) continue;
+				}
+				if (i >= n_params) continue;                    // safety (non-variadic overflow)
+				x64Value av = x64_stabilize_value(p, x64_build_expr(p, arg));
+				if (av.type == nullptr) av.type = params->variables[i]->type;
+				pvals[i] = av;
+			}
+
+			// Pass 2: named args → param-indexed slots.
+			if (ce->split_args != nullptr) {
+				for (isize ni = 0; ni < ce->split_args->named.count; ni++) {
+					Ast *fv_node = ce->split_args->named[ni];
+					if (fv_node->kind != Ast_FieldValue) continue;
+					ast_node(fv, FieldValue, fv_node);
+					if (!fv->field || fv->field->kind != Ast_Ident) continue;
+					isize pidx = lookup_procedure_parameter(ct, fv->field->Ident.token.string);
+					if (pidx < 0 || pidx >= n_params) continue;
+					x64Value av = x64_stabilize_value(p, x64_build_expr(p, fv->value));
+					if (av.type == nullptr) av.type = params->variables[pidx]->type;
+					pvals[pidx] = av;
+				}
+			}
+
+			// Pass 3: fill defaults for params still empty (mirrors LLVM's final loop
+			// over all params at llvm_backend_proc.cpp:5026).
+			for (int i = 0; i < n_params; i++) {
+				Entity *pe = params->variables[i];
+				if (has_variadic && i == variadic_index) {
+					if (pvals[i].kind == x64Value_None) { // empty variadic → nil slice
+						i32 slice_off = x64_alloc_local(p, 16, 8);
+						x64_emit_mov_mi(&p->asm_, X64OpSize_64, x64_rbp_mem(slice_off),     0);
+						x64_emit_mov_mi(&p->asm_, X64OpSize_64, x64_rbp_mem(slice_off + 8), 0);
+						pvals[i] = x64v_mem(variadic_slice_type, x64_rbp_mem(slice_off));
+					}
+					continue;
+				}
+				if (pe->kind != Entity_Variable) continue;
+				if (pvals[i].kind != x64Value_None) continue; // already positional/named
+				x64Value dv = x64v_none();
+				if (pe->Variable.param_value.kind != ParameterValue_Invalid) {
+					dv = x64_handle_param_value(p, pe->type, pe->Variable.param_value);
+				}
+				if (dv.kind == x64Value_None || dv.type == nullptr) {
+					dv = x64v_imm(pe->type ? pe->type : t_int, 0);
+				}
+				if (dv.type == nullptr) dv.type = pe->type;
+				pvals[i] = x64_stabilize_value(p, dv);
+			}
+
+			// Lower each parameter value to ABI slots in parameter order. Zero-sized
+			// params consume no slot; Win64 indirect aggregates are passed by pointer.
+			for (int i = 0; i < n_params; i++) {
+				Entity *pe = params->variables[i];
+				if (pe->kind == Entity_TypeName) continue;              // no runtime slot
+				Type *pt2 = pe->type;
+				if (pt2 != nullptr && type_size_of(pt2) == 0) continue; // zero-sized
+				x64Value v = pvals[i];
+				if (v.kind == x64Value_None) v = x64v_imm(pt2 ? pt2 : t_int, 0);
+				if (v.type == nullptr) v.type = pt2;
+				// `using`-field subtype: a Temp_Allocator passed where Allocator is wanted
+				// narrows to the embedded `allocator` field (mirrors lb_emit_conv subtype path).
+				v = x64_apply_using_subtype(p, v, pt2);
+				if (x64_arg_is_indirect(pt2)) {
+					if (v.kind != x64Value_Mem) {
+						i64 asz = type_size_of(pt2); if (asz <= 0) asz = 8;
+						i64 aal = type_align_of(pt2); if (aal <= 0) aal = 8;
+						i32 tmp = x64_alloc_local(p, asz, aal);
+						x64_zero_mem(p, x64_rbp_mem(tmp), asz); // covers imm/None defaults
+						v = x64v_mem(pt2, x64_rbp_mem(tmp));
+					}
+					i32 ptr = x64_alloc_local(p, 8, 8);
+					x64_emit_lea(&p->asm_, X64Reg_RAX, v.mem);
+					x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(ptr), X64Reg_RAX);
+					args[slot++] = x64v_mem(alloc_type_pointer(pt2), x64_rbp_mem(ptr));
+				} else {
+					args[slot++] = v;
+				}
+			}
+
+			// C varargs follow the fixed parameters as their own slots.
+			for (int i = 0; i < cvar_count; i++) args[slot++] = cvar[i];
+
+		}
+
+		// Split-return hidden pointers for results[0..N-2] — after params, before context
+		// (mirrors LLVM's arg order: [sret][params][partial-rets][context]).
+		for (int i = 0; i < npartial; i++) args[slot++] = partial_ptr[i];
+
+		// Context — keep as memory ref so x64_emit_call loads it fresh (arg-building
+		// above clobbers RAX, so we can't snapshot it here).
+		if (needs_ctx) {
+			args[slot++] = x64_context_ptr_value(p);
+		}
+
+		if (!indirect) {
+			x64Value rv = x64_emit_call(p, callee_sym, callee_type_raw, args, slot);
+
+			// Capture/assemble the result NOW, before the deferred-procedure block below
+			// (which allocates locals and clobbers RAX) can destroy a register result.
+			x64Value call_result = x64_reconstruct_call_result(p, ct, npartial, last_rt, needs_rbp, ret_local_off, partial_off, rv);
+
+			// @(deferred_*): register a deferred call at scope exit (mirrors lb_emit_call).
+			// `in` passes the call's INPUTS, `out` its RESULTS, `in_out` both; `*_by_ptr` passes
+			// each by address. Covers sync.guard (in) and TEMP_ALLOCATOR_GUARD's arena reset (out).
+			if (callee_ent != nullptr && entity_has_deferred_procedure(callee_ent)) {
+				DeferredProcedureKind dk = callee_ent->Procedure.deferred_procedure.kind;
+				Entity *dproc = callee_ent->Procedure.deferred_procedure.entity;
+				if (dproc != nullptr && dk != DeferredProcedure_none) {
+					bool by_ptr   = dk == DeferredProcedure_in_by_ptr || dk == DeferredProcedure_out_by_ptr || dk == DeferredProcedure_in_out_by_ptr;
+					bool want_in  = dk == DeferredProcedure_in  || dk == DeferredProcedure_in_by_ptr  || dk == DeferredProcedure_in_out || dk == DeferredProcedure_in_out_by_ptr;
+					bool want_out = dk == DeferredProcedure_out || dk == DeferredProcedure_out_by_ptr || dk == DeferredProcedure_in_out || dk == DeferredProcedure_in_out_by_ptr;
+					Type *dct  = base_type(dproc->type);
+					bool  dctx = dct != nullptr && dct->kind == Type_Proc && dct->Proc.calling_convention == ProcCC_Odin;
+
+					int first_explicit = needs_rbp ? 1 : 0;
+					int last_explicit  = slot - (needs_ctx ? 1 : 0);
+					int in_count  = want_in ? gb_max(last_explicit - first_explicit, 0) : 0;
+					int rcount    = (want_out && ct->Proc.results != nullptr) ? (int)ct->Proc.results->Tuple.variables.count : 0;
+					x64Value *dargs = gb_alloc_array(permanent_allocator(), x64Value, in_count + rcount + 1);
+					int di = 0;
+
+					// Inputs: the explicit ABI arg slots (already lowered; deferred_in's params
+					// match the callee's). Spill so they survive to scope exit.
+					if (want_in) {
+						for (int ai = first_explicit; ai < last_explicit; ai++) {
+							Type *at = args[ai].type ? args[ai].type : t_rawptr;
+							x64Value sv = x64_spill_value(p, args[ai], at);
+							if (by_ptr) {
+								i32 poff = x64_alloc_local(p, 8, 8);
+								x64_emit_lea(&p->asm_, X64Reg_RAX, sv.mem);
+								x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(poff), X64Reg_RAX);
+								sv = x64v_mem(alloc_type_pointer(at), x64_rbp_mem(poff));
+							}
+							dargs[di++] = sv;
+						}
+					}
+					// Outputs: the call's result field(s), ABI-lowered against the result type
+					// (large aggregates → by pointer; `*_by_ptr` forces a pointer).
+					for (int ri = 0; ri < rcount; ri++) {
+						Type *rt = ct->Proc.results->Tuple.variables[ri]->type;
+						x64Value rv = call_result;
+						if (rcount > 1) { X64Mem m = call_result.mem; m.disp += (i32)type_offset_of(ct->Proc.results, ri); rv = x64v_mem(rt, m); }
+						x64Value sv = x64_spill_value(p, rv, rt);
+						if (by_ptr || x64_arg_is_indirect(rt)) {
+							i32 poff = x64_alloc_local(p, 8, 8);
+							x64_emit_lea(&p->asm_, X64Reg_RAX, sv.mem);
+							x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(poff), X64Reg_RAX);
+							sv = x64v_mem(alloc_type_pointer(rt), x64_rbp_mem(poff));
+						}
+						dargs[di++] = sv;
+					}
+					if (dctx) dargs[di++] = x64_context_ptr_value(p);
+
+					x64Procedure::DeferEntry de = {};
+					de.call_proc = dproc;
+					de.call_type = dproc->type;
+					de.call_args = dargs;
+					de.call_argc = di;
+					array_add(&p->deferred, de);
+				}
+			}
+
+			return call_result;
+		}
+
+		// Indirect call: load callee into R10, then set up args
+		x64Value proc_v = x64_build_expr(p, ce->proc);
+		x64_value_to_reg(p, proc_v, X64Reg_R10);
+
+		// Place args (re-use the same logic as direct call, minus CALL sym)
+		int reg_count = gb_min(slot, 4);
+		for (int i = reg_count - 1; i >= 0; i--) {
+			if (x64_arg_is_float(args[i].type)) x64_value_to_xmm(p, args[i], X64_XMM_ARG_REGS[i]);
+			else                                 x64_value_to_reg (p, args[i], X64_INT_ARG_REGS[i]);
+		}
+		for (int i = 4; i < slot; i++) {
+			x64_value_to_reg(p, args[i], X64Reg_RAX);
+			x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_mem(X64Reg_RSP, 32 + (i-4)*8), X64Reg_RAX);
+		}
+		x64_emit_call_r(&p->asm_, X64Reg_R10);
+
+		// Single-value register result (multi/sret handled inside reconstruct_call_result).
+		x64Value ind_rv = x64v_none();
+		if (!needs_rbp && ct->Proc.result_count == 1) {
+			Type *ret_t = ct->Proc.results->Tuple.variables[0]->type;
+			if (ret_t && type_size_of(ret_t) != 0) {
+				ind_rv = x64_is_float(ret_t) ? x64v_xmm(ret_t, X64XmmReg_XMM0)
+				                             : x64v_reg(ret_t, X64Reg_RAX);
+			}
+		}
+		return x64_reconstruct_call_result(p, ct, npartial, last_rt, needs_rbp, ret_local_off, partial_off, ind_rv);
 }

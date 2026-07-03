@@ -34,8 +34,11 @@ gb_internal X64OpSize x64_op_size_of(Type *t) {
 
 gb_internal bool x64_is_float(Type *t) {
 	t = base_type(t);
-	return t->kind == Type_Basic &&
-	       (t->Basic.flags & (BasicFlag_Float | BasicFlag_Complex)) != 0;
+	// ONLY true scalar floats (f16/f32/f64) — NOT complex. complex is a 2-float AGGREGATE; including
+	// BasicFlag_Complex here made x64_store_value/x64_load_addr treat a 16-byte complex128 as a
+	// scalar and copy it with a single movss/movsd (4/8 bytes) → truncated/garbage. quaternion was
+	// never affected (BasicFlag_Quaternion, not Complex). Complex arith/ABI must use the aggregate path.
+	return t->kind == Type_Basic && (t->Basic.flags & BasicFlag_Float) != 0;
 }
 
 gb_internal bool x64_is_double(Type *t) {
@@ -222,46 +225,86 @@ gb_internal void x64_copy_fixed(x64Procedure *p, X64Mem dst, X64Mem src, i64 siz
 	}
 }
 
+// Construct a union value at `dst` from a variant value `src` whose type is one of `union_type`'s
+// variants: zero the union, store the variant value at offset 0, set the discriminant tag. Mirrors
+// lb_emit_store_union_variant (+_tag). A variant SMALLER than variant_block_size (e.g. the 1-byte
+// Allocator_Error in 8-byte os.Error) needs the zero so stale high bytes/tag don't make a nil
+// variant read non-nil. #shared_nil: tag MUST be 0 when the value is nil (else `== nil`/or_return
+// read a non-nil tag). The caller has already converted `src` to the chosen variant type.
+gb_internal void x64_store_union_variant(x64Procedure *p, X64Mem dst, x64Value src, Type *union_type) {
+	X64Assembler *a   = &p->asm_;
+	Type         *ubt = base_type(union_type);
+	i64           usz = x64_type_size(union_type);
+	if (usz == 0) return;
+	x64_zero_mem(p, dst, usz);
+	if (src.type != nullptr && type_size_of(src.type) != 0) {
+		x64_store_value(p, x64addr(dst, src.type), src); // value @ offset 0
+	}
+	if (is_type_union_maybe_pointer(ubt) || src.type == nullptr) return;
+	i64 tag_off = (i64)ubt->Union.variant_block_size;
+	i64 tag_sz  = union_tag_size(ubt);
+	i64 tag_val = union_variant_index_checked(ubt, src.type);
+	X64OpSize tsz2 = tag_sz <= 1 ? X64OpSize_8 :
+	                 tag_sz == 2 ? X64OpSize_16 :
+	                 tag_sz == 4 ? X64OpSize_32 : X64OpSize_64;
+	X64Mem tagm = dst; tagm.disp += (i32)tag_off;
+	i64 vsz = type_size_of(src.type);
+	if (ubt->Union.kind == UnionType_shared_nil && vsz > 0 && vsz <= 8) {
+		// tag = (value@0 == 0) ? 0 : tag_val
+		X64OpSize vosz = x64_op_size_of(src.type);
+		x64_emit_mov_rm(a, vosz, X64Reg_RAX, dst);             // value@0
+		x64_emit_mov_ri(a, X64OpSize_64, X64Reg_RCX, tag_val); // mov: no flags
+		x64_emit_mov_ri(a, X64OpSize_64, X64Reg_RDX, 0);       // mov (NOT xor) — keep ZF
+		x64_emit_test_rr(a, vosz, X64Reg_RAX, X64Reg_RAX);     // ZF = (value == 0)
+		x64_emit_cmov_rr(a, X64Cc_E, X64OpSize_64, X64Reg_RCX, X64Reg_RDX);
+		x64_emit_mov_mr(a, tsz2, tagm, X64Reg_RCX);
+	} else {
+		x64_emit_mov_mi(a, tsz2, tagm, (i32)tag_val);
+	}
+}
+
+// Box `src` (of type `src_type`) into an `any` {data: rawptr @0, id: typeid @8} at `dst`: spill the
+// value to a local, point data at it, set id = typeid(default_type(src_type)). The to-`any` case of
+// lb_emit_conv (used by x64_emit_conv and the variadic `..any` arg packing).
+gb_internal void x64_box_any(x64Procedure *p, X64Mem dst, x64Value src, Type *src_type) {
+	X64Assembler *a  = &p->asm_;
+	Type *at = (src_type != nullptr) ? default_type(src_type) : t_any;
+	at = x64_typed(at);
+	i64 asz = type_size_of(at); if (asz <= 0) asz = 1;
+	i64 aal = type_align_of(at); if (aal <= 0) aal = 1;
+	i32 val_off = x64_alloc_local(p, asz, aal);
+	x64_store_value(p, x64addr(x64_rbp_mem(val_off), at), src);
+	x64_emit_lea(a, X64Reg_RAX, x64_rbp_mem(val_off));
+	x64_emit_mov_mr(a, X64OpSize_64, dst, X64Reg_RAX);          // data @0
+	X64Mem idm = dst; idm.disp += 8;
+	x64_emit_mov_ri(a, X64OpSize_64, X64Reg_RAX, (i64)type_hash_canonical_type(at));
+	x64_emit_mov_mr(a, X64OpSize_64, idm, X64Reg_RAX);          // id @8
+}
+
 gb_internal void x64_store_value(x64Procedure *p, x64Addr dst, x64Value src) {
 	X64Assembler *a  = &p->asm_;
 	Type         *t  = dst.type;
 	if (t != nullptr && x64_type_size(t) == 0) return; // zero-sized: nothing to store
-	X64OpSize     sz = x64_op_size_of(t);
 
-	// Variant → union construction (mirrors lb_emit_store_union_variant/_tag): store the
-	// variant value at offset 0 and set the discriminant tag. Without this a union built
-	// from a variant (`u = TA_Big{...}` / `u = 42`) carries tag 0, so every `x.(T)` and
-	// type switch misses. Gated on union_is_variant_of so plain union→union copies and nil
-	// stores fall to the normal path below.
-	Type *dbt = t ? base_type(t) : nullptr;
-	if (dbt != nullptr && dbt->kind == Type_Union && src.type != nullptr) {
-		Type *sbt = base_type(src.type);
-		bool src_is_same_union = sbt != nullptr && sbt->kind == Type_Union &&
-		                         are_types_identical(t, src.type);
-		if (!src_is_same_union && union_is_variant_of(dbt, src.type)) {
-			if (type_size_of(src.type) == 0) {
-				x64_zero_mem(p, dst.mem, (i64)dbt->Union.variant_block_size);
-			} else {
-				x64_store_value(p, x64addr(dst.mem, src.type), src); // value @ offset 0
-			}
-			if (!is_type_union_maybe_pointer(dbt) && type_size_of(t) != 0) {
-				i64 tag_off = (i64)dbt->Union.variant_block_size;
-				i64 tag_sz  = union_tag_size(dbt);
-				i64 tag_val = union_variant_index_checked(dbt, src.type);
-				X64OpSize tsz2 = tag_sz <= 1 ? X64OpSize_8 :
-				                 tag_sz == 2 ? X64OpSize_16 :
-				                 tag_sz == 4 ? X64OpSize_32 : X64OpSize_64;
-				X64Mem tagm = dst.mem; tagm.disp += (i32)tag_off;
-				x64_emit_mov_mi(a, tsz2, tagm, (i32)tag_val);
-			}
-			return;
-		}
+	// Convert src to the destination type FIRST, then store (mirrors lb_addr_store → lb_emit_conv
+	// → lb_emit_store). All conversion lives in x64_emit_conv; this is then a dumb store. No-op
+	// when the types already match (the common case).
+	if (src.kind != x64Value_None && src.type != nullptr && t != nullptr &&
+	    !are_types_identical(src.type, t)) {
+		src = x64_emit_conv(p, src, src.type, t);
 	}
 
+	X64OpSize sz = x64_op_size_of(t);
 	switch (src.kind) {
 	case x64Value_Imm: {
 		i64 v = src.imm;
-		if (sz == X64OpSize_64 && (v < 0 || v > 0x7fffffffLL)) {
+		// An Imm into an AGGREGATE dst (>8 bytes) only happens for a nil/zero store (e.g.
+		// `u = nil` on a union, `s = nil` on a slice/map/dynarray) where untyped nil built to an
+		// 8-byte 0. An 8-byte mov would leave the rest STALE — e.g. a union's tag (after the
+		// variant block) keeping its previous variant → `== nil` reads non-nil. Zero it fully.
+		if (x64_type_size(t) > 8) {
+			x64_zero_mem(p, dst.mem, x64_type_size(t));
+		} else if (sz == X64OpSize_64 && (v < 0 || v > 0x7fffffffLL)) {
 			// Need full 64-bit: load into RAX then store
 			x64_emit_mov_ri(a, X64OpSize_64, X64Reg_RAX, v);
 			x64_emit_mov_mr(a, X64OpSize_64, dst.mem, X64Reg_RAX);

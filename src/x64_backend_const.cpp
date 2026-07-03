@@ -224,9 +224,12 @@ gb_internal void x64_const_value(x64Module *m, CoffSection *sec, u32 off, Type *
 			coff_reloc_add(sec, off, x64_const_intern_string(m, s), COFF_REL_ADDR64);
 			return;
 		}
-		// `string` is {data, len}; data via ADDR64 reloc to interned bytes.
+		// string / []T are {data, len}; data via ADDR64 reloc to interned bytes. For a non-u8
+		// slice (#load to []u32 etc.) len is the ELEMENT count = bytes / elem size (mirrors
+		// lb_find_or_add_entity_string_byte_slice_with_type).
 		if (s.len > 0) coff_reloc_add(sec, off, x64_const_intern_string(m, s), COFF_REL_ADDR64);
 		i64 len = s.len;
+		if (is_type_slice(bt)) { i64 esz = type_size_of(bt->Slice.elem); if (esz > 1) len /= esz; }
 		x64_const_patch(sec, off + 8, &len, 8);
 		return;
 	}
@@ -342,18 +345,31 @@ gb_internal void x64_const_value(x64Module *m, CoffSection *sec, u32 off, Type *
 					if (elem == nullptr || elem->kind != Ast_FieldValue) continue;
 					Ast *idx = elem->FieldValue.field;
 					if (idx == nullptr) continue;
-					TypeAndValue itav = type_and_value_of_expr(idx);
-					if (itav.value.kind != ExactValue_Integer) continue;
-					i64 i = big_int_to_i64(&itav.value.value_integer);
-					// Enumerated-array keys are enum VALUES; the storage index is the
-					// ordinal = value - min_value (matches the index path).
-					if (bt->kind == Type_EnumeratedArray && bt->EnumeratedArray.min_value) {
-						i -= exact_value_to_i64(*bt->EnumeratedArray.min_value);
+					// Key is a single integer (`0x80 = v`) or a RANGE (`lo..=hi = v` / `lo..<hi = v`,
+					// e.g. utf8.accept_sizes); ranges fill [lo, hi) (mirrors lb_const_value).
+					i64 lo, hi;
+					if (is_ast_range(idx)) {
+						ast_node(ie, BinaryExpr, idx);
+						lo = exact_value_to_i64(ie->left->tav.value);
+						hi = exact_value_to_i64(ie->right->tav.value);
+						if (ie->op.kind != Token_RangeHalf) hi += 1; // inclusive ..=
+					} else {
+						TypeAndValue itav = type_and_value_of_expr(idx);
+						if (itav.value.kind != ExactValue_Integer) continue;
+						lo = big_int_to_i64(&itav.value.value_integer);
+						hi = lo + 1;
 					}
-					if (i < 0 || i >= ecount) continue;
+					// Enumerated-array keys are enum VALUES; storage index = value - min.
+					if (bt->kind == Type_EnumeratedArray && bt->EnumeratedArray.min_value) {
+						i64 mn = exact_value_to_i64(*bt->EnumeratedArray.min_value);
+						lo -= mn; hi -= mn;
+					}
 					Type *evt = nullptr;
 					ExactValue ev = x64_const_elem_value(elem, &evt);
-					x64_const_value(m, sec, off + (u32)(i*esz), et, ev, evt);
+					for (i64 i = lo; i < hi; i++) {
+						if (i < 0 || i >= ecount) continue;
+						x64_const_value(m, sec, off + (u32)(i*esz), et, ev, evt);
+					}
 				}
 			} else {
 				isize n = gb_min((isize)cl->elems.count, (isize)ecount);

@@ -1093,3 +1093,9 @@ gb_internal void x64_emit_lock_xchg_mr(X64Assembler *a, X64OpSize sz, X64Mem dst
 gb_internal void x64_emit_mfence(X64Assembler *a) { x64_enc_b(a, 0x0Fu); x64_enc_b(a, 0xAEu); x64_enc_b(a, 0xF0u); }
 gb_internal void x64_emit_sfence(X64Assembler *a) { x64_enc_b(a, 0x0Fu); x64_enc_b(a, 0xAEu); x64_enc_b(a, 0xF8u); }
 gb_internal void x64_emit_lfence(X64Assembler *a) { x64_enc_b(a, 0x0Fu); x64_enc_b(a, 0xAEu); x64_enc_b(a, 0xE8u); }
+
+gb_internal void x64_emit_pause (X64Assembler *a) { x64_enc_b(a, 0xF3u); x64_enc_b(a, 0x90u); }                    // cpu_relax
+gb_internal void x64_emit_ud2   (X64Assembler *a) { x64_enc_b(a, 0x0Fu); x64_enc_b(a, 0x0Bu); }                    // trap
+gb_internal void x64_emit_rdtsc (X64Assembler *a) { x64_enc_b(a, 0x0Fu); x64_enc_b(a, 0x31u); }                    // EDX:EAX = TSC
+gb_internal void x64_emit_cpuid (X64Assembler *a) { x64_enc_b(a, 0x0Fu); x64_enc_b(a, 0xA2u); }                    // leaf EAX, sub ECX
+gb_internal void x64_emit_xgetbv(X64Assembler *a) { x64_enc_b(a, 0x0Fu); x64_enc_b(a, 0x01u); x64_enc_b(a, 0xD0u); } // EDX:EAX = XCR[ECX]
