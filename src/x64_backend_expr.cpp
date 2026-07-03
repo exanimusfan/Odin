@@ -679,6 +679,59 @@ gb_internal x64Value x64_spill_value(x64Procedure *p, x64Value v, Type *t) {
 	return x64v_mem(t, x64_rbp_mem(off));
 }
 
+// A register-width value that survives a later register-clobbering sub-build with NO memory
+// round-trip: an immediate (a constant) or a value already at a fixed RBP frame slot. Such a
+// value doesn't need x64_spill_value's snapshot-to-temp — the arith/comp emitter loads it into a
+// register on demand. Aggregates (>8B, odd-width) keep the snapshot; only reg-width scalars qualify.
+gb_internal bool x64_value_is_stable(x64Value v) {
+	if (v.kind == x64Value_Imm) return true;
+	if (v.kind == x64Value_Mem && v.mem.base == X64Reg_RBP && v.mem.index == X64Reg_NONE && !v.mem.rip_rel) {
+		i64 sz = v.type ? x64_type_size(v.type) : 8;
+		return sz == 1 || sz == 2 || sz == 4 || sz == 8;
+	}
+	return false;
+}
+
+// Conservative purity test: true only when evaluating `e` cannot write memory or emit a call, so a
+// stable operand built BEFORE it stays valid without snapshotting. Only definitely-call-free node
+// kinds qualify — a BinaryExpr is excluded because string/complex/i128 ops lower to runtime calls,
+// and Index/Selector because of map lookups / bounds-check panics. Anything else → false → spill.
+gb_internal bool x64_expr_side_effect_free(Ast *e) {
+	if (e == nullptr) return true;
+	e = unparen_expr(e);
+	if (e == nullptr) return true;
+	switch (e->kind) {
+	case Ast_Ident:                return true;
+	case Ast_BasicLit:             return true;
+	case Ast_ImplicitSelectorExpr: return true;
+	case Ast_UnaryExpr:            return x64_expr_side_effect_free(e->UnaryExpr.expr);
+	}
+	return false;
+}
+
+// Build a binary-expression operand. For a bare register-width scalar local/param read, return its
+// RBP memory operand directly (deferred load) so it's a stable operand needing no spill — the
+// arith emitter loads it on demand. Everything else builds normally (into a register/temp).
+gb_internal x64Value x64_build_binop_operand(x64Procedure *p, Ast *e, Type *t) {
+	Ast *u = unparen_expr(e);
+	if (u != nullptr && u->kind == Ast_Ident && t != nullptr && x64_is_scalar(t) && !x64_is_float(t)) {
+		i64 sz = x64_type_size(t);
+		if (sz == 1 || sz == 2 || sz == 4 || sz == 8) {
+			Entity *ent = entity_from_expr(u);
+			if (ent != nullptr && ent->kind == Entity_Variable && !(ent->flags & EntityFlag_Using) &&
+			    x64_entity_is_local(p, ent)) {
+				bool indirect = false;
+				for (isize k = 0; k < p->indirect_params.count; k++) if (p->indirect_params[k] == ent) { indirect = true; break; }
+				if (!indirect) {
+					i32 *off = x64_var_get(&p->var_offsets, ent);
+					if (off != nullptr) return x64v_mem(t, x64_rbp_mem(*off));
+				}
+			}
+		}
+	}
+	return x64_build_expr(p, e);
+}
+
 // Byte offset of the `len` field in a fixed-capacity dynamic array `[dynamic; N]E`. Layout is
 // {data: [N]E @0, len: int} (runtime.Raw_Fixed_Capacity_Dynamic_Array): len sits right AFTER the
 // data array, at align_up(N*size_of(E), align_of(int)). NOT type_size-8 — when E is over-aligned the
@@ -6960,15 +7013,23 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 			}
 		}
 
-		// Generic binary op: build BOTH operands (spilled, so they're stable), then dispatch to
-		// x64_emit_comp (string/aggregate/float/int comparisons) or x64_emit_arith. The special
-		// cases above (&&/||, in/not_in, x==nil) returned already. Mirrors lb_build_expr's
-		// BinaryExpr -> lb_emit_arith / lb_emit_comp.
-		x64Value lhs = x64_spill_value(p, x64_build_expr(p, be->left), ltype);
-		x64Value rhs = x64_spill_value(p, x64_build_expr(p, be->right), x64_typed(be->right->tav.type));
+		// Generic binary op: build BOTH operands, then dispatch to x64_emit_comp or x64_emit_arith
+		// (which load the operands into registers themselves). The special cases above returned.
+		Type *rtype = x64_typed(be->right->tav.type);
 		bool is_cmp = op == Token_CmpEq || op == Token_NotEq || op == Token_Lt ||
 		              op == Token_Gt    || op == Token_LtEq  || op == Token_GtEq;
-		if (is_cmp) return x64_emit_comp(p, op, lhs, rhs);
+		if (is_cmp) {
+			x64Value lhs = x64_spill_value(p, x64_build_expr(p, be->left), ltype);
+			x64Value rhs = x64_spill_value(p, x64_build_expr(p, be->right), rtype);
+			return x64_emit_comp(p, op, lhs, rhs);
+		}
+		// Arith: spill only what needs a snapshot. A stable operand (immediate / RBP slot) survives
+		// register-clobbering sub-builds, so the emitter reads it directly. The LEFT operand still
+		// needs a snapshot if building the RIGHT could write memory that aliases it (a call).
+		x64Value lhs = x64_build_binop_operand(p, be->left, ltype);
+		if (!x64_value_is_stable(lhs) || !x64_expr_side_effect_free(be->right)) lhs = x64_spill_value(p, lhs, ltype);
+		x64Value rhs = x64_build_binop_operand(p, be->right, rtype);
+		if (!x64_value_is_stable(rhs)) rhs = x64_spill_value(p, rhs, rtype);
 		return x64_emit_arith(p, op, lhs, rhs, result_type);
 	} case_end;
 
