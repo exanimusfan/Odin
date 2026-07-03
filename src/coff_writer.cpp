@@ -168,7 +168,7 @@ gb_internal u32 coff_sym_add_section(CoffWriter *cw, i16 section_number, CoffSec
 	e.storage_class  = COFF_SYM_CLASS_STATIC;
 	e.has_aux_section   = true;
 	e.aux_section_length = cast(u32)sec->data.count; // updated during emit
-	e.aux_num_relocs     = cast(u16)sec->relocs.count;
+	e.aux_num_relocs     = cast(u16)gb_min(sec->relocs.count, cast(isize)0xFFFF);
 	array_add(&cw->syms, e);
 
 	if (sec) sec->sym_idx = idx;
@@ -277,7 +277,7 @@ gb_internal Array<u8> coff_writer_to_bytes(CoffWriter *cw) {
 			CoffSymEntry *se = &cw->syms[sec->sym_idx];
 			if (se->has_aux_section) {
 				se->aux_section_length = cast(u32)sec->data.count;
-				se->aux_num_relocs     = cast(u16)sec->relocs.count;
+				se->aux_num_relocs     = cast(u16)gb_min(sec->relocs.count, cast(isize)0xFFFF);
 			}
 		}
 	}
@@ -308,7 +308,10 @@ gb_internal Array<u8> coff_writer_to_bytes(CoffWriter *cw) {
 	for (u32 si = 0; si < cast(u32)cw->sections.count; si++) {
 		CoffSection *sec = cw->sections[si];
 		sec_reloc_offsets[si] = (sec->relocs.count > 0) ? cur : 0u;
-		cur += cast(u32)sec->relocs.count * cast(u32)sizeof(CoffReloc);
+		// >0xFFFF relocations use the IMAGE_SCN_LNK_NRELOC_OVFL protocol: a leading
+		// sentinel reloc carries the real count, so reserve one extra slot for it.
+		isize nrel = sec->relocs.count + (sec->relocs.count > 0xFFFF ? 1 : 0);
+		cur += cast(u32)nrel * cast(u32)sizeof(CoffReloc);
 	}
 
 	u32 offset_symtable = cur;
@@ -342,9 +345,18 @@ gb_internal Array<u8> coff_writer_to_bytes(CoffWriter *cw) {
 		sh.ptr_raw_data    = sec_data_offsets[si];
 		sh.ptr_relocs      = sec_reloc_offsets[si];
 		sh.ptr_line_numbers = 0;
-		sh.num_relocs      = cast(u16)gb_min(sec->relocs.count, cast(isize)0xFFFF);
 		sh.num_line_numbers = 0;
-		sh.characteristics  = sec->characteristics;
+		// COFF's NumberOfRelocations is u16. For >0xFFFF relocs, set it to the 0xFFFF
+		// marker + IMAGE_SCN_LNK_NRELOC_OVFL and store the real count in a sentinel
+		// first relocation (written below). Without this the linker silently drops the
+		// overflow relocations → unrelocated pointers (the RegisterClassW/win.L bug).
+		if (sec->relocs.count > 0xFFFF) {
+			sh.num_relocs      = 0xFFFF;
+			sh.characteristics = sec->characteristics | 0x01000000u; // IMAGE_SCN_LNK_NRELOC_OVFL
+		} else {
+			sh.num_relocs      = cast(u16)sec->relocs.count;
+			sh.characteristics = sec->characteristics;
+		}
 		coff_buf_bytes(&out, &sh, sizeof(sh));
 	}
 
@@ -372,6 +384,15 @@ gb_internal Array<u8> coff_writer_to_bytes(CoffWriter *cw) {
 	// Section relocations
 	for_array(si, cw->sections) {
 		CoffSection *sec = cw->sections[si];
+		if (sec->relocs.count > 0xFFFF) {
+			// IMAGE_SCN_LNK_NRELOC_OVFL sentinel: VirtualAddress = real count (including
+			// this entry); SymbolTableIndex/Type are ignored by the linker.
+			CoffReloc cr = {};
+			cr.virtual_address = cast(u32)(sec->relocs.count + 1);
+			cr.sym_table_idx   = 0;
+			cr.type            = 0; // IMAGE_REL_AMD64_ABSOLUTE
+			coff_buf_bytes(&out, &cr, sizeof(cr));
+		}
 		for_array(ri, sec->relocs) {
 			CoffSectionReloc const &r = sec->relocs[ri];
 			CoffReloc cr = {};

@@ -63,9 +63,14 @@ gb_internal void x64_const_int_bytes(Type *type, BigInt const *a, u8 *out, isize
 		mp_incr(&val);
 	}
 
-	u64 rop64[4] = {}; // 32 bytes — covers up to i256
-	u8 *rop = cast(u8 *)rop64;
-	GB_ASSERT(gb_size_of(rop64) >= sz);
+	// Buffer sized to the type (arbitrary width — mirrors lb_big_int_to_llvm). Small (≤32B = i256,
+	// i128/u128, etc.) stays on the stack; wider (large bit_sets backed by an int) heap-temp.
+	u64 stack64[4] = {}; // 32 bytes
+	u8 *rop = cast(u8 *)stack64;
+	if (sz_in > (isize)gb_size_of(stack64)) {
+		rop = cast(u8 *)gb_alloc(temporary_allocator(), sz_in);
+		gb_zero_size(rop, sz_in);
+	}
 
 	size_t written = 0;
 	mp_err err = mp_pack(rop, sz, &written, MP_LSB_FIRST, 1, MP_LITTLE_ENDIAN, 0, &val);
@@ -77,7 +82,7 @@ gb_internal void x64_const_int_bytes(Type *type, BigInt const *a, u8 *out, isize
 		}
 	}
 	if (big_int_is_neg(a)) {
-		for (size_t i = 0; i < sizeof rop64; i++) rop[i] = ~rop[i];
+		for (size_t i = 0; i < sz; i++) rop[i] = ~rop[i];
 	}
 	gb_memmove(out, rop, sz_in);
 }
@@ -94,7 +99,11 @@ gb_internal String x64_const_intern_string(x64Module *m, String s) {
 	String *cached = string_map_get(&m->const_strings, s);
 	if (cached != nullptr) return *cached;
 
-	coff_section_align(m->rdata, 1);
+	// Align to 2: a `cstring16` (win.L / constant_utf16_cstring) is a u16 array, and Win32 APIs
+	// capture wide strings with a WCHAR (2-byte) ProbeForRead — an odd address raises
+	// STATUS_DATATYPE_MISALIGNMENT kernel-side → ERROR_NOACCESS (998). 1-byte packing let wide
+	// string constants land on odd addresses (the chaotic RegisterClassW/CreateWindowExW failures).
+	coff_section_align(m->rdata, 2);
 	u32 boff = (u32)coff_section_len(m->rdata);
 	if (s.len > 0) coff_section_write(m->rdata, s.text, s.len);
 	coff_section_write_u8(m->rdata, 0); // NUL (harmless for `string`, required for `cstring`)
@@ -165,6 +174,42 @@ gb_internal void x64_const_value(x64Module *m, CoffSection *sec, u32 off, Type *
 	Type *bt = core_type(type);
 	i64 sz = type_size_of(type);
 	if (sz <= 0) return;
+
+	// static `any = <const>` (e.g. `@(static) v: any = 3`): box the value into a hidden .data
+	// global, then write any{data → it @0, id @8}. Without this the int bytes were written raw
+	// into the 16-byte any slot → id=0 → every `v.(T)` missed. Mirrors x64_box_any for statics.
+	if (is_type_any(bt) && value.kind != ExactValue_Invalid) {
+		Type *vt = nullptr;
+		if (value_type != nullptr && !is_type_untyped(value_type) && !is_type_any(base_type(value_type))) {
+			vt = default_type(value_type);
+		}
+		if (vt == nullptr) {
+			switch (value.kind) {
+			case ExactValue_Integer: vt = t_int;    break;
+			case ExactValue_Float:   vt = t_f64;    break;
+			case ExactValue_Bool:    vt = t_bool;   break;
+			case ExactValue_String:  vt = t_string; break;
+			default: break;
+			}
+		}
+		if (vt != nullptr) {
+			i64 vsz = type_size_of(vt); if (vsz <= 0) vsz = 1;
+			i64 val_al = type_align_of(vt); if (val_al <= 0) val_al = 1;
+			u32 voff = x64_const_reserve(m->data, val_al, vsz);
+			x64_const_value(m, m->data, voff, vt, value, value_type);
+			gbString gs = gb_string_make(m->alloc, "__$anybox$");
+			gs = gb_string_append_length(gs, m->pkg->name.text, m->pkg->name.len);
+			if (m->file != nullptr) gs = gb_string_append_fmt(gs, "$%d", (int)m->file->id);
+			gs = gb_string_append_fmt(gs, "$%u", m->gen_global_count++);
+			String vsym = make_string(cast(u8 const *)gs, gb_string_length(gs));
+			x64_const_define_symbol(m, vsym, 3 /*.data*/, voff);
+			coff_reloc_add(sec, off, vsym, COFF_REL_ADDR64);             // any.data @0
+			u64 idh = type_hash_canonical_type(vt);
+			x64_const_patch(sec, off + 8, &idh, 8);                      // any.id @8
+		}
+		return;
+	}
+
 	value = convert_exact_value_for_type(value, type);
 
 	switch (value.kind) {
@@ -183,7 +228,12 @@ gb_internal void x64_const_value(x64Module *m, CoffSection *sec, u32 off, Type *
 			x64_const_patch(sec, off, &v, 8);
 			return;
 		}
-		u8 buf[32] = {};
+		u8 stackbuf[32] = {};
+		u8 *buf = stackbuf;
+		if (sz > (i64)gb_size_of(stackbuf)) {
+			buf = cast(u8 *)gb_alloc(temporary_allocator(), sz);
+			gb_zero_size(buf, sz);
+		}
 		x64_const_int_bytes(type, &value.value_integer, buf, sz);
 		x64_const_patch(sec, off, buf, sz);
 		return;

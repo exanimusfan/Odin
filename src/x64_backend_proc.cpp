@@ -3,6 +3,11 @@
 static const X64Reg    X64_INT_ARG_REGS[4] = { X64Reg_RCX, X64Reg_RDX, X64Reg_R8, X64Reg_R9 };
 static const X64XmmReg X64_XMM_ARG_REGS[4] = { X64XmmReg_XMM0, X64XmmReg_XMM1, X64XmmReg_XMM2, X64XmmReg_XMM3 };
 
+// Indirect-ABI params at or below this size are copied into a frame-local on entry
+// (cheap, lets accesses use a direct RBP slot). Larger ones are accessed through the
+// incoming pointer (no copy) to avoid blowing the stack on huge by-value structs.
+#define X64_INDIRECT_PARAM_COPY_MAX 4096
+
 gb_internal bool x64_arg_is_float(Type *t) { return x64_is_float(t); }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -50,17 +55,48 @@ gb_internal void x64_record_line(x64Procedure *p, Ast *node) {
 	if (p->module->debug_s == nullptr) return; // no line tables outside -debug
 	if (node == nullptr) return;
 	TokenPos pos = ast_token(node).pos;
-	if (pos.line <= 0) return;
-	if (pos.file_id != p->file_id) return; // one source file per proc for now
-	if (pos.line == p->cur_line) return;
-	p->cur_line = pos.line;
+	u32 code_off = (u32)p->asm_.code.count;
+
+	// S_INLINESITE: also record the CALLEE's real line+file for the active inline site (additive
+	// nested-frame info; the binary annotations are built from these).
+	if (p->cur_inline_site >= 0 && pos.line > 0 && pos.file_id > 0) {
+		x64Procedure::InlineSiteRec *sr = &p->inline_sites[p->cur_inline_site];
+		x64Procedure::InlineSiteLine il; il.offset = code_off; il.line = pos.line; il.file_id = pos.file_id;
+		if (sr->lines.count > 0 && sr->lines[sr->lines.count - 1].offset == il.offset) {
+			sr->lines[sr->lines.count - 1] = il; // newest at same offset wins
+		} else if (sr->lines.count == 0 ||
+		           sr->lines[sr->lines.count - 1].line != il.line ||
+		           sr->lines[sr->lines.count - 1].file_id != il.file_id) {
+			array_add(&sr->lines, il);
+		}
+	}
+
+	i32 line = pos.line;
+	i32 fid  = pos.file_id;
+	if (p->inline_frames.count > 0) {
+		// Inlined code → PRIMARY table gets the CALL-SITE line (caller's file) so the enclosing frame
+		// shows where the #force_inline was called; the inline frame's own callee lines come from the
+		// S_INLINESITE annotations recorded above. This pairing (primary=call-site, site=callee) is
+		// what makes the debugger surface a nested inline frame instead of just showing the callee
+		// line in the parent frame.
+		fid  = p->file_id;
+		line = p->inline_call_line;
+	} else {
+		if (fid != p->file_id) return; // non-inlined: one source file per proc (drops generic noise)
+	}
+	if (line <= 0) return;
+	if (line == p->cur_line && fid == p->cur_file_id) return;
+	p->cur_line = line;
+	p->cur_file_id = fid;
 
 	x64Procedure::LineEntry le;
-	le.offset = (u32)p->asm_.code.count;
-	le.line   = (u32)pos.line;
+	le.offset  = code_off;
+	le.line    = (u32)line;
+	le.file_id = fid;
 	if (p->lines.count > 0 && p->lines[p->lines.count - 1].offset == le.offset) {
-		// no code since last marker — newer line wins
-		p->lines[p->lines.count - 1].line = le.line;
+		// no code since last marker — newer entry wins
+		p->lines[p->lines.count - 1].line    = le.line;
+		p->lines[p->lines.count - 1].file_id = le.file_id;
 		return;
 	}
 	array_add(&p->lines, le);
@@ -134,6 +170,9 @@ gb_internal u32 x64_cv_type(x64Module *m, Type *t) {
 		}
 	}
 	if (bt->kind == Type_Proc) return 0x0603u; // void* (no signature modelling)
+	// Enum → its backing integer (e.g. `enum byte` → u8), so the debugger reads the right WIDTH
+	// (not a generic 8-byte blob that pulls in adjacent stack bytes). No enumerator names.
+	if (bt->kind == Type_Enum) return x64_cv_type(m, bt->Enum.base_type);
 
 	u32 *cached = map_get(&m->cv_types, t);
 	if (cached) return *cached;
@@ -201,6 +240,11 @@ gb_internal u32 x64_cv_type(x64Module *m, Type *t) {
 		mem[0].type = t_rawptr; mem[0].off = 0; mem[0].name = str_lit("data");
 		mem[1].type = t_typeid; mem[1].off = 8; mem[1].name = str_lit("id");
 		nmem = 2; tname = str_lit("any");
+	} else if (bt->kind == Type_FixedCapacityDynamicArray) {
+		mem[0].type = alloc_type_array(bt->FixedCapacityDynamicArray.elem, bt->FixedCapacityDynamicArray.capacity);
+		mem[0].off  = 0; mem[0].name = str_lit("data");
+		mem[1].type = t_int; mem[1].off = x64_fca_len_offset(t); mem[1].name = str_lit("len");
+		nmem = 2; tname = str_lit("fixed_capacity_dynamic_array");
 	} else {
 		return 0x0023u; // unmodelled aggregate: show first 8 bytes
 	}
@@ -394,13 +438,20 @@ gb_internal void x64_proc_begin(x64Procedure *p) {
 					i64 esz = x64_type_size(e->type);
 					x64_emit_mov_mr(a, X64OpSize_64, x64_rbp_mem(off), X64_INT_ARG_REGS[s]);
 					if (x64_arg_is_indirect(e->type)) {
-						// Win64: indirect params arrive as a pointer in the reg.
-						// Copy the actual data into a local so entity accesses work directly.
-						i64 eal = type_align_of(e->type);
-						i32 data_off = x64_alloc_local(p, esz, eal);
-						x64_emit_mov_rm(a, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(off));
-						x64_copy_fixed(p, x64_rbp_mem(data_off), x64_mem(X64Reg_RAX, 0), esz);
-						x64_var_set(&p->var_offsets, e, data_off);
+						// Win64: indirect params arrive as a pointer (homed to [off]).
+						if (esz > X64_INDIRECT_PARAM_COPY_MAX) {
+							// Too big to copy onto the stack — keep the pointer slot and
+							// deref through it on access (mirrors LLVM byval-immutable).
+							x64_var_set(&p->var_offsets, e, off);
+							array_add(&p->indirect_params, e);
+						} else {
+							// Small: copy the data into a local so accesses work directly.
+							i64 eal = type_align_of(e->type);
+							i32 data_off = x64_alloc_local(p, esz, eal);
+							x64_emit_mov_rm(a, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(off));
+							x64_copy_fixed(p, x64_rbp_mem(data_off), x64_mem(X64Reg_RAX, 0), esz);
+							x64_var_set(&p->var_offsets, e, data_off);
+						}
 					} else {
 						x64_var_set(&p->var_offsets, e, off);
 					}
@@ -410,12 +461,19 @@ gb_internal void x64_proc_begin(x64Procedure *p) {
 				i64 esz = x64_type_size(e->type);
 				if (x64_arg_is_indirect(e->type)) {
 					// Win64: indirect aggregate passed by pointer — the stack slot
-					// holds the pointer, so deref + copy the data into a local.
-					i64 eal = type_align_of(e->type);
-					i32 data_off = x64_alloc_local(p, esz, eal);
-					x64_emit_mov_rm(a, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(off));
-					x64_copy_fixed(p, x64_rbp_mem(data_off), x64_mem(X64Reg_RAX, 0), esz);
-					x64_var_set(&p->var_offsets, e, data_off);
+					// holds the pointer.
+					if (esz > X64_INDIRECT_PARAM_COPY_MAX) {
+						// Too big to copy — deref through the pointer slot on access.
+						x64_var_set(&p->var_offsets, e, off);
+						array_add(&p->indirect_params, e);
+					} else {
+						// Small: deref + copy the data into a local.
+						i64 eal = type_align_of(e->type);
+						i32 data_off = x64_alloc_local(p, esz, eal);
+						x64_emit_mov_rm(a, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(off));
+						x64_copy_fixed(p, x64_rbp_mem(data_off), x64_mem(X64Reg_RAX, 0), esz);
+						x64_var_set(&p->var_offsets, e, data_off);
+					}
 				} else {
 					x64_var_set(&p->var_offsets, e, off);
 				}
@@ -446,7 +504,10 @@ gb_internal void x64_proc_begin(x64Procedure *p) {
 		for_array(i, results->variables) {
 			Entity *e = results->variables[i];
 			if (e->kind != Entity_Variable) continue;
-			if (e->token.string.len == 0) continue; // unnamed result
+			// Unnamed result (`-> Allocator_Error`): no debugger value normally. In a -debug
+			// build give it a slot anyway (named "result"/"result_N" in CodeView, see
+			// x64_proc_end) so the returned value is inspectable. Non-debug skips it (fast path).
+			if (e->token.string.len == 0 && p->module->debug_s == nullptr) continue;
 			i64 sz    = x64_type_size(e->type);
 			i64 align = x64_type_align(e->type);
 			i32 off   = x64_alloc_local(p, sz, align);
@@ -454,6 +515,16 @@ gb_internal void x64_proc_begin(x64Procedure *p) {
 			// zero-init (x64_zero_mem caps unrolling and switches to REP STOSB for
 			// large results — a big by-value return must not explode .text)
 			x64_zero_mem(p, x64_rbp_mem(off), sz);
+			// Named return with a DEFAULT value (`-> (pow: u32 = 1)`): apply it (mirrors LLVM
+			// lb_build_proc_body's result-default store). Without this, the result starts at the
+			// zero value, ignoring `= 1` (was strconv Rabin-Karp pow=0 → strings.index always -1).
+			ParameterValue const &pv = e->Variable.param_value;
+			if (pv.kind != ParameterValue_Invalid &&
+			    pv.kind != ParameterValue_Location &&    // not valid for a result default (LLVM asserts)
+			    pv.kind != ParameterValue_Expression) {
+				x64_store_value(p, x64addr(x64_rbp_mem(off), e->type),
+				                x64_handle_param_value(p, e->type, pv, nullptr));
+			}
 		}
 	}
 }
@@ -508,7 +579,7 @@ gb_internal void x64_emit_named_returns(x64Procedure *p) {
 			if (x64_is_double(e->type)) x64_emit_movsd_rm(a, X64XmmReg_XMM0, x64_rbp_mem(*loff));
 			else                         x64_emit_movss_rm(a, X64XmmReg_XMM0, x64_rbp_mem(*loff));
 		} else {
-			x64_emit_mov_rm(a, x64_op_size_of(e->type), X64Reg_RAX, x64_rbp_mem(*loff));
+			x64_value_to_reg(p, x64v_mem(e->type, x64_rbp_mem(*loff)), X64Reg_RAX);
 		}
 	}
 }
@@ -524,6 +595,163 @@ gb_internal void x64_proc_emit_epilogue(x64Procedure *p) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// CodeView S_INLINESITE (#force_inline inline frames)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// CodeView compressed unsigned int (CodeViewRecordIO::writeEncodedInteger): 1/2/4 bytes,
+// big-endian with 0x80 / 0xC0 continuation bits.
+gb_internal void x64_cv_annot_uint(Array<u8> *o, u32 v) {
+	if (v < 0x80u) {
+		array_add(o, (u8)v);
+	} else if (v < 0x4000u) {
+		array_add(o, (u8)((v >> 8) | 0x80u));
+		array_add(o, (u8)(v & 0xFFu));
+	} else {
+		array_add(o, (u8)((v >> 24) | 0xC0u));
+		array_add(o, (u8)((v >> 16) & 0xFFu));
+		array_add(o, (u8)((v >> 8) & 0xFFu));
+		array_add(o, (u8)(v & 0xFFu));
+	}
+}
+// Signed → zig-zag (positive: v<<1; negative: (-v<<1)|1), then the unsigned encoding.
+gb_internal void x64_cv_annot_sint(Array<u8> *o, i32 v) {
+	x64_cv_annot_uint(o, (v >= 0) ? ((u32)v << 1) : (((u32)(-v) << 1) | 1u));
+}
+
+// Binary-annotation bytestream for an inline site: maps code offsets (from function start) to the
+// callee's source lines, relative to the inlinee's declaration line+file. Opcodes: 3=ChangeCodeOffset,
+// 4=ChangeCodeLength, 5=ChangeFile, 6=ChangeLineOffset (separate ops, never the packed form — simpler
+// & safe). The interpreter starts at codeOffset=0, line=decl_line, file=decl_file.
+gb_internal void x64_cv_build_annotations(x64Module *m, Array<u8> *o, x64Procedure::InlineSiteRec *site) {
+	if (site->lines.count == 0) {
+		// No body lines recorded: position at code_start, span to code_end (avoids claiming the
+		// whole function prefix as inlined). Degenerate — a real #force_inline body has lines.
+		if (site->code_start > 0)               { x64_cv_annot_uint(o, 3u); x64_cv_annot_uint(o, site->code_start); }
+		if (site->code_end > site->code_start)  { x64_cv_annot_uint(o, 4u); x64_cv_annot_uint(o, site->code_end - site->code_start); }
+		return;
+	}
+	u32 last_off  = 0;
+	i32 last_line = site->decl_line;
+	u32 last_file = x64_cv_file_offset(m, site->decl_file_id);
+	for (isize i = 0; i < site->lines.count; i++) {
+		x64Procedure::InlineSiteLine *L = &site->lines[i];
+		u32 file = x64_cv_file_offset(m, L->file_id);
+		if (file != last_file) { x64_cv_annot_uint(o, 5u); x64_cv_annot_uint(o, file); last_file = file; }
+		u32 code_delta = L->offset - last_off;
+		i32 line_delta = L->line  - last_line;
+		// Line BEFORE code: the marker created when the code offset advances must already carry the
+		// new line (mirrors the packed ChangeCodeOffsetAndLineOffset / LLVM's emission order).
+		if (line_delta != 0) { x64_cv_annot_uint(o, 6u); x64_cv_annot_sint(o, line_delta); }
+		if (code_delta != 0) { x64_cv_annot_uint(o, 3u); x64_cv_annot_uint(o, code_delta); }
+		last_off = L->offset; last_line = L->line;
+	}
+	if (site->code_end > last_off) { x64_cv_annot_uint(o, 4u); x64_cv_annot_uint(o, site->code_end - last_off); }
+}
+
+// Emit (once, cached) an LF_FUNC_ID id-record for `callee` → its .debug$T index (referenced by
+// S_INLINESITE.inlinee). Needs an LF_PROCEDURE; a shared void() suffices (the debugger uses the id's
+// NAME for the inline frame). ID + type records share the obj .debug$T index space; the linker splits
+// TPI/IPI by leaf kind.
+gb_internal u32 x64_cv_func_id(x64Module *m, Entity *callee) {
+	if (m->debug_t == nullptr) return 0;
+	u32 *cached = map_get(&m->cv_func_ids, callee);
+	if (cached) return *cached;
+
+	CoffSection *T = m->debug_t;
+	if (m->cv_empty_arglist == 0) {
+		u32 idx = m->cv_next_type++;
+		u32 lp = (u32)coff_section_len(T); coff_section_write_u16(T, 0);
+		coff_section_write_u16(T, 0x1201u);  // LF_ARGLIST
+		coff_section_write_u32(T, 0);        // count = 0
+		x64_cv_finish_type(T, lp);
+		m->cv_empty_arglist = idx;
+	}
+	if (m->cv_void_proc_type == 0) {
+		u32 idx = m->cv_next_type++;
+		u32 lp = (u32)coff_section_len(T); coff_section_write_u16(T, 0);
+		coff_section_write_u16(T, 0x1008u);  // LF_PROCEDURE
+		coff_section_write_u32(T, 0x0003u);  // return type = T_VOID
+		coff_section_write_u8(T, 0);         // calling convention = NEAR_C
+		coff_section_write_u8(T, 0);         // funcattr
+		coff_section_write_u16(T, 0);        // parm count
+		coff_section_write_u32(T, m->cv_empty_arglist);
+		x64_cv_finish_type(T, lp);
+		m->cv_void_proc_type = idx;
+	}
+
+	String name = callee->token.string;
+	u32 idx = m->cv_next_type++;
+	u32 lp = (u32)coff_section_len(T); coff_section_write_u16(T, 0);
+	coff_section_write_u16(T, 0x1601u);   // LF_FUNC_ID
+	coff_section_write_u32(T, 0);         // scopeId = 0
+	coff_section_write_u32(T, m->cv_void_proc_type);
+	coff_section_write(T, name.text, name.len);
+	coff_section_write_u8(T, 0);
+	x64_cv_finish_type(T, lp);
+	map_set(&m->cv_func_ids, callee, idx);
+	array_add(&m->cv_inlinees, callee); // → DEBUG_S_INLINEELINES at finalize
+	return idx;
+}
+
+// One S_REGREL32 (RBP-relative local) — shared by the GPROC flat locals and inline-site scopes.
+gb_internal void x64_cv_emit_regrel32(x64Module *m, String name, i32 off, u32 cvt) {
+	isize content = 2 + 4 + 4 + 2 + name.len + 1;        // rectype+offset+typind+reg+name
+	isize total   = (2 + content + 3) & ~(isize)3;
+	coff_section_write_u16(m->debug_s, (u16)(total - 2)); // reclen
+	coff_section_write_u16(m->debug_s, 0x1111u);          // S_REGREL32
+	coff_section_write_u32(m->debug_s, (u32)off);
+	coff_section_write_u32(m->debug_s, cvt);
+	coff_section_write_u16(m->debug_s, 334u);             // CV_AMD64_RBP
+	coff_section_write(m->debug_s, name.text, name.len);
+	coff_section_write_u8(m->debug_s, 0);
+	x64_cv_pad4(m->debug_s);
+}
+
+// Recursively emit S_INLINESITE … (scoped locals) … (child sites) … S_INLINESITE_END for `idx` and
+// every site whose parent is `idx`. pParent/pEnd left 0 — the linker recomputes scope linkage from
+// the balanced record nesting (same as the GPROC, which also writes 0).
+gb_internal void x64_cv_emit_inline_site(x64Procedure *p, i32 idx) {
+	x64Module *m = p->module;
+	x64Procedure::InlineSiteRec *site = &p->inline_sites[idx];
+
+	u32 inlinee = x64_cv_func_id(m, site->callee);
+
+	Array<u8> annot; array_init(&annot, p->alloc, 0, 32);
+	x64_cv_build_annotations(m, &annot, site);
+	// Pad the ANNOTATION stream to 4 bytes with 0x00 (BA_OP_Invalid) — the annotation parser reads
+	// trailing record bytes as opcodes, so the record's alignment padding must be Invalid (0), NOT
+	// the LF_PAD 0xF1-0xF3 used elsewhere (those decode as bogus opcodes). The fixed header is 16B
+	// (mult of 4), so a 4-aligned annot makes the whole record 4-aligned without x64_cv_pad4.
+	while ((annot.count % 4) != 0) array_add(&annot, (u8)0);
+
+	// S_INLINESITE: rectype(2)+pParent(4)+pEnd(4)+inlinee(4)+annotations.
+	isize content = 2 + 4 + 4 + 4 + annot.count; // already a multiple of 4
+	isize total   = 2 + content;
+	coff_section_write_u16(m->debug_s, (u16)(total - 2)); // reclen
+	coff_section_write_u16(m->debug_s, 0x114Du);          // S_INLINESITE
+	coff_section_write_u32(m->debug_s, 0);                // pParent (linker recomputes)
+	coff_section_write_u32(m->debug_s, 0);                // pEnd    (linker recomputes)
+	coff_section_write_u32(m->debug_s, inlinee);
+	if (annot.count > 0) coff_section_write(m->debug_s, annot.data, annot.count);
+
+	// Scoped locals (per-site offsets → correct even when the same callee inlines at many sites).
+	for (isize i = 0; i < site->locals.count; i++) {
+		x64Procedure::InlineSiteLocal *L = &site->locals[i];
+		u32 cvt = L->is_ptr ? 0x0603u : x64_cv_type(m, L->type); // by-ptr param: show as pointer
+		x64_cv_emit_regrel32(m, L->name, L->offset, cvt);
+	}
+
+	// Child inline sites (nested #force_inline within this body).
+	for (i32 c = 0; c < (i32)p->inline_sites.count; c++) {
+		if (p->inline_sites[c].parent == idx) x64_cv_emit_inline_site(p, c);
+	}
+
+	// S_INLINESITE_END
+	coff_section_write_u16(m->debug_s, 2u);
+	coff_section_write_u16(m->debug_s, 0x114Eu);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Finalise: patch frame size, write COFF
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -532,8 +760,12 @@ gb_internal void x64_proc_end(x64Procedure *p) {
 
 	x64_emit_ret(a);
 
-	// frame = locals + shadow space (32) + outgoing stack args (64), 16-byte aligned
-	i32 frame = ((p->frame_max + 32 + 64 + 15) & ~15);
+	// frame = locals + shadow space (32) + outgoing stack args, 16-byte aligned. The outgoing
+	// area is the peak over all calls (max_outgoing_bytes), floored at 64 so the alloca path's
+	// fixed rsp+96 (shadow 32 + 64) assumption holds. A hardcoded 64 under-reserved for calls
+	// with >12 args (their extra stack slots overwrote a local).
+	i32 outgoing = gb_max(p->max_outgoing_bytes, 64);
+	i32 frame = ((p->frame_max + 32 + outgoing + 15) & ~15);
 	if (frame < 0x1000) {
 		// Under one page: plain SUB RSP is safe (a deep push still hits & commits
 		// the guard page). NOP pad follows.
@@ -561,7 +793,9 @@ gb_internal void x64_proc_end(x64Procedure *p) {
 	// All procs must be EXTERNAL: even file-private (#+private) procs can be
 	// referenced as UNDEF externals from other .obj files before their definition
 	// is seen, and STATIC symbols are never searched when resolving those refs.
-	coff_sym_add_proc(&m->coff, p->link_name, 1 /*text is sec 1*/, base_off, true);
+	// EXCEPTION: synthetic map hasher/equal procs (is_static) are referenced only
+	// within their own module → STATIC, so parallel modules don't clash on the name.
+	coff_sym_add_proc(&m->coff, p->link_name, 1 /*text is sec 1*/, base_off, !p->is_static);
 
 	coff_section_write(m->text, a->code.data, a->code.count);
 	coff_apply_x64_relocs(m->text, a, &m->coff, base_off);
@@ -664,14 +898,53 @@ gb_internal void x64_proc_end(x64Procedure *p) {
 		coff_section_write_u32(m->debug_s, 0x00028000u);
 		x64_cv_pad4(m->debug_s);
 
+		// Results tuple — used to give unnamed returns a synthetic debugger name below.
+		TypeTuple *res_tuple = (p->type != nullptr && p->type->kind == Type_Proc &&
+		                        p->type->Proc.results != nullptr) ? &p->type->Proc.results->Tuple : nullptr;
+
 		// S_REGREL32 (0x1111) for each named local/param: name @ [RBP + offset].
 		for (i32 vi = 0; vi < p->var_offsets.count; vi++) {
 			Entity *ve   = p->var_offsets.keys[vi];
 			i32     voff = p->var_offsets.vals[vi];
 			if (ve == nullptr) continue;
+			// Inline-site locals are emitted inside their S_INLINESITE scope (below); skip them here
+			// so they aren't duplicated (a callee inlined N times would otherwise show only its last
+			// slot in this flat list). Counts are tiny → linear scan.
+			bool is_inlined_local = false;
+			for (isize s = 0; s < p->inline_sites.count && !is_inlined_local; s++) {
+				for (isize li = 0; li < p->inline_sites[s].locals.count; li++) {
+					if (p->inline_sites[s].locals[li].entity == ve) { is_inlined_local = true; break; }
+				}
+			}
+			if (is_inlined_local) continue;
 			String vn = ve->token.string;
-			if (vn.len == 0) continue;
+			char   synthbuf[24];
+			if (vn.len == 0) {
+				// Unnamed result → synthetic name ("return", or "return_N" for multi-result).
+				// `return` is a reserved word so it can never collide with a real local. Only
+				// unnamed RESULTS are var_set without a name (see x64_proc_begin); skip any
+				// other nameless slot.
+				int ridx = -1;
+				if (res_tuple != nullptr) {
+					for_array(ri, res_tuple->variables) {
+						if (res_tuple->variables[ri] == ve) { ridx = (int)ri; break; }
+					}
+				}
+				if (ridx < 0) continue;
+				if (res_tuple->variables.count == 1) {
+					vn = str_lit("return");
+				} else {
+					gb_snprintf(synthbuf, gb_size_of(synthbuf), "return_%d", ridx);
+					vn = make_string((u8 const *)synthbuf, gb_strlen(synthbuf));
+				}
+			}
 			u32 cvt = x64_cv_type(m, ve->type);
+			// Large indirect param: the slot holds the incoming POINTER, not the data —
+			// describe it as a pointer so the debugger shows a valid address to deref
+			// (not the pointer bytes misread as the aggregate).
+			for (isize ii = 0; ii < p->indirect_params.count; ii++) {
+				if (p->indirect_params[ii] == ve) { cvt = 0x0603u; break; } // T_64PVOID
+			}
 			// content: rectype(2)+offset(4)+typind(4)+reg(2)+name(len+1)
 			isize content = 2 + 4 + 4 + 2 + vn.len + 1;
 			isize total   = (2 + content + 3) & ~(isize)3;
@@ -683,6 +956,12 @@ gb_internal void x64_proc_end(x64Procedure *p) {
 			coff_section_write(m->debug_s, vn.text, vn.len);
 			coff_section_write_u8(m->debug_s, 0);
 			x64_cv_pad4(m->debug_s);
+		}
+
+		// S_INLINESITE trees for #force_inline calls (each a nested, step-into-able frame whose
+		// own lines come from binary annotations; the primary line table keeps the call-site line).
+		for (i32 s = 0; s < (i32)p->inline_sites.count; s++) {
+			if (p->inline_sites[s].parent == -1) x64_cv_emit_inline_site(p, s);
 		}
 
 		// S_END:
@@ -697,11 +976,19 @@ gb_internal void x64_proc_end(x64Procedure *p) {
 		m->debug_s->data[sub_len_pos + 3] = (u8)((sub_len >> 24) & 0xFFu);
 
 		// ── DEBUG_S_LINES subsection — code offset → source line mapping ──────
+		// Entries are grouped into one CV file block per run of the same file_id; inlined
+		// #force_inline code carries the callee's file, so the table can span multiple files
+		// (lets the debugger step INTO inlined bodies showing their own source).
 		if (p->lines.count > 0) {
-			u32 file_off = x64_cv_file_offset(m, p->file_id);
-			u32 nlines   = (u32)p->lines.count;
-			// Payload: CV_DebugSLinesHeader_t(12) + FileBlockHeader(12) + lines(n*8)
-			u32 cb       = 12 + 12 + nlines * 8;
+			isize n = p->lines.count;
+			// Payload: CV_DebugSLinesHeader_t(12) + per file block (FileBlockHeader(12) + lines*8).
+			u32 cb = 12;
+			for (isize i = 0; i < n;) {
+				i32 f = p->lines[i].file_id; isize j = i;
+				while (j < n && p->lines[j].file_id == f) j++;
+				cb += 12 + (u32)(j - i) * 8;
+				i = j;
+			}
 
 			coff_section_write_u32(m->debug_s, 0xF2u);  // DEBUG_S_LINES
 			coff_section_write_u32(m->debug_s, cb);
@@ -719,16 +1006,22 @@ gb_internal void x64_proc_end(x64Procedure *p) {
 			coff_section_write_u16(m->debug_s, 0);          // flags (0 = no columns)
 			coff_section_write_u32(m->debug_s, proc_size);  // cbCon
 
-			// CV_DebugSLinesFileBlockHeader_t: offFile(4) + nLines(4) + cbBlock(4)
-			coff_section_write_u32(m->debug_s, file_off);
-			coff_section_write_u32(m->debug_s, nlines);
-			coff_section_write_u32(m->debug_s, 12 + nlines * 8); // cbBlock
-
-			// CV_Line_t records: offset(4) + flags(4); flags = line | fStatement.
-			for (isize li = 0; li < p->lines.count; li++) {
-				coff_section_write_u32(m->debug_s, p->lines[li].offset);
-				coff_section_write_u32(m->debug_s,
-				    (p->lines[li].line & 0x00FFFFFFu) | 0x80000000u);
+			// One CV_DebugSLinesFileBlockHeader_t per file run: offFile(4) + nLines(4) + cbBlock(4).
+			for (isize i = 0; i < n;) {
+				i32 f = p->lines[i].file_id; isize j = i;
+				while (j < n && p->lines[j].file_id == f) j++;
+				u32 cnt  = (u32)(j - i);
+				u32 foff = x64_cv_file_offset(m, f);
+				coff_section_write_u32(m->debug_s, foff);
+				coff_section_write_u32(m->debug_s, cnt);
+				coff_section_write_u32(m->debug_s, 12 + cnt * 8); // cbBlock
+				// CV_Line_t records: offset(4) + flags(4); flags = line | fStatement.
+				for (isize k = i; k < j; k++) {
+					coff_section_write_u32(m->debug_s, p->lines[k].offset);
+					coff_section_write_u32(m->debug_s,
+					    (p->lines[k].line & 0x00FFFFFFu) | 0x80000000u);
+				}
+				i = j;
 			}
 		}
 	}
@@ -748,6 +1041,15 @@ gb_internal x64Value x64_emit_call(x64Procedure *p,
 	Type         *ct = base_type(callee_type_raw);
 	GB_ASSERT(ct->kind == Type_Proc);
 
+	// Reserve enough outgoing stack-arg space for THIS call (args beyond the 4 register slots).
+	// x64_proc_end sizes the frame's outgoing area from this peak; a fixed 64 bytes silently
+	// under-reserved for calls with >12 args → the 9th+ stack arg wrote past the area into a
+	// local (THE blick scrollview bug: 13-arg ui_scrollview_begin clobbered view_size).
+	if (arg_count > 4) {
+		i32 ob = (arg_count - 4) * 8;
+		if (ob > p->max_outgoing_bytes) p->max_outgoing_bytes = ob;
+	}
+
 	// Stack args (slots 4+), reverse order
 	for (int i = gb_max(arg_count - 1, 3); i >= 4; i--) {
 		x64Value v = args[i];
@@ -763,11 +1065,16 @@ gb_internal x64Value x64_emit_call(x64Procedure *p,
 	}
 
 	// Register args (slots 0-3), reverse order to avoid clobbering: fill R9/XMM3 first.
+	// Win64 variadic ABI: a floating-point arg in a register slot of a variadic (c_vararg) callee must
+	// ALSO be placed in the corresponding GP register — the callee reads `...` args from GP. Without
+	// this, printf/ffmpeg-style `%f` args read garbage from the GP reg.
+	bool variadic_abi = ct->Proc.c_vararg;
 	int reg_count = gb_min(arg_count, 4);
 	for (int i = reg_count - 1; i >= 0; i--) {
 		x64Value v = args[i];
 		if (x64_arg_is_float(v.type)) {
 			x64_value_to_xmm(p, v, X64_XMM_ARG_REGS[i]);
+			if (variadic_abi) x64_value_to_reg(p, v, X64_INT_ARG_REGS[i]); // duplicate FP bits into GP
 		} else {
 			x64_value_to_reg(p, v, X64_INT_ARG_REGS[i]);
 		}

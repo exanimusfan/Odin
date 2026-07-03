@@ -32,23 +32,35 @@ gb_internal X64OpSize x64_op_size_of(Type *t) {
 	return X64OpSize_64;
 }
 
+// True only for SSE-backed floats (f32/f64). f16 is EXCLUDED: it's 2 bytes, and the SSE path
+// (movss/movsd) would move 4/8 bytes — a `movss` store on a 2-byte f16 slot overwrites the adjacent
+// stack slot (THE `animate(.., alpha: f16)` crash: alpha's store clobbered the `flag` param next to
+// it → garbage enum index → OOB write). f16 is moved as a raw 2-byte value via the integer path
+// (see x64_is_scalar); f16<->f32 arithmetic/conversion (F16C) is not yet supported.
+gb_internal bool x64_is_f16(Type *t) {
+	t = base_type(t);
+	return t->kind == Type_Basic && (t->Basic.flags & BasicFlag_Float) != 0 && type_size_of(t) == 2;
+}
 gb_internal bool x64_is_float(Type *t) {
 	t = base_type(t);
-	// ONLY true scalar floats (f16/f32/f64) — NOT complex. complex is a 2-float AGGREGATE; including
-	// BasicFlag_Complex here made x64_store_value/x64_load_addr treat a 16-byte complex128 as a
-	// scalar and copy it with a single movss/movsd (4/8 bytes) → truncated/garbage. quaternion was
-	// never affected (BasicFlag_Quaternion, not Complex). Complex arith/ABI must use the aggregate path.
-	return t->kind == Type_Basic && (t->Basic.flags & BasicFlag_Float) != 0;
+	// ONLY true scalar SSE floats (f32/f64) — NOT f16 (see x64_is_f16) and NOT complex. complex is a
+	// 2-float AGGREGATE; including BasicFlag_Complex here made x64_store_value/x64_load_addr treat a
+	// 16-byte complex128 as a scalar and copy it with a single movss/movsd → truncated/garbage.
+	// quaternion was never affected (BasicFlag_Quaternion). Complex arith/ABI uses the aggregate path.
+	return t->kind == Type_Basic && (t->Basic.flags & BasicFlag_Float) != 0 && type_size_of(t) != 2;
 }
 
+// "double" = any 8-byte SSE float (f64 AND f64le/f64be) — the move/op dispatch keys on this to pick
+// movsd vs movss. Matching only Basic_f64 made f64le/f64be fall to the 4-byte movss path → an 8-byte
+// endian-float was truncated to f32 (e.g. f64le(-1.) stored as 0xbf800000). f16 is excluded by size.
 gb_internal bool x64_is_double(Type *t) {
 	t = base_type(t);
-	return t->kind == Type_Basic && t->Basic.kind == Basic_f64;
+	return t->kind == Type_Basic && (t->Basic.flags & BasicFlag_Float) != 0 && type_size_of(t) == 8;
 }
 
 gb_internal bool x64_is_f32(Type *t) {
 	t = base_type(t);
-	return t->kind == Type_Basic && t->Basic.kind == Basic_f32;
+	return t->kind == Type_Basic && (t->Basic.flags & BasicFlag_Float) != 0 && type_size_of(t) == 4;
 }
 
 gb_internal bool x64_is_integer(Type *t) {
@@ -69,7 +81,8 @@ gb_internal bool x64_is_ptr(Type *t) {
 }
 
 gb_internal bool x64_is_scalar(Type *t) {
-	return x64_is_integer(t) || x64_is_bool(t) || x64_is_ptr(t) || x64_is_float(t);
+	// f16 is a scalar moved as a 2-byte integer (raw bits) — NOT via SSE (see x64_is_float).
+	return x64_is_integer(t) || x64_is_bool(t) || x64_is_ptr(t) || x64_is_float(t) || x64_is_f16(t);
 }
 
 // Win64 indirect-arg rule (lbAbiAmd64Win64::compute_arg_types + lbAbi386::non_struct):
@@ -85,6 +98,10 @@ gb_internal bool x64_arg_is_indirect(Type *t) {
 
 gb_internal bool x64_is_signed_integer(Type *t) {
 	t = base_type(t);
+	// An enum's signedness is its underlying integer's. Without this, a signed enum (the default;
+	// any enum with a negative value) compared unsigned & loaded zero-extended → e.g. Ordering.Less
+	// (-1) read as a huge value → broken `<`/`>=` (was THE slice.sort / smoothsort Ordering bug).
+	if (t->kind == Type_Enum) t = base_type(t->Enum.base_type);
 	return t->kind == Type_Basic &&
 	       (t->Basic.flags & BasicFlag_Integer) &&
 	       !(t->Basic.flags & BasicFlag_Unsigned);
@@ -110,6 +127,39 @@ gb_internal String x64_get_entity_name(Entity *e) {
 	if (e->kind == Entity_Procedure) e->Procedure.link_name = name;
 	else if (e->kind == Entity_Variable) e->Variable.link_name = name;
 	return name;
+}
+
+// True if a value of this type contains NO pointers anywhere (scalars, enums, bit_sets,
+// and fixed aggregates of those). Such a value can never alias stack scratch, so storing it
+// into a local and then reclaiming the initializer's temps is safe — unlike slices/strings/
+// pointers/maps/unions, whose data can point INTO the reclaimed scratch. Conservative:
+// anything not provably pointer-free returns false.
+gb_internal bool x64_type_is_pointer_free(Type *t) {
+	if (t == nullptr) return false;
+	t = base_type(t);
+	switch (t->kind) {
+	case Type_Basic:
+		switch (t->Basic.kind) {
+		case Basic_string: case Basic_cstring: case Basic_rawptr: case Basic_any:
+			return false;
+		}
+		return true; // integers/floats/bools/runes/complex/quaternion/uintptr/typeid
+	case Type_Enum:
+	case Type_BitSet:
+		return true;
+	case Type_Array:           return x64_type_is_pointer_free(t->Array.elem);
+	case Type_EnumeratedArray: return x64_type_is_pointer_free(t->EnumeratedArray.elem);
+	case Type_Matrix:          return x64_type_is_pointer_free(t->Matrix.elem);
+	case Type_SimdVector:      return x64_type_is_pointer_free(t->SimdVector.elem);
+	case Type_BitField:        return x64_type_is_pointer_free(t->BitField.backing_type);
+	case Type_Struct:
+		for_array(i, t->Struct.fields) if (!x64_type_is_pointer_free(t->Struct.fields[i]->type)) return false;
+		return true;
+	case Type_Tuple:
+		for_array(i, t->Tuple.variables) if (!x64_type_is_pointer_free(t->Tuple.variables[i]->type)) return false;
+		return true;
+	}
+	return false; // Pointer/MultiPointer/Slice/DynamicArray/Map/Proc/Union/SoaPointer/…
 }
 
 // Stack frame helpers
@@ -148,6 +198,14 @@ gb_internal x64Addr x64_entity_addr(x64Procedure *p, Entity *e) {
 	i32 *off = x64_var_get(&p->var_offsets, e);
 	GB_ASSERT_MSG(off != nullptr, "x64_entity_addr: '%.*s' not registered",
 	              LIT(e->token.string));
+	// Large indirect-ABI param: the slot holds the incoming pointer, not the data —
+	// deref through it (like a ^T param). See x64_proc_begin / indirect_params.
+	for (isize i = 0; i < p->indirect_params.count; i++) {
+		if (p->indirect_params[i] == e) {
+			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(*off));
+			return x64addr(x64_mem(X64Reg_RAX, 0), e->type);
+		}
+	}
 	return x64addr(x64_rbp_mem(*off), e->type);
 }
 
@@ -225,33 +283,31 @@ gb_internal void x64_copy_fixed(x64Procedure *p, X64Mem dst, X64Mem src, i64 siz
 	}
 }
 
-// Construct a union value at `dst` from a variant value `src` whose type is one of `union_type`'s
-// variants: zero the union, store the variant value at offset 0, set the discriminant tag. Mirrors
-// lb_emit_store_union_variant (+_tag). A variant SMALLER than variant_block_size (e.g. the 1-byte
-// Allocator_Error in 8-byte os.Error) needs the zero so stale high bytes/tag don't make a nil
-// variant read non-nil. #shared_nil: tag MUST be 0 when the value is nil (else `== nil`/or_return
-// read a non-nil tag). The caller has already converted `src` to the chosen variant type.
-gb_internal void x64_store_union_variant(x64Procedure *p, X64Mem dst, x64Value src, Type *union_type) {
+// Tag address + width for a tagged union (mirrors lb_emit_union_tag_ptr). Used on both the store side
+// (x64_store_union_variant) and the load side (x64_emit_union_tag_value).
+gb_internal X64UnionTag x64_emit_union_tag_ptr(Type *ubt, X64Mem union_mem) {
+	i64 tag_sz = union_tag_size(ubt);
+	X64OpSize opsz = tag_sz <= 1 ? X64OpSize_8  : tag_sz == 2 ? X64OpSize_16 :
+	                 tag_sz == 4 ? X64OpSize_32 : X64OpSize_64;
+	X64Mem m = union_mem; m.disp += (i32)ubt->Union.variant_block_size;
+	return {m, opsz};
+}
+
+// Write a tagged union's discriminant for variant `src_type` into the union at `dst` (mirrors
+// lb_emit_store_union_variant_tag). #shared_nil: tag MUST be 0 when the value is nil (else `==
+// nil`/or_return read a non-nil tag) → cmov on (value@0 == 0). maybe-pointer unions have no tag.
+gb_internal void x64_emit_store_union_variant_tag(x64Procedure *p, X64Mem dst, Type *src_type, Type *union_type) {
 	X64Assembler *a   = &p->asm_;
 	Type         *ubt = base_type(union_type);
-	i64           usz = x64_type_size(union_type);
-	if (usz == 0) return;
-	x64_zero_mem(p, dst, usz);
-	if (src.type != nullptr && type_size_of(src.type) != 0) {
-		x64_store_value(p, x64addr(dst, src.type), src); // value @ offset 0
-	}
-	if (is_type_union_maybe_pointer(ubt) || src.type == nullptr) return;
-	i64 tag_off = (i64)ubt->Union.variant_block_size;
-	i64 tag_sz  = union_tag_size(ubt);
-	i64 tag_val = union_variant_index_checked(ubt, src.type);
-	X64OpSize tsz2 = tag_sz <= 1 ? X64OpSize_8 :
-	                 tag_sz == 2 ? X64OpSize_16 :
-	                 tag_sz == 4 ? X64OpSize_32 : X64OpSize_64;
-	X64Mem tagm = dst; tagm.disp += (i32)tag_off;
-	i64 vsz = type_size_of(src.type);
+	if (is_type_union_maybe_pointer(ubt) || src_type == nullptr) return;
+	i64 tag_val = union_variant_index_checked(ubt, src_type);
+	X64UnionTag tag = x64_emit_union_tag_ptr(ubt, dst);
+	X64OpSize tsz2 = tag.opsz;
+	X64Mem tagm = tag.mem;
+	i64 vsz = type_size_of(src_type);
 	if (ubt->Union.kind == UnionType_shared_nil && vsz > 0 && vsz <= 8) {
 		// tag = (value@0 == 0) ? 0 : tag_val
-		X64OpSize vosz = x64_op_size_of(src.type);
+		X64OpSize vosz = x64_op_size_of(src_type);
 		x64_emit_mov_rm(a, vosz, X64Reg_RAX, dst);             // value@0
 		x64_emit_mov_ri(a, X64OpSize_64, X64Reg_RCX, tag_val); // mov: no flags
 		x64_emit_mov_ri(a, X64OpSize_64, X64Reg_RDX, 0);       // mov (NOT xor) — keep ZF
@@ -263,6 +319,21 @@ gb_internal void x64_store_union_variant(x64Procedure *p, X64Mem dst, x64Value s
 	}
 }
 
+// Construct a union value at `dst` from a variant value `src` whose type is one of `union_type`'s
+// variants: zero the union, store the variant value at offset 0, set the discriminant tag. Mirrors
+// lb_emit_store_union_variant. A variant SMALLER than variant_block_size (e.g. the 1-byte
+// Allocator_Error in 8-byte os.Error) needs the zero so stale high bytes/tag don't make a nil
+// variant read non-nil. The caller has already converted `src` to the chosen variant type.
+gb_internal void x64_store_union_variant(x64Procedure *p, X64Mem dst, x64Value src, Type *union_type) {
+	i64 usz = x64_type_size(union_type);
+	if (usz == 0) return;
+	x64_zero_mem(p, dst, usz);
+	if (src.type != nullptr && type_size_of(src.type) != 0) {
+		x64_store_value(p, x64addr(dst, src.type), src); // value @ offset 0
+	}
+	x64_emit_store_union_variant_tag(p, dst, src.type, union_type);
+}
+
 // Box `src` (of type `src_type`) into an `any` {data: rawptr @0, id: typeid @8} at `dst`: spill the
 // value to a local, point data at it, set id = typeid(default_type(src_type)). The to-`any` case of
 // lb_emit_conv (used by x64_emit_conv and the variadic `..any` arg packing).
@@ -272,7 +343,27 @@ gb_internal void x64_box_any(x64Procedure *p, X64Mem dst, x64Value src, Type *sr
 	at = x64_typed(at);
 	i64 asz = type_size_of(at); if (asz <= 0) asz = 1;
 	i64 aal = type_align_of(at); if (aal <= 0) aal = 1;
+	if (p->is_startup) {
+		// Global/static `any = v` initializer: the boxed value must live in a STATIC global — a
+		// stack temp dies when __$startup_runtime returns, leaving any.data dangling. Mirrors the
+		// is_startup &CompoundLit path. Store the value into the global, then data @0 = &global.
+		String sym = x64_add_global_generated(p->module, at);
+		i32 tmp = x64_alloc_local(p, asz, aal);
+		x64_store_value(p, x64addr(x64_rbp_mem(tmp), at), src);
+		x64_emit_lea_sym(a, X64Reg_RAX, sym);
+		x64_copy_fixed(p, x64_mem(X64Reg_RAX, 0), x64_rbp_mem(tmp), asz);
+		x64_emit_lea_sym(a, X64Reg_RAX, sym);                   // re-lea (copy clobbered RAX)
+		x64_emit_mov_mr(a, X64OpSize_64, dst, X64Reg_RAX);     // data @0 = &global
+		X64Mem idm0 = dst; idm0.disp += 8;
+		x64_emit_mov_ri(a, X64OpSize_64, X64Reg_RAX, (i64)type_hash_canonical_type(at));
+		x64_emit_mov_mr(a, X64OpSize_64, idm0, X64Reg_RAX);    // id @8
+		return;
+	}
 	i32 val_off = x64_alloc_local(p, asz, aal);
+	// The `any` holds a POINTER to this boxed value, so the temp must outlive the statement —
+	// mark scope-lived (named_seq) so the per-statement temp reclaimer never reuses its slot.
+	// Without this, `x = f32(1.1)` after other stmts left any.data dangling → garbage on read.
+	p->named_seq++;
 	x64_store_value(p, x64addr(x64_rbp_mem(val_off), at), src);
 	x64_emit_lea(a, X64Reg_RAX, x64_rbp_mem(val_off));
 	x64_emit_mov_mr(a, X64OpSize_64, dst, X64Reg_RAX);          // data @0
@@ -289,9 +380,33 @@ gb_internal void x64_store_value(x64Procedure *p, x64Addr dst, x64Value src) {
 	// Convert src to the destination type FIRST, then store (mirrors lb_addr_store → lb_emit_conv
 	// → lb_emit_store). All conversion lives in x64_emit_conv; this is then a dumb store. No-op
 	// when the types already match (the common case).
-	if (src.kind != x64Value_None && src.type != nullptr && t != nullptr &&
-	    !are_types_identical(src.type, t)) {
+	// A zero-sized variant (empty struct, e.g. `union{Empty,…} = Empty{}`) builds to None: the
+	// general "src has a value" guard would skip conversion, so the union's discriminant tag is
+	// never written → the union reads as nil (`switch v in u` matches nothing). An empty variant
+	// still needs tag construction, so let the union-boxing conv run for a None src too. Was THE
+	// blick shutdown hang: Message_Quit is `struct{}` → boxed into the message union its tag stayed
+	// 0 → the app pump never matched Message_Quit → the quit never propagated → join hung forever.
+	bool needs_conv = src.type != nullptr && t != nullptr && !are_types_identical(src.type, t);
+	bool zero_variant_box = needs_conv && src.kind == x64Value_None &&
+	                        base_type(t)->kind == Type_Union && union_is_variant_of(base_type(t), src.type);
+	if (needs_conv && (src.kind != x64Value_None || zero_variant_box)) {
+		// x64_emit_conv may build the converted value with rep stos/movs (variant→union, array,
+		// struct conversions) which CLOBBER volatile registers — INCLUDING one holding dst.mem.base.
+		// Pin a volatile dst base across the conversion, then reload it. Was the blick project-open
+		// crash: `panel.state = media_variant` held &panel.state in RCX while the variant→union
+		// conversion's rep stos used RCX as the count (→ 0) → the store wrote to addr 0x8 → AV.
+		bool pin_dst = !dst.mem.rip_rel && dst.mem.base != X64Reg_RBP && dst.mem.base != X64Reg_NONE;
+		i32 dpin = 0;
+		if (pin_dst) {
+			dpin = x64_alloc_local(p, 8, 8);
+			x64_emit_mov_mr(a, X64OpSize_64, x64_rbp_mem(dpin), dst.mem.base);
+		}
 		src = x64_emit_conv(p, src, src.type, t);
+		if (pin_dst) {
+			X64Reg base_reg = (src.kind == x64Value_Reg && src.reg == X64Reg_RCX) ? X64Reg_R11 : X64Reg_RCX;
+			x64_emit_mov_rm(a, X64OpSize_64, base_reg, x64_rbp_mem(dpin));
+			dst.mem.base = base_reg;
+		}
 	}
 
 	X64OpSize sz = x64_op_size_of(t);
@@ -371,14 +486,35 @@ gb_internal x64Value x64_load_addr(x64Procedure *p, x64Addr addr) {
 	                  (bt->Basic.flags & BasicFlag_Integer) &&
 	                  !(bt->Basic.flags & BasicFlag_Unsigned);
 
-	if (sz == X64OpSize_64 || sz == X64OpSize_32) {
+	// Fill the WHOLE 64-bit register so 64-bit consumers (cvtsi2ss, 64-bit arith, calls) see the right
+	// value. A signed sub-64 load MUST sign-extend (movsx/movsxd) — a plain `mov r32` zero-extends, so a
+	// signed i32 of -1 became +0xFFFFFFFF and `cvtsi2ss(64)` produced 2^32 (the _to_f32 of negative ints
+	// bug). Mirrors x64_value_to_reg's Mem path exactly (was a divergence between the two loaders).
+	if (sz == X64OpSize_64) {
 		x64_emit_mov_rm(a, sz, X64Reg_RAX, addr.mem);
 	} else if (signed_int) {
-		x64_emit_movsx_rm(a, sz, X64Reg_RAX, addr.mem);
+		x64_emit_movsx_rm(a, sz, X64Reg_RAX, addr.mem); // sz==32 → MOVSXD, 8/16 → MOVSX
+	} else if (sz == X64OpSize_32) {
+		x64_emit_mov_rm(a, X64OpSize_32, X64Reg_RAX, addr.mem); // 32-bit mov already zero-extends
 	} else {
 		x64_emit_movzx_rm(a, sz, X64Reg_RAX, addr.mem);
 	}
 	return x64v_reg(t, X64Reg_RAX);
+}
+
+// Tuple field pointer / value by index (mirror lb_emit_tuple_ep / lb_emit_tuple_ev). `tuple` is the
+// tuple's in-memory buffer; field i lives at the CANONICAL type_offset_of(tuple_type, i). Using this
+// instead of the hand-rolled align_formula loops that were duplicated at each call site removes a
+// divergence class (a loop disagreeing with type_offset_of would silently read the wrong field).
+gb_internal x64Addr x64_emit_tuple_ep(x64Procedure *p, x64Value tuple, i32 index) {
+	(void)p;
+	Type *tt = base_type(tuple.type);
+	Type *ft = tt->Tuple.variables[index]->type;
+	X64Mem m = tuple.mem; m.disp += (i32)type_offset_of(tt, index);
+	return x64addr(m, ft);
+}
+gb_internal x64Value x64_emit_tuple_ev(x64Procedure *p, x64Value tuple, i32 index) {
+	return x64_load_addr(p, x64_emit_tuple_ep(p, tuple, index));
 }
 
 // Materialise helpers
@@ -395,8 +531,13 @@ gb_internal X64Reg x64_value_to_reg(x64Procedure *p, x64Value v, X64Reg into) {
 		x64_emit_mov_ri(a, X64OpSize_64, into, v.imm);
 		return into;
 	case x64Value_Mem:
-		if (t && x64_is_signed_integer(t) && sz < X64OpSize_64) {
-			x64_emit_movsx_rm(a, sz, into, v.mem);
+		// A sub-8-byte load must fill the WHOLE register: `mov al`/`mov ax` keep the high bits,
+		// leaking a prior value (e.g. a call's leftover) into them. Sign-extend signed scalars;
+		// zero-extend the rest (`mov r32` already zero-extends to 64).
+		if (t != nullptr && sz < X64OpSize_64) {
+			if (x64_is_signed_integer(t))       x64_emit_movsx_rm(a, sz, into, v.mem);
+			else if (sz == X64OpSize_32)        x64_emit_mov_rm  (a, X64OpSize_32, into, v.mem);
+			else                                x64_emit_movzx_rm(a, sz, into, v.mem);
 		} else {
 			x64_emit_mov_rm(a, sz, into, v.mem);
 		}

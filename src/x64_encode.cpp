@@ -353,7 +353,7 @@ gb_internal void x64_enc_reloc_sym(X64Assembler *a, X64RelocType type, String sy
 // xmm registers use the same 4-bit encoding as GP registers.
 gb_internal void x64_enc_sse_rr(X64Assembler *a, u8 prefix, u8 op,
                                  X64XmmReg dst, X64XmmReg src) {
-	x64_enc_b(a, prefix);
+	if (prefix) x64_enc_b(a, prefix); // packed ops (movups/movaps) have no mandatory prefix
 	bool R = (dst >= 8);
 	bool B = (src >= 8);
 	if (R || B) x64_enc_b(a, cast(u8)(0x40u | (R ? 0x04u : 0u) | (B ? 0x01u : 0u)));
@@ -364,7 +364,7 @@ gb_internal void x64_enc_sse_rr(X64Assembler *a, u8 prefix, u8 op,
 
 gb_internal void x64_enc_sse_rm(X64Assembler *a, u8 prefix, u8 op,
                                  X64XmmReg dst, X64Mem src) {
-	x64_enc_b(a, prefix);
+	if (prefix) x64_enc_b(a, prefix); // packed ops (movups/movaps) have no mandatory prefix
 	X64Reg base = src.rip_rel ? X64Reg_NONE : src.base;
 	bool R = (dst >= 8);
 	bool X = (src.index != X64Reg_NONE) && (src.index >= 8);
@@ -379,7 +379,7 @@ gb_internal void x64_enc_sse_rm(X64Assembler *a, u8 prefix, u8 op,
 
 gb_internal void x64_enc_sse_mr(X64Assembler *a, u8 prefix, u8 op,
                                  X64Mem dst, X64XmmReg src) {
-	x64_enc_b(a, prefix);
+	if (prefix) x64_enc_b(a, prefix); // packed ops (movups/movaps) have no mandatory prefix
 	X64Reg base = dst.rip_rel ? X64Reg_NONE : dst.base;
 	bool R = (src >= 8);
 	bool X = (dst.index != X64Reg_NONE) && (dst.index >= 8);
@@ -390,6 +390,83 @@ gb_internal void x64_enc_sse_mr(X64Assembler *a, u8 prefix, u8 op,
 	x64_enc_b(a, 0x0Fu);
 	x64_enc_b(a, op);
 	x64_enc_modrm_mem(a, cast(u8)(src & 7u), dst);
+}
+
+// 3-byte opcode SSE (66 0F 38 op /r) xmm,xmm — SSE4.1/4.2 packed ops (pmulld, pcmpeqq, pminsd, …).
+gb_internal void x64_enc_sse38_rr(X64Assembler *a, u8 prefix, u8 op,
+                                  X64XmmReg dst, X64XmmReg src) {
+	if (prefix) x64_enc_b(a, prefix);
+	bool R = (dst >= 8);
+	bool B = (src >= 8);
+	if (R || B) x64_enc_b(a, cast(u8)(0x40u | (R ? 0x04u : 0u) | (B ? 0x01u : 0u)));
+	x64_enc_b(a, 0x0Fu); x64_enc_b(a, 0x38u); x64_enc_b(a, op);
+	x64_enc_b(a, cast(u8)(0xC0u | ((dst & 7u) << 3) | (src & 7u)));
+}
+
+// ---- AVX/AVX2 VEX-prefix encoders ----------------------------------------------------------------
+// VEX fields are stored INVERTED (1 = "not extended"). We always emit the 3-byte (C4) form — it can
+// encode every map/W combination, so we skip the 2-byte (C5) shortcut (a pure size optimization, TODO).
+//   pp: 0=none 1=66 2=F3 3=F2     mm (map): 1=0F 2=0F38 3=0F3A     L: false=128(xmm) true=256(ymm)
+//   reg/rm = ModRM operands; vvvv = the (non-destructive) 2nd source register — pass X64XmmReg_XMM0 for
+//   ops with no 2nd source (its inverted encoding 1111 is exactly the spec's "unused" value).
+gb_internal void x64_enc_vex3(X64Assembler *a, bool R, bool X, bool B, u8 mm, bool W, u8 vvvv, bool L, u8 pp) {
+	x64_enc_b(a, 0xC4u);
+	x64_enc_b(a, cast(u8)(((R?0u:1u)<<7) | ((X?0u:1u)<<6) | ((B?0u:1u)<<5) | (mm & 0x1Fu)));
+	x64_enc_b(a, cast(u8)(((W?1u:0u)<<7) | (((~cast(u32)vvvv) & 0xFu)<<3) | ((L?1u:0u)<<2) | (pp & 3u)));
+}
+
+gb_internal void x64_emit_vex_rr(X64Assembler *a, u8 pp, u8 mm, u8 op, bool W, bool L,
+                                 X64XmmReg reg, X64XmmReg vvvv, X64XmmReg rm) {
+	x64_enc_vex3(a, reg>=8, false, rm>=8, mm, W, cast(u8)vvvv, L, pp);
+	x64_enc_b(a, op);
+	x64_enc_b(a, cast(u8)(0xC0u | ((reg & 7u) << 3) | (rm & 7u)));
+}
+gb_internal void x64_emit_vex_rm(X64Assembler *a, u8 pp, u8 mm, u8 op, bool W, bool L,
+                                 X64XmmReg reg, X64XmmReg vvvv, X64Mem rm) {
+	X64Reg base = rm.rip_rel ? X64Reg_NONE : rm.base;
+	bool Xb = (rm.index != X64Reg_NONE) && (rm.index >= 8);
+	bool Bb = (base != X64Reg_NONE) && (base >= 8);
+	x64_enc_vex3(a, reg>=8, Xb, Bb, mm, W, cast(u8)vvvv, L, pp);
+	x64_enc_b(a, op);
+	x64_enc_modrm_mem(a, cast(u8)(reg & 7u), rm);
+}
+gb_internal void x64_emit_vex_mr(X64Assembler *a, u8 pp, u8 mm, u8 op, bool W, bool L,
+                                 X64Mem rm, X64XmmReg vvvv, X64XmmReg reg) {
+	X64Reg base = rm.rip_rel ? X64Reg_NONE : rm.base;
+	bool Xb = (rm.index != X64Reg_NONE) && (rm.index >= 8);
+	bool Bb = (base != X64Reg_NONE) && (base >= 8);
+	x64_enc_vex3(a, reg>=8, Xb, Bb, mm, W, cast(u8)vvvv, L, pp);
+	x64_enc_b(a, op);
+	x64_enc_modrm_mem(a, cast(u8)(reg & 7u), rm);
+}
+// imm8-suffixed reg-reg form (vroundps/pd, vpermq/pd, vshufps, vpblendd, vblendv* — the latter encode
+// a register selector in imm8[7:4]).
+gb_internal void x64_emit_vex_rr_i(X64Assembler *a, u8 pp, u8 mm, u8 op, bool W, bool L,
+                                   X64XmmReg reg, X64XmmReg vvvv, X64XmmReg rm, u8 imm) {
+	x64_emit_vex_rr(a, pp, mm, op, W, L, reg, vvvv, rm);
+	x64_enc_b(a, imm);
+}
+
+// VSIB gather form: ModRM.reg = dst, SIB index = a VECTOR register (xmm/ymm), base = GP. Used by
+// vpgatherdd/vgatherdps and friends. mod/disp follow the standard rules; index high bit → VEX.X.
+gb_internal void x64_emit_vex_gather(X64Assembler *a, u8 pp, u8 mm, u8 op, bool W, bool L,
+                                     X64XmmReg dst, X64XmmReg mask, X64Reg base, X64XmmReg vindex, u8 scale) {
+	x64_enc_vex3(a, dst>=8, vindex>=8, base>=8, mm, W, cast(u8)mask, L, pp);
+	x64_enc_b(a, op);
+	// mod=00 (no disp) with SIB; base RBP/R13 (lo==5) needs mod=01+disp8=0, like x64_enc_modrm_mem.
+	u8 base_lo = cast(u8)(base & 7u);
+	u8 mod = (base_lo == 5u) ? 1u : 0u;
+	x64_enc_b(a, cast(u8)((mod << 6) | ((dst & 7u) << 3) | 4u)); // r/m=100 → SIB
+	u8 scale_bits = scale==8?3u : scale==4?2u : scale==2?1u : 0u;
+	x64_enc_b(a, cast(u8)((scale_bits << 6) | ((vindex & 7u) << 3) | base_lo));
+	if (mod == 1u) x64_enc_b(a, 0u);
+}
+
+// VZEROUPPER (C5 F8 77): zero bits 255:128 of all YMM regs, preserving the low 128 (XMM). Emitted on
+// exit from AVX2 SIMD codegen so the boundary with the rest of the backend's legacy-SSE instructions
+// (scalar float math, movups struct copies) doesn't hit the SSE↔AVX transition stall.
+gb_internal void x64_emit_vzeroupper(X64Assembler *a) {
+	x64_enc_b(a, 0xC5u); x64_enc_b(a, 0xF8u); x64_enc_b(a, 0x77u);
 }
 
 // SSE2 int<->float conversion (has W bit from GP register width)
@@ -745,12 +822,28 @@ gb_internal void x64_emit_##name##_mi(X64Assembler *a, X64OpSize sz, X64Mem dst,
 
 X64_ALU_IMPL(add, 0x00, 0)
 X64_ALU_IMPL(or,  0x08, 1)
+X64_ALU_IMPL(adc, 0x10, 2)
+X64_ALU_IMPL(sbb, 0x18, 3)
 X64_ALU_IMPL(and, 0x20, 4)
 X64_ALU_IMPL(sub, 0x28, 5)
 X64_ALU_IMPL(xor, 0x30, 6)
 X64_ALU_IMPL(cmp, 0x38, 7)
 
 #undef X64_ALU_IMPL
+
+// SHLD/SHRD r/m, r, CL  (0F A5 /r ; 0F AD /r). reg field = src, r/m = dst.
+gb_internal void x64_emit_shld_rcl(X64Assembler *a, X64OpSize sz, X64Reg dst, X64Reg src) {
+	if (sz == X64OpSize_16) x64_enc_b(a, 0x66u);
+	x64_enc_rex(a, sz, src, dst, X64Reg_NONE);
+	x64_enc_b(a, 0x0Fu); x64_enc_b(a, 0xA5u);
+	x64_enc_b(a, cast(u8)(0xC0u | ((src & 7u) << 3) | (dst & 7u)));
+}
+gb_internal void x64_emit_shrd_rcl(X64Assembler *a, X64OpSize sz, X64Reg dst, X64Reg src) {
+	if (sz == X64OpSize_16) x64_enc_b(a, 0x66u);
+	x64_enc_rex(a, sz, src, dst, X64Reg_NONE);
+	x64_enc_b(a, 0x0Fu); x64_enc_b(a, 0xADu);
+	x64_enc_b(a, cast(u8)(0xC0u | ((src & 7u) << 3) | (dst & 7u)));
+}
 
 gb_internal void x64_emit_test_rr(X64Assembler *a, X64OpSize sz, X64Reg lhs, X64Reg rhs) {
 	// TEST r/m, r  (85 /r; 84 /r for 8-bit) — lhs is r/m, rhs is reg
@@ -969,6 +1062,101 @@ gb_internal void x64_emit_movsd_mr(X64Assembler *a, X64Mem dst, X64XmmReg src)  
 gb_internal void x64_emit_movss_rr(X64Assembler *a, X64XmmReg dst, X64XmmReg src) { x64_enc_sse_rr(a, 0xF3u, 0x10u, dst, src); }
 gb_internal void x64_emit_movss_rm(X64Assembler *a, X64XmmReg dst, X64Mem src)    { x64_enc_sse_rm(a, 0xF3u, 0x10u, dst, src); }
 gb_internal void x64_emit_movss_mr(X64Assembler *a, X64Mem dst, X64XmmReg src)    { x64_enc_sse_mr(a, 0xF3u, 0x11u, dst, src); }
+
+// Unaligned 128-bit packed move (load/store a whole #simd vector). No mandatory prefix: 0F 10 / 0F 11.
+gb_internal void x64_emit_movups_rm(X64Assembler *a, X64XmmReg dst, X64Mem src)   { x64_enc_sse_rm(a, 0x00u, 0x10u, dst, src); }
+gb_internal void x64_emit_movups_mr(X64Assembler *a, X64Mem dst, X64XmmReg src)   { x64_enc_sse_mr(a, 0x00u, 0x11u, dst, src); }
+
+// ROUNDPS/ROUNDPD xmm1, xmm2, imm8 (SSE4.1): 66 0F 3A 08/09 /r ib. imm8 picks the rounding mode
+// (0x09 floor, 0x0A ceil, 0x0B trunc, 0x0C nearbyint; all | 0x08 to suppress the precision exception).
+gb_internal void x64_emit_round_packed(X64Assembler *a, u8 op, X64XmmReg dst, X64XmmReg src, u8 imm) {
+	x64_enc_b(a, 0x66u);
+	bool R = (dst >= 8);
+	bool B = (src >= 8);
+	if (R || B) x64_enc_b(a, cast(u8)(0x40u | (R ? 0x04u : 0u) | (B ? 0x01u : 0u)));
+	x64_enc_b(a, 0x0Fu); x64_enc_b(a, 0x3Au); x64_enc_b(a, op);
+	x64_enc_b(a, cast(u8)(0xC0u | ((dst & 7u) << 3) | (src & 7u)));
+	x64_enc_b(a, imm);
+}
+gb_internal void x64_emit_roundps(X64Assembler *a, X64XmmReg dst, X64XmmReg src, u8 imm) { x64_emit_round_packed(a, 0x08u, dst, src, imm); }
+gb_internal void x64_emit_roundpd(X64Assembler *a, X64XmmReg dst, X64XmmReg src, u8 imm) { x64_emit_round_packed(a, 0x09u, dst, src, imm); }
+
+// --- Packed (whole-XMM) SSE ops for #simd vectors: every lane at once ---
+// Float single (no prefix) / double (0x66).
+gb_internal void x64_emit_addps(X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x00u, 0x58u, d, s); }
+gb_internal void x64_emit_subps(X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x00u, 0x5Cu, d, s); }
+gb_internal void x64_emit_mulps(X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x00u, 0x59u, d, s); }
+gb_internal void x64_emit_divps(X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x00u, 0x5Eu, d, s); }
+gb_internal void x64_emit_minps(X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x00u, 0x5Du, d, s); }
+gb_internal void x64_emit_maxps(X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x00u, 0x5Fu, d, s); }
+gb_internal void x64_emit_addpd(X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x66u, 0x58u, d, s); }
+gb_internal void x64_emit_subpd(X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x66u, 0x5Cu, d, s); }
+gb_internal void x64_emit_mulpd(X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x66u, 0x59u, d, s); }
+gb_internal void x64_emit_divpd(X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x66u, 0x5Eu, d, s); }
+gb_internal void x64_emit_minpd(X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x66u, 0x5Du, d, s); }
+gb_internal void x64_emit_maxpd(X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x66u, 0x5Fu, d, s); }
+// Integer (0x66): add/sub by lane width, bitwise (width-agnostic), eq/gt compares, 16/32-bit multiply.
+gb_internal void x64_emit_paddb(X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x66u, 0xFCu, d, s); }
+gb_internal void x64_emit_paddw(X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x66u, 0xFDu, d, s); }
+gb_internal void x64_emit_paddd(X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x66u, 0xFEu, d, s); }
+gb_internal void x64_emit_paddq(X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x66u, 0xD4u, d, s); }
+gb_internal void x64_emit_psubb(X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x66u, 0xF8u, d, s); }
+gb_internal void x64_emit_psubw(X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x66u, 0xF9u, d, s); }
+gb_internal void x64_emit_psubd(X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x66u, 0xFAu, d, s); }
+gb_internal void x64_emit_psubq(X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x66u, 0xFBu, d, s); }
+gb_internal void x64_emit_pand (X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x66u, 0xDBu, d, s); }
+gb_internal void x64_emit_por  (X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x66u, 0xEBu, d, s); }
+gb_internal void x64_emit_pxor (X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x66u, 0xEFu, d, s); }
+gb_internal void x64_emit_pandn(X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x66u, 0xDFu, d, s); } // (~d) & s
+gb_internal void x64_emit_pcmpeqb(X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x66u, 0x74u, d, s); }
+gb_internal void x64_emit_pcmpeqw(X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x66u, 0x75u, d, s); }
+gb_internal void x64_emit_pcmpeqd(X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x66u, 0x76u, d, s); }
+gb_internal void x64_emit_pcmpgtb(X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x66u, 0x64u, d, s); }
+gb_internal void x64_emit_pcmpgtw(X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x66u, 0x65u, d, s); }
+gb_internal void x64_emit_pcmpgtd(X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x66u, 0x66u, d, s); }
+gb_internal void x64_emit_pmullw (X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x66u, 0xD5u, d, s); }
+// 3-byte (66 0F 38) SSE4.1/4.2.
+gb_internal void x64_emit_pmulld (X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse38_rr(a, 0x66u, 0x40u, d, s); }
+gb_internal void x64_emit_pcmpeqq(X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse38_rr(a, 0x66u, 0x29u, d, s); }
+gb_internal void x64_emit_pcmpgtq(X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse38_rr(a, 0x66u, 0x37u, d, s); }
+gb_internal void x64_emit_pminsb (X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse38_rr(a, 0x66u, 0x38u, d, s); }
+gb_internal void x64_emit_pminsd (X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse38_rr(a, 0x66u, 0x39u, d, s); }
+gb_internal void x64_emit_pmaxsb (X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse38_rr(a, 0x66u, 0x3Cu, d, s); }
+gb_internal void x64_emit_pmaxsd (X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse38_rr(a, 0x66u, 0x3Du, d, s); }
+gb_internal void x64_emit_pminuw (X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse38_rr(a, 0x66u, 0x3Au, d, s); }
+gb_internal void x64_emit_pminud (X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse38_rr(a, 0x66u, 0x3Bu, d, s); }
+gb_internal void x64_emit_pmaxuw (X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse38_rr(a, 0x66u, 0x3Eu, d, s); }
+gb_internal void x64_emit_pmaxud (X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse38_rr(a, 0x66u, 0x3Fu, d, s); }
+gb_internal void x64_emit_pminub (X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x66u, 0xDAu, d, s); }
+gb_internal void x64_emit_pmaxub (X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x66u, 0xDEu, d, s); }
+gb_internal void x64_emit_pminsw (X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x66u, 0xEAu, d, s); }
+gb_internal void x64_emit_pmaxsw (X64Assembler *a, X64XmmReg d, X64XmmReg s) { x64_enc_sse_rr(a, 0x66u, 0xEEu, d, s); }
+
+// CMPPS/CMPPD xmm1, xmm2, imm8 (packed compare → per-lane all-ones/all-zeros mask): 0F C2 /r ib.
+gb_internal void x64_emit_cmpps(X64Assembler *a, X64XmmReg d, X64XmmReg s, u8 imm) {
+	bool R = (d >= 8), B = (s >= 8);
+	if (R || B) x64_enc_b(a, cast(u8)(0x40u | (R ? 0x04u : 0u) | (B ? 0x01u : 0u)));
+	x64_enc_b(a, 0x0Fu); x64_enc_b(a, 0xC2u);
+	x64_enc_b(a, cast(u8)(0xC0u | ((d & 7u) << 3) | (s & 7u)));
+	x64_enc_b(a, imm);
+}
+gb_internal void x64_emit_cmppd(X64Assembler *a, X64XmmReg d, X64XmmReg s, u8 imm) {
+	x64_enc_b(a, 0x66u);
+	bool R = (d >= 8), B = (s >= 8);
+	if (R || B) x64_enc_b(a, cast(u8)(0x40u | (R ? 0x04u : 0u) | (B ? 0x01u : 0u)));
+	x64_enc_b(a, 0x0Fu); x64_enc_b(a, 0xC2u);
+	x64_enc_b(a, cast(u8)(0xC0u | ((d & 7u) << 3) | (s & 7u)));
+	x64_enc_b(a, imm);
+}
+// PSRLDQ xmm, imm8 — shift the WHOLE 128-bit register right by imm bytes (zero-fill). 66 0F 73 /3 ib.
+// Used to fold lanes in a horizontal reduction.
+gb_internal void x64_emit_psrldq(X64Assembler *a, X64XmmReg d, u8 imm) {
+	x64_enc_b(a, 0x66u);
+	if (d >= 8) x64_enc_b(a, 0x41u); // REX.B (r/m is the xmm)
+	x64_enc_b(a, 0x0Fu); x64_enc_b(a, 0x73u);
+	x64_enc_b(a, cast(u8)(0xC0u | (3u << 3) | (d & 7u))); // /3
+	x64_enc_b(a, imm);
+}
 
 gb_internal void x64_emit_addsd(X64Assembler *a, X64XmmReg dst, X64XmmReg src)  { x64_enc_sse_rr(a, 0xF2u, 0x58u, dst, src); }
 gb_internal void x64_emit_subsd(X64Assembler *a, X64XmmReg dst, X64XmmReg src)  { x64_enc_sse_rr(a, 0xF2u, 0x5Cu, dst, src); }

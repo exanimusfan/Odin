@@ -220,13 +220,20 @@ gb_internal void x64_emit_cmov_rm(X64Assembler *a, X64Cc cc, X64OpSize sz, X64Re
 	gb_internal void x64_emit_##op##_mi(X64Assembler *a, X64OpSize sz, X64Mem  dst, i32    imm)
 
 X64_ALU_DECLS(add);
+X64_ALU_DECLS(adc); // add-with-carry (128-bit lo:hi arithmetic)
 X64_ALU_DECLS(sub);
+X64_ALU_DECLS(sbb); // sub-with-borrow (128-bit lo:hi arithmetic)
 X64_ALU_DECLS(and);
 X64_ALU_DECLS(or);
 X64_ALU_DECLS(xor);
 X64_ALU_DECLS(cmp); // sets flags only, does not write result
 
 #undef X64_ALU_DECLS
+
+// Double-precision shifts (for 128-bit lo:hi shifting). `dst` is r/m, `src` is the reg whose bits fill
+// in. shld: dst = (dst << cl) | (src >> (n-cl)); shrd: dst = (dst >> cl) | (src << (n-cl)). CL form only.
+gb_internal void x64_emit_shld_rcl(X64Assembler *a, X64OpSize sz, X64Reg dst, X64Reg src);
+gb_internal void x64_emit_shrd_rcl(X64Assembler *a, X64OpSize sz, X64Reg dst, X64Reg src);
 
 gb_internal void x64_emit_test_rr(X64Assembler *a, X64OpSize sz, X64Reg lhs, X64Reg rhs);
 gb_internal void x64_emit_test_ri(X64Assembler *a, X64OpSize sz, X64Reg lhs, i32    imm);
@@ -286,6 +293,72 @@ gb_internal void x64_emit_movsd_mr(X64Assembler *a, X64Mem dst, X64XmmReg src);
 gb_internal void x64_emit_movss_rr(X64Assembler *a, X64XmmReg dst, X64XmmReg src);
 gb_internal void x64_emit_movss_rm(X64Assembler *a, X64XmmReg dst, X64Mem src);
 gb_internal void x64_emit_movss_mr(X64Assembler *a, X64Mem dst, X64XmmReg src);
+
+// AVX/AVX2 VEX-encoded generic emitters (pp: 0=none 1=66 2=F3 3=F2; mm: 1=0F 2=0F38 3=0F3A;
+// L: false=128/xmm true=256/ymm; vvvv = 2nd source, pass X64XmmReg_XMM0 when the op has none).
+gb_internal void x64_emit_vex_rr(X64Assembler *a, u8 pp, u8 mm, u8 op, bool W, bool L, X64XmmReg reg, X64XmmReg vvvv, X64XmmReg rm);
+gb_internal void x64_emit_vex_rm(X64Assembler *a, u8 pp, u8 mm, u8 op, bool W, bool L, X64XmmReg reg, X64XmmReg vvvv, X64Mem rm);
+gb_internal void x64_emit_vex_mr(X64Assembler *a, u8 pp, u8 mm, u8 op, bool W, bool L, X64Mem rm, X64XmmReg vvvv, X64XmmReg reg);
+gb_internal void x64_emit_vex_rr_i(X64Assembler *a, u8 pp, u8 mm, u8 op, bool W, bool L, X64XmmReg reg, X64XmmReg vvvv, X64XmmReg rm, u8 imm);
+gb_internal void x64_emit_vex_gather(X64Assembler *a, u8 pp, u8 mm, u8 op, bool W, bool L, X64XmmReg dst, X64XmmReg mask, X64Reg base, X64XmmReg vindex, u8 scale);
+gb_internal void x64_emit_vzeroupper(X64Assembler *a);
+
+// Unaligned 128-bit packed move + packed round (SSE4.1) — for #simd vector ops
+gb_internal void x64_emit_movups_rm(X64Assembler *a, X64XmmReg dst, X64Mem src);
+gb_internal void x64_emit_movups_mr(X64Assembler *a, X64Mem dst, X64XmmReg src);
+gb_internal void x64_emit_roundps(X64Assembler *a, X64XmmReg dst, X64XmmReg src, u8 imm);
+gb_internal void x64_emit_roundpd(X64Assembler *a, X64XmmReg dst, X64XmmReg src, u8 imm);
+
+// Packed (whole-XMM) ops for #simd vectors
+gb_internal void x64_emit_addps(X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_subps(X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_mulps(X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_divps(X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_minps(X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_maxps(X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_addpd(X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_subpd(X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_mulpd(X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_divpd(X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_minpd(X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_maxpd(X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_paddb(X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_paddw(X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_paddd(X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_paddq(X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_psubb(X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_psubw(X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_psubd(X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_psubq(X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_pand (X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_por  (X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_pxor (X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_pandn(X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_pcmpeqb(X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_pcmpeqw(X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_pcmpeqd(X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_pcmpgtb(X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_pcmpgtw(X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_pcmpgtd(X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_pmullw (X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_pmulld (X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_pcmpeqq(X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_pcmpgtq(X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_pminsb (X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_pminsd (X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_pmaxsb (X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_pmaxsd (X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_pminuw (X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_pminud (X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_pmaxuw (X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_pmaxud (X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_pminub (X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_pmaxub (X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_pminsw (X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_pmaxsw (X64Assembler *a, X64XmmReg d, X64XmmReg s);
+gb_internal void x64_emit_cmpps(X64Assembler *a, X64XmmReg d, X64XmmReg s, u8 imm);
+gb_internal void x64_emit_cmppd(X64Assembler *a, X64XmmReg d, X64XmmReg s, u8 imm);
+gb_internal void x64_emit_psrldq(X64Assembler *a, X64XmmReg d, u8 imm);
 
 // Arithmetic (scalar double)
 gb_internal void x64_emit_addsd(X64Assembler *a, X64XmmReg dst, X64XmmReg src);

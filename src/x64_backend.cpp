@@ -6,6 +6,7 @@
 #include "x64_backend_const.cpp"
 #include "x64_backend_proc.cpp"
 #include "x64_backend_expr.cpp"
+#include "x64_backend_map.cpp"
 #include "x64_backend_stmt.cpp"
 
 // Pad .debug$S to a 4-byte boundary using CodeView LF_PAD bytes (the convention
@@ -106,6 +107,10 @@ gb_internal x64Module *x64_module_create(x64Generator *gen, AstPackage *pkg, Ast
 
 	map_init(&m->cv_types, 64);
 	m->cv_next_type = 0x1000; // user type indices start here; below is built-in
+	map_init(&m->cv_func_ids, 16);
+	array_init(&m->cv_inlinees, a, 0, 8);
+	m->cv_empty_arglist = 0;
+	m->cv_void_proc_type = 0;
 
 	// CodeView debug info (.debug$S symbols/lines + .debug$T types) — appended
 	// last (sections 7, 8) and ONLY for -debug builds. Without -debug the backend
@@ -137,6 +142,9 @@ gb_internal x64Module *x64_module_create(x64Generator *gen, AstPackage *pkg, Ast
 	array_init(&m->cv_file_offs,  a, 0, 8);
 	array_init(&m->compile_roots, a, 0, 16);
 	mpsc_init(&m->proc_queue, a);
+	mpsc_init(&m->synth_queue, a);
+	map_init(&m->map_info_map, 8);
+	map_init(&m->map_cell_info_map, 8);
 	array_init(&m->onref_globals, a, 0, 8);
 	string_map_init(&m->const_strings, 16);
 
@@ -148,6 +156,27 @@ gb_internal x64Module *x64_module_create(x64Generator *gen, AstPackage *pkg, Ast
 // in the module are compiled and before the COFF file is written.
 gb_internal void x64_module_finalize_debug(x64Module *m) {
 	if (m->debug_s == nullptr || m->cv_filechksms.count == 0) return;
+
+	// DEBUG_S_INLINEELINES (0xF6) — each inlined callee (LF_FUNC_ID) → its source file + decl line,
+	// the base the S_INLINESITE binary annotations are relative to. Emitted BEFORE F4 so a file first
+	// seen here still lands in the checksum table. payload: signature(4) + n*(inlinee,file,line)(12).
+	if (m->cv_inlinees.count > 0) {
+		u32 cb = 4 + (u32)m->cv_inlinees.count * 12;
+		coff_section_write_u32(m->debug_s, 0xF6u);
+		coff_section_write_u32(m->debug_s, cb);
+		coff_section_write_u32(m->debug_s, 0); // CV_INLINEE_SOURCE_LINE_SIGNATURE (normal)
+		for (isize i = 0; i < m->cv_inlinees.count; i++) {
+			Entity *callee = m->cv_inlinees[i];
+			u32 *fid = map_get(&m->cv_func_ids, callee);
+			DeclInfo *d = decl_info_of_entity(callee);
+			Ast *pl = (d != nullptr) ? d->proc_lit : nullptr;
+			TokenPos dp = (pl != nullptr) ? ast_token(pl).pos : callee->token.pos;
+			coff_section_write_u32(m->debug_s, fid ? *fid : 0u);
+			coff_section_write_u32(m->debug_s, x64_cv_file_offset(m, dp.file_id));
+			coff_section_write_u32(m->debug_s, (u32)dp.line);
+		}
+		coff_section_align(m->debug_s, 4);
+	}
 
 	// DEBUG_S_FILECHKSMS (0xF4)
 	coff_section_write_u32(m->debug_s, 0xF4u);
@@ -207,6 +236,7 @@ gb_internal void x64_compile_procedure(x64Module *m, Entity *e, Ast *body) {
 
 	x64Procedure *p = gb_alloc_item(a, x64Procedure);
 	p->module    = m;
+	p->alloc     = a;
 	p->entity    = e;
 	p->type      = proc_type;
 	p->link_name = link_name;
@@ -216,7 +246,13 @@ gb_internal void x64_compile_procedure(x64Module *m, Entity *e, Ast *body) {
 	array_init(&p->deferred, a, 0, 4);
 	array_init(&p->loops,    a, 0, 4);
 	array_init(&p->lines,    a, 0, 64);
+	array_init(&p->indirect_params, a, 0, 2);
+	array_init(&p->inline_frames,   a, 0, 2);
+	array_init(&p->inline_sites,    a, 0, 2);
+	p->cur_inline_site = -1;
+	p->fallthrough_lbl = -1;
 	p->cur_line = -1;
+	p->cur_file_id = -1;
 	// Line-table file from the BODY, not the entity token (mirrors LLVM's node->file()).
 	// For a generic instantiation (e.g. make_slice[[]Logger]) the entity token resolves
 	// to a DIFFERENT file than the body; wrong file → x64_record_line drops every body
@@ -382,7 +418,9 @@ gb_internal bool x64_global_has_const_init(DeclInfo *d, Entity *e) {
 
 // Emit a compile-time-const global as STATIC data (mirrors LLVM's LLVMSetInitializer).
 // @(rodata) → read-only .rdata; else writable .data. No startup-runtime store generated.
-gb_internal void x64_emit_global_static(x64Module *m, Entity *e, DeclInfo *d) {
+// `init_expr` is the constant initializer (file-scope: d->init_expr; proc-local @(static):
+// the ValueDecl value directly, mirroring lb_build_static_variables).
+gb_internal void x64_emit_global_static_value(x64Module *m, Entity *e, Ast *init_expr) {
 	String name = x64_get_entity_name(e);
 	{
 		u32 *existing = string_map_get(&m->coff.sym_map, name);
@@ -399,11 +437,14 @@ gb_internal void x64_emit_global_static(x64Module *m, Entity *e, DeclInfo *d) {
 	i16          section_number = ro ? 2 : 3;         // .rdata=2, .data=3
 
 	u32 off = x64_const_reserve(sec, al, sz);
-	TypeAndValue tav = type_and_value_of_expr(d->init_expr);
+	TypeAndValue tav = type_and_value_of_expr(init_expr);
 	x64_const_value(m, sec, off, t, tav.value, tav.type);
 
 	x64_const_define_symbol(m, name, section_number, off);
 	x64_emit_cv_global(m, name, e);
+}
+gb_internal void x64_emit_global_static(x64Module *m, Entity *e, DeclInfo *d) {
+	x64_emit_global_static_value(m, e, d->init_expr);
 }
 
 // Lazily create this module's `.tls$` section (the thread-local template the OS copies per
@@ -569,6 +610,7 @@ gb_internal void x64_emit_startup_runtime(x64Module *m, x64Generator *gen, PtrSe
 
 	x64Procedure *p = gb_alloc_item(a, x64Procedure);
 	p->module    = m;
+	p->alloc     = a;
 	p->entity    = nullptr; // synthetic — proc_end driven by link_name, not entity
 	p->type      = alloc_type_proc(nullptr, nullptr, 0, nullptr, 0, false, ProcCC_Odin);
 	p->link_name = str_lit("__$startup_runtime");
@@ -578,7 +620,13 @@ gb_internal void x64_emit_startup_runtime(x64Module *m, x64Generator *gen, PtrSe
 	array_init(&p->deferred, a, 0, 4);
 	array_init(&p->loops,    a, 0, 4);
 	array_init(&p->lines,    a, 0, 8);
+	array_init(&p->indirect_params, a, 0, 2);
+	array_init(&p->inline_frames,   a, 0, 2);
+	array_init(&p->inline_sites,    a, 0, 2);
+	p->cur_inline_site = -1;
+	p->fallthrough_lbl = -1;
 	p->cur_line = -1;
+	p->cur_file_id = -1;
 	p->file_id  = 0;
 
 	x64_proc_begin(p);
@@ -617,6 +665,124 @@ gb_internal void x64_emit_startup_runtime(x64Module *m, x64Generator *gen, PtrSe
 	x64_proc_end(p);
 }
 
+// `odin test` entry: the runtime's `main` is `when !ODIN_TEST` (absent), so generate one here
+// (mirrors lb_create_main_procedure's test path). Sets runtime.args__ from argc/argv, runs the
+// startup runtime, builds a []testing.Internal_Test{pkg,name,proc} from info->testing_procedures,
+// calls testing.runner(slice), then runtime.exit(0/1). C entry: argc in ECX, argv in RDX (Win64).
+gb_internal void x64_emit_test_main(x64Module *m, x64Generator *gen) {
+	CheckerInfo *info = gen->info;
+	AstPackage *rt = get_runtime_package(info);
+	AstPackage *tp = try_get_core_package(info, str_lit("testing"));
+	if (rt == nullptr || tp == nullptr) return;
+	Entity *startup = scope_lookup_current(rt->scope, string_interner_insert(str_lit("_startup_runtime")));
+	Entity *args_e  = scope_lookup_current(rt->scope, string_interner_insert(str_lit("args__")));
+	Entity *exit_e  = scope_lookup_current(rt->scope, string_interner_insert(str_lit("exit")));
+	Entity *runner  = scope_lookup_current(tp->scope, string_interner_insert(str_lit("runner")));
+	Type   *it_type = find_type_in_pkg(info, str_lit("testing"), str_lit("Internal_Test"));
+	if (runner == nullptr || it_type == nullptr || exit_e == nullptr) return;
+
+	Arena         *scratch = get_arena(ThreadArena_Temporary);
+	ArenaTempGuard scratch_guard(scratch);
+	gbAllocator    a = arena_allocator(scratch);
+
+	x64Procedure *p = gb_alloc_item(a, x64Procedure);
+	p->module    = m;
+	p->alloc     = a;
+	p->entity    = nullptr;
+	p->type      = alloc_type_proc(nullptr, nullptr, 0, nullptr, 0, false, ProcCC_CDecl); // C entry → generated context
+	p->link_name = str_lit("main");
+	x64_asm_init(&p->asm_, a);
+	x64_var_map_init(&p->var_offsets, a, 16);
+	array_init(&p->deferred, a, 0, 4);
+	array_init(&p->loops,    a, 0, 4);
+	array_init(&p->lines,    a, 0, 8);
+	array_init(&p->indirect_params, a, 0, 2);
+	array_init(&p->inline_frames,   a, 0, 2);
+	array_init(&p->inline_sites,    a, 0, 2);
+	p->cur_inline_site = -1;
+	p->fallthrough_lbl = -1;
+	p->cur_line = -1;
+	p->cur_file_id = -1;
+	p->file_id  = 0;
+
+	x64_proc_begin(p);
+	p->is_startup = true;
+
+	// args__ = argv[:argc]  (argc=ECX, argv=RDX at entry; the prologue doesn't touch them).
+	if (args_e != nullptr) {
+		x64_emit_mov_rr(&p->asm_, X64OpSize_32, X64Reg_R8, X64Reg_RCX);   // R8 = argc (zero-extended; argc≥0)
+		x64_emit_lea_sym(&p->asm_, X64Reg_RAX, x64_get_entity_name(args_e));
+		x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_mem(X64Reg_RAX, 0), X64Reg_RDX); // .data = argv
+		x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_mem(X64Reg_RAX, 8), X64Reg_R8);  // .len  = argc
+	}
+
+	// startup runtime (global var initializers); _startup_runtime is foreign → link __$startup_runtime.
+	if (startup != nullptr) x64_call_no_arg(p, startup);
+
+	// Run the @(init) procs (e.g. os.init_std_files setting up stdin/stdout/stderr). Normally these
+	// run inside intrinsics.__entry_point (x64_build_expr), which the test entry bypasses — so call
+	// them here, mirroring LLVM's _startup_runtime (lb_create_startup_runtime runs init_procedures).
+	for (Entity *ie : info->init_procedures) {
+		if (ie != nullptr && ie->kind == Entity_Procedure) x64_call_no_arg(p, ie);
+	}
+
+	// Build the []testing.Internal_Test backing array on the stack.
+	i64 itsz = type_size_of(it_type); if (itsz <= 0) itsz = 40;
+	i64 N    = info->testing_procedures.count;
+	i32 arr  = x64_alloc_local(p, gb_max(N*itsz, (i64)itsz), gb_max(type_align_of(it_type), (i64)8));
+	for (i64 i = 0; i < N; i++) {
+		Entity *tproc = info->testing_procedures[i];
+		if (tproc == nullptr) continue;
+		String pkg_name = (tproc->pkg != nullptr) ? tproc->pkg->name : str_lit("");
+		String tname    = tproc->token.string;
+		i32 base = arr + (i32)(i*itsz);
+		// pkg string {data,len} @ +0
+		x64_emit_lea_sym(&p->asm_, X64Reg_RAX, x64_const_intern_string(m, pkg_name));
+		x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(base + 0), X64Reg_RAX);
+		x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RAX, pkg_name.len);
+		x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(base + 8), X64Reg_RAX);
+		// name string {data,len} @ +16
+		x64_emit_lea_sym(&p->asm_, X64Reg_RAX, x64_const_intern_string(m, tname));
+		x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(base + 16), X64Reg_RAX);
+		x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RAX, tname.len);
+		x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(base + 24), X64Reg_RAX);
+		// proc pointer @ +32
+		x64_emit_lea_sym(&p->asm_, X64Reg_RAX, x64_get_entity_name(tproc));
+		x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(base + 32), X64Reg_RAX);
+	}
+
+	// slice {&arr[0], N}
+	i32 sl = x64_alloc_local(p, 16, 8);
+	x64_emit_lea(&p->asm_, X64Reg_RAX, x64_rbp_mem(arr));
+	x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(sl + 0), X64Reg_RAX);
+	x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RAX, N);
+	x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(sl + 8), X64Reg_RAX);
+
+	// runner(slice) — the slice (16B) is passed indirect (by pointer); context is the last Odin arg.
+	i32 slp = x64_alloc_local(p, 8, 8);
+	x64_emit_lea(&p->asm_, X64Reg_RAX, x64_rbp_mem(sl));
+	x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(slp), X64Reg_RAX);
+	x64Value rargs[2];
+	rargs[0] = x64v_mem(t_rawptr, x64_rbp_mem(slp));
+	rargs[1] = x64_context_ptr_value(p);
+	x64Value rres = x64_emit_call(p, x64_get_entity_name(runner), runner->type, rargs, 2); // bool → RAX
+
+	// exit(success ? 0 : 1): code = (runner result == 0) ? 1 : 0.
+	x64_value_to_reg(p, rres, X64Reg_RAX);
+	x64_emit_test_rr(&p->asm_, X64OpSize_8, X64Reg_RAX, X64Reg_RAX);
+	x64_emit_setcc_r(&p->asm_, X64Cc_E, X64Reg_RCX);                 // RCX = 1 if failed (result==0)
+	x64_emit_movzx_rr(&p->asm_, X64OpSize_8, X64Reg_RCX, X64Reg_RCX);
+	x64Value eargs[1];
+	eargs[0] = x64v_reg(t_int, X64Reg_RCX);
+	x64_emit_call(p, x64_get_entity_name(exit_e), exit_e->type, eargs, 1); // contextless (code:int) → noreturn
+
+	x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RAX, 0); // unreachable; main returns i32 0
+	x64_run_deferred(p);
+	x64_proc_emit_epilogue(p);
+	x64_emit_ret(&p->asm_);
+	x64_proc_end(p);
+}
+
 // Mirror of lb_typeid_kind — type → Typeid_Kind value (= union variant index).
 // Named types return Typeid_Invalid (0) → the Named variant (variants[0]).
 gb_internal u64 x64_typeid_kind(Type *type) {
@@ -631,6 +797,7 @@ gb_internal u64 x64_typeid_kind(Type *type) {
 		if (flags & BasicFlag_Unsigned) kind = Typeid_Integer;
 		if (flags & BasicFlag_Float)    kind = Typeid_Float;
 		if (flags & BasicFlag_Complex)  kind = Typeid_Complex;
+		if (flags & BasicFlag_Quaternion) kind = Typeid_Quaternion; // was missing → quaternion type_info tagged Named → fmt read a garbage base → crash
 		if (flags & BasicFlag_Pointer)  kind = Typeid_Pointer;
 		if (flags & BasicFlag_String)   kind = Typeid_String;
 		if (flags & BasicFlag_Rune)     kind = Typeid_Rune;
@@ -774,11 +941,13 @@ gb_internal void x64_emit_type_table(x64Generator *gen) {
 		else if (bt->kind == Type_BitField) emit = true;
 		else if (bt->kind == Type_Pointer || bt->kind == Type_MultiPointer ||
 		         bt->kind == Type_Slice   || bt->kind == Type_DynamicArray  ||
-		         bt->kind == Type_Array)  emit = true; // elem-based variants
+		         bt->kind == Type_Array   || bt->kind == Type_FixedCapacityDynamicArray) emit = true; // elem-based variants
 		else if (bt->kind == Type_Proc)   emit = true;
 		else if (bt->kind == Type_Enum)   emit = true;
 		else if (bt->kind == Type_Union)  emit = true;
 		else if (bt->kind == Type_Map)    emit = true;
+		else if (bt->kind == Type_Matrix || bt->kind == Type_SimdVector ||
+		         bt->kind == Type_BitSet || bt->kind == Type_EnumeratedArray) emit = true; // were unemitted → type_info nil/garbage → fmt(matrix)/flags(bit_set) crash
 		if (!emit) continue;
 		isize slot = type_info_index(info, pair, false);
 		if (slot < 0 || slot >= n) continue;
@@ -791,13 +960,19 @@ gb_internal void x64_emit_type_table(x64Generator *gen) {
 		if (!slot_emit[slot]) continue;
 		Type *t  = slot_type[slot];
 		Type *bt = base_type(t);
+		// Named types (distinct/aliased: time.Duration, MyDur :: distinct i64, named structs)
+		// emit a Type_Info_Named{name, base, pkg, loc} pointing at the base type's slot — NOT
+		// the base variant. Without this, fmt's named custom-formatters (Duration/Time/SCL)
+		// never fire and reflect.Type_Info_Named matching fails. Mirrors lb_type_info Type_Named.
+		bool is_named = (t->kind == Type_Named);
 
 		// Struct variant: emit names/types/offsets/usings/tags arrays first, capturing
 		// the symbol that names element 0 of each (mirrors lb_type_info Type_Struct).
 		String a_types = {}, a_names = {}, a_offsets = {}, a_usings = {}, a_tags = {};
 		i32  field_count = 0;
 		u8   struct_flags = 0;
-		Type *ci_elem = nullptr; // elem-based variants (pointer/slice/dyn-array/array)
+		Type *ci_elem = nullptr; // elem-based variants (pointer/slice/dyn-array/array/matrix/simd/bit_set/enum-array): elem @vd+0
+		Type *ci_elem2 = nullptr; i64 ci_elem2_off = 0; // secondary ^Type_Info (bit_set.underlying / enum-array.index)
 		String e_names = {}, e_values = {}; // enum names/values arrays
 		i32   e_count = 0;
 		Type *e_base  = nullptr;
@@ -806,7 +981,9 @@ gb_internal void x64_emit_type_table(x64Generator *gen) {
 		String bf_names = {}, bf_types = {}, bf_bsizes = {}, bf_boffs = {}, bf_tags = {}; // bit_field arrays
 		i32   bf_count = 0;
 		Type *bf_backing = nullptr;
-		if (bt->kind == Type_Struct) {
+		if (is_named) {
+			// no base sub-arrays for a Named variant
+		} else if (bt->kind == Type_Struct) {
 			type_set_offsets(bt);
 			isize cnt = bt->Struct.fields.count;
 			field_count = (i32)cnt;
@@ -886,33 +1063,51 @@ gb_internal void x64_emit_type_table(x64Generator *gen) {
 		gb_memmove(bytes + off_fl,  &flags, 4);
 		gb_memmove(bytes + off_id,  &id,    8);
 
-		// Union tag (1-indexed variant index)
-		u64 tag = x64_typeid_kind(t) + 1;
+		// Union tag (1-indexed variant index). Type_Info_Named is variants[0] → tag 1.
+		u64 tag = is_named ? 1 : (x64_typeid_kind(t) + 1);
 		gb_memmove(bytes + off_tag, &tag, 8);
 
 		// Variant-specific data (at off_var)
 		u8 *vd = bytes + (isize)off_var;
-		if (bt->kind == Type_Struct) {
+		if (is_named) {
+			// Type_Info_Named{name: string, base: ^Type_Info, pkg: string, loc: ^SCL}.
+			// Scalar lengths here; data ptrs + base via relocs below.
+			i64 nm_off = 0, pkg_off = 24;
+			if (t_type_info_named != nullptr) {
+				Type *tin = base_type(t_type_info_named);
+				if (tin->kind == Type_Struct && tin->Struct.fields.count >= 3) {
+					nm_off  = type_offset_of(t_type_info_named, 0);
+					pkg_off = type_offset_of(t_type_info_named, 2);
+				}
+			}
+			String nm = t->Named.type_name->token.string;
+			String pk = (t->Named.type_name->pkg != nullptr) ? t->Named.type_name->pkg->name : String{};
+			i64 nl = nm.len, pl = pk.len;
+			if (nl) gb_memmove(vd + nm_off  + 8, &nl, 8);
+			if (pl) gb_memmove(vd + pkg_off + 8, &pl, 8);
+		} else if (bt->kind == Type_Struct) {
 			// Array pointers (vd+sf_*) are filled by ADDR64 relocs below; here write the
 			// scalar fields (field_count, flags). Pointers stay zero in the buffer.
 			gb_memmove(vd + sf_fc,    &field_count,  4);
 			gb_memmove(vd + sf_flags, &struct_flags, 1);
 		} else if (bt->kind == Type_Pointer || bt->kind == Type_MultiPointer ||
 		           bt->kind == Type_Slice   || bt->kind == Type_DynamicArray  ||
-		           bt->kind == Type_Array) {
+		           bt->kind == Type_Array   || bt->kind == Type_FixedCapacityDynamicArray) {
 			// Elem-based variants: elem: ^Type_Info @vd+0 (ADDR64 reloc below),
-			// elem_size: int @vd+8 (slice/dyn-array/array), count: int @vd+16 (array).
+			// elem_size: int @vd+8 (slice/dyn-array/array/fixed-cap), count: int @vd+16 (array/fixed-cap).
 			i64 esz = 0, cnt = 0;
+			bool has_count = false;
 			switch (bt->kind) {
 			case Type_Pointer:      ci_elem = bt->Pointer.elem;      break;
 			case Type_MultiPointer: ci_elem = bt->MultiPointer.elem; break;
 			case Type_Slice:        ci_elem = bt->Slice.elem;        esz = ci_elem ? type_size_of(ci_elem) : 0; break;
 			case Type_DynamicArray: ci_elem = bt->DynamicArray.elem; esz = ci_elem ? type_size_of(ci_elem) : 0; break;
-			case Type_Array:        ci_elem = bt->Array.elem;        esz = ci_elem ? type_size_of(ci_elem) : 0; cnt = bt->Array.count; break;
+			case Type_Array:        ci_elem = bt->Array.elem;        esz = ci_elem ? type_size_of(ci_elem) : 0; cnt = bt->Array.count; has_count = true; break;
+			case Type_FixedCapacityDynamicArray: ci_elem = bt->FixedCapacityDynamicArray.elem; esz = ci_elem ? type_size_of(ci_elem) : 0; cnt = bt->FixedCapacityDynamicArray.capacity; has_count = true; break;
 			default: break;
 			}
-			if (esz != 0)                gb_memmove(vd + 8,  &esz, 8);
-			if (bt->kind == Type_Array)  gb_memmove(vd + 16, &cnt, 8);
+			if (esz != 0)   gb_memmove(vd + 8,  &esz, 8);
+			if (has_count)  gb_memmove(vd + 16, &cnt, 8);
 		} else if (bt->kind == Type_Proc) {
 			// Type_Info_Procedure: params/results (^Type_Info) left nil (Type_Info_Parameters
 			// not emitted yet), variadic: bool, convention: u8 (= calling_convention).
@@ -983,6 +1178,45 @@ gb_internal void x64_emit_type_table(x64Generator *gen) {
 		} else if (bt->kind == Type_Map) {
 			// key/value (^Type_Info) via relocs below; map_info (^Map_Info) left nil
 			// (reflection's variant check doesn't use it).
+		} else if (bt->kind == Type_Matrix) {
+			// Type_Info_Matrix{elem@0, elem_size@8, elem_stride@16, row_count@24, column_count@32,
+			// layout(u8)@40}. elem ptr via ci_elem reloc. Mirrors lb_type_info Type_Matrix.
+			ci_elem = bt->Matrix.elem;
+			i64 esz = ci_elem ? type_size_of(ci_elem) : 0;
+			i64 stride = matrix_type_stride_in_elems(bt);
+			i64 rc = bt->Matrix.row_count, cc = bt->Matrix.column_count;
+			gb_memmove(vd + 8,  &esz,    8);
+			gb_memmove(vd + 16, &stride, 8);
+			gb_memmove(vd + 24, &rc,     8);
+			gb_memmove(vd + 32, &cc,     8);
+			vd[40] = bt->Matrix.is_row_major ? 1 : 0;
+		} else if (bt->kind == Type_SimdVector) {
+			// Type_Info_Simd_Vector{elem@0, elem_size@8, count@16}.
+			ci_elem = bt->SimdVector.elem;
+			i64 esz = ci_elem ? type_size_of(ci_elem) : 0;
+			i64 cnt = bt->SimdVector.count;
+			gb_memmove(vd + 8,  &esz, 8);
+			gb_memmove(vd + 16, &cnt, 8);
+		} else if (bt->kind == Type_BitSet) {
+			// Type_Info_Bit_Set{elem@0, underlying@8, explicit_underlying(bool)@16, lower(i64)@24,
+			// upper(i64)@32}. underlying reloc only when EXPLICIT (bit_set[E; U]); mirrors LLVM.
+			ci_elem = bt->BitSet.elem;
+			i64 lo = bt->BitSet.lower, up = bt->BitSet.upper;
+			if (bt->BitSet.underlying != nullptr) { ci_elem2 = bt->BitSet.underlying; ci_elem2_off = 8; vd[16] = 1; }
+			gb_memmove(vd + 24, &lo, 8);
+			gb_memmove(vd + 32, &up, 8);
+		} else if (bt->kind == Type_EnumeratedArray) {
+			// Type_Info_Enumerated_Array{elem@0, index@8, elem_size@16, count@24, min_value@32,
+			// max_value@40, is_sparse@48}. min/max (Type_Info_Enum_Value = i64) written directly.
+			ci_elem = bt->EnumeratedArray.elem;
+			ci_elem2 = bt->EnumeratedArray.index; ci_elem2_off = 8;
+			i64 esz = ci_elem ? type_size_of(ci_elem) : 0;
+			i64 cnt = bt->EnumeratedArray.count;
+			gb_memmove(vd + 16, &esz, 8);
+			gb_memmove(vd + 24, &cnt, 8);
+			if (bt->EnumeratedArray.min_value) { i64 mn = exact_value_to_i64(*bt->EnumeratedArray.min_value); gb_memmove(vd + 32, &mn, 8); }
+			if (bt->EnumeratedArray.max_value) { i64 mx = exact_value_to_i64(*bt->EnumeratedArray.max_value); gb_memmove(vd + 40, &mx, 8); }
+			vd[48] = bt->EnumeratedArray.is_sparse ? 1 : 0;
 		} else
 		switch (bt->Basic.kind) {
 		case Basic_i8:    case Basic_u8:
@@ -1043,6 +1277,30 @@ gb_internal void x64_emit_type_table(x64Generator *gen) {
 		// Internal symbol so the pointer table reloc can reference it
 		coff_sym_add_proc(&rm->coff, x64_ti_slot_sym(slot), 2 /*rdata*/, rdata_off, false);
 
+		// Named variant: name.data + pkg.data string ptrs; base → base type's Type_Info slot.
+		if (is_named) {
+			i64 nm_off = 0, base_off = 16, pkg_off = 24;
+			if (t_type_info_named != nullptr) {
+				Type *tin = base_type(t_type_info_named);
+				if (tin->kind == Type_Struct && tin->Struct.fields.count >= 3) {
+					nm_off   = type_offset_of(t_type_info_named, 0);
+					base_off = type_offset_of(t_type_info_named, 1);
+					pkg_off  = type_offset_of(t_type_info_named, 2);
+				}
+			}
+			String nm = t->Named.type_name->token.string;
+			String pk = (t->Named.type_name->pkg != nullptr) ? t->Named.type_name->pkg->name : String{};
+			if (nm.len) coff_reloc_add(rm->rdata, rdata_off + (u32)off_var + (u32)nm_off,  x64_const_intern_string(rm, nm), COFF_REL_ADDR64);
+			if (pk.len) coff_reloc_add(rm->rdata, rdata_off + (u32)off_var + (u32)pkg_off, x64_const_intern_string(rm, pk), COFF_REL_ADDR64);
+			Type *base = t->Named.base;
+			if (base != nullptr) {
+				isize bs = type_info_index(info, base, false);
+				if (bs >= 0 && bs < n && slot_emit[bs]) {
+					coff_reloc_add(rm->rdata, rdata_off + (u32)off_var + (u32)base_off, x64_ti_slot_sym(bs), COFF_REL_ADDR64);
+				}
+			}
+		}
+
 		// Struct variant: patch the five array pointers (vd+sf_*) with ADDR64 relocs.
 		if (bt->kind == Type_Struct) {
 			u32 vbase = rdata_off + (u32)off_var;
@@ -1058,6 +1316,13 @@ gb_internal void x64_emit_type_table(x64Generator *gen) {
 			isize es = type_info_index(info, ci_elem, false);
 			if (es >= 0 && es < n && slot_emit[es]) {
 				coff_reloc_add(rm->rdata, rdata_off + (u32)off_var, x64_ti_slot_sym(es), COFF_REL_ADDR64);
+			}
+		}
+		// Secondary ^Type_Info (bit_set.underlying @+8 when explicit / enum-array.index @+8).
+		if (ci_elem2 != nullptr) {
+			isize es = type_info_index(info, ci_elem2, false);
+			if (es >= 0 && es < n && slot_emit[es]) {
+				coff_reloc_add(rm->rdata, rdata_off + (u32)off_var + (u32)ci_elem2_off, x64_ti_slot_sym(es), COFF_REL_ADDR64);
 			}
 		}
 
@@ -1129,14 +1394,18 @@ gb_internal void x64_emit_type_table(x64Generator *gen) {
 			if (bf_tags.len)   coff_reloc_add(rm->rdata, rdata_off + (u32)off_var + (u32)o_tg, bf_tags,   COFF_REL_ADDR64);
 		}
 
-		// Map variant: key (@+0) + value (@+offset_of(1)) → their Type_Info; map_info nil.
+		// Map variant: key (@0) + value (@8) + map_info (@16). map_info was left nil, but reflection
+		// DOES use it — core:flags calls `type_info.map_info.key_hasher(...)` through the reflected
+		// type_info → null-call segfault (map[cstring]cstring test hung). Point it at the same
+		// {ks,vs,key_hasher,key_equal} Map_Info global the compiled map ops use.
 		if (bt->kind == Type_Map) {
-			i64 ok2 = 0, ov2 = 8;
+			i64 ok2 = 0, ov2 = 8, om2 = 16;
 			if (t_type_info_map != nullptr) {
 				Type *tim = base_type(t_type_info_map);
-				if (tim->kind == Type_Struct && tim->Struct.fields.count >= 2) {
+				if (tim->kind == Type_Struct && tim->Struct.fields.count >= 3) {
 					ok2 = type_offset_of(t_type_info_map, 0);
 					ov2 = type_offset_of(t_type_info_map, 1);
+					om2 = type_offset_of(t_type_info_map, 2);
 				}
 			}
 			if (bt->Map.key != nullptr) {
@@ -1147,6 +1416,11 @@ gb_internal void x64_emit_type_table(x64Generator *gen) {
 				isize vs = type_info_index(info, bt->Map.value, false);
 				if (vs >= 0 && vs < n && slot_emit[vs]) coff_reloc_add(rm->rdata, rdata_off + (u32)off_var + (u32)ov2, x64_ti_slot_sym(vs), COFF_REL_ADDR64);
 			}
+			// x64_gen_map_info_ptr is dedup'd: for a map already used in compiled code it returns the
+			// cached symbol (no new work); for a reflection-only map it emits the global + enqueues the
+			// synth hasher/equal — drained right after x64_emit_type_table (else unresolved external).
+			String mi_sym = x64_gen_map_info_ptr(rm, bt);
+			if (mi_sym.len > 0) coff_reloc_add(rm->rdata, rdata_off + (u32)off_var + (u32)om2, mi_sym, COFF_REL_ADDR64);
 		}
 	}
 
@@ -1287,10 +1561,19 @@ gb_internal WORKER_TASK_PROC(x64_write_module_worker) {
 // into any module's queue. Mirrors lb_generate_procedures_worker_proc.
 gb_internal WORKER_TASK_PROC(x64_generate_pending_worker) {
 	x64Module *m = cast(x64Module *)data;
-	for (Entity *e = nullptr; mpsc_dequeue(&m->proc_queue, &e); /**/) {
-		DeclInfo *decl = decl_info_of_entity(e);
-		if (decl == nullptr || decl->proc_lit == nullptr) continue;
-		x64_compile_procedure(m, e, decl->proc_lit->ProcLit.body); // dedups internally if already emitted
+	// Loop: compiling a proc may emit a map op → enqueue synth hashers; a synth hasher may
+	// enqueue child hashers (synth_queue) and runtime hashers (proc_queue). Drain both to a
+	// local fixpoint; the outer driver handles cross-module enqueues.
+	for (;;) {
+		bool did = false;
+		for (Entity *e = nullptr; mpsc_dequeue(&m->proc_queue, &e); /**/) {
+			DeclInfo *decl = decl_info_of_entity(e);
+			if (decl == nullptr || decl->proc_lit == nullptr) continue;
+			x64_compile_procedure(m, e, decl->proc_lit->ProcLit.body); // dedups internally if already emitted
+			did = true;
+		}
+		if (x64_generate_synth_procs(m)) did = true;
+		if (!did) break;
 	}
 	return 0;
 }
@@ -1309,7 +1592,8 @@ gb_internal void x64_generate_pending(x64Generator *gen, bool threaded) {
 		}
 		bool any = false;
 		for (auto const &entry : gen->modules) {
-			if (entry.value->proc_queue.count.load(std::memory_order_relaxed) != 0) { any = true; break; }
+			if (entry.value->proc_queue.count.load(std::memory_order_relaxed) != 0 ||
+			    entry.value->synth_queue.count.load(std::memory_order_relaxed) != 0) { any = true; break; }
 		}
 		if (!any) break;
 		GB_ASSERT(retry++ <= gen->modules.count); // bounded: each round drains ≥1 queue to no-ops
@@ -1431,6 +1715,13 @@ gb_internal x64Generator *x64_generate_code(Checker *c) {
 		for (Entity *ie : info->init_procedures) {
 			if (ie != nullptr && ie->kind == Entity_Procedure) array_add(&roots, ie);
 		}
+		// `odin test`: the @(test) procs are referenced only by the synthetic main we generate
+		// (x64_emit_test_main), so force them in (they may have min_dep_count == 0).
+		if (build_context.command_kind == Command_test) {
+			for (Entity *te : info->testing_procedures) {
+				if (te != nullptr && te->kind == Entity_Procedure) array_add(&roots, te);
+			}
+		}
 		// Distribute roots to their owning module (token-pos order → deterministic
 		// per-module COFF output regardless of thread scheduling).
 		array_sort(roots, x64_proc_entity_cmp);
@@ -1468,6 +1759,8 @@ gb_internal x64Generator *x64_generate_code(Checker *c) {
 				x64Module *m = entry.value;
 				if (m->pkg->kind == Package_Runtime && m->file == nullptr) {
 					x64_emit_startup_runtime(m, gen, &defined);
+					// `odin test`: generate the synthetic `main` (runtime's is `when !ODIN_TEST`).
+					if (build_context.command_kind == Command_test) x64_emit_test_main(m, gen);
 					break;
 				}
 			}
@@ -1490,6 +1783,9 @@ gb_internal x64Generator *x64_generate_code(Checker *c) {
 
 	// Emit runtime.type_table — after all procs compiled (modules exist), before write.
 	x64_emit_type_table(gen);
+	// The type table's map variants generate Map_Info globals for reflection-only map types, which
+	// enqueue their synth hasher/equal procs. Drain so those symbols get defined before the write.
+	x64_generate_pending(gen, global_thread_pool.threads.count > 1);
 
 	// Serialize + write one COFF object per module in parallel (independent files).
 	{
@@ -1529,7 +1825,11 @@ gb_internal x64Generator *x64_generate_code(Checker *c) {
 					ScopeMapSlot *slot = &s->elements.slots[i];
 					if (slot->hash == 0) continue;
 					Entity *e = slot->value;
-					if (e != nullptr && e->kind == Entity_LibraryName) {
+					// Match LLVM (lb_add_foreign_library_path asserts EntityFlag_Used): only
+					// collect libraries whose foreign entities are actually USED. Passing stray
+					// declared-but-unused libs lets one win symbol resolution over the correct one
+					// (Kernel32.lib vs Synchronization.lib for WakeByAddressSingle).
+					if (e != nullptr && e->kind == Entity_LibraryName && (e->flags & EntityFlag_Used)) {
 						x64_add_foreign_lib(gen, e);
 					}
 				}
@@ -1540,6 +1840,12 @@ gb_internal x64Generator *x64_generate_code(Checker *c) {
 			x64_add_foreign_lib(gen, lib);
 		}
 	}
+
+	// Deterministic link order, EXACTLY like LLVM (lb_generate_code): sort by priority_index, then
+	// package/file/source order. The unsorted scope-walk order let Kernel32.lib precede
+	// Synchronization.lib, so WakeByAddressSingle resolved against the wrong DLL
+	// (STATUS_ENTRYPOINT_NOT_FOUND) once the Windows SDK changed (VS uninstall).
+	array_sort(gen->foreign_libraries, foreign_library_cmp);
 
 	return gen;
 }
