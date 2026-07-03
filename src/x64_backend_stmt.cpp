@@ -305,21 +305,33 @@ gb_internal void x64_build_return_stmt(x64Procedure *p, Slice<Ast *> const &resu
 				sfoff += ssz;
 			}
 		} else {
-			// `return v0, v1, ...` — one expression per result. Store each into its NAMED result
-			// local (when one exists) so pending defers OBSERVE — and may MODIFY — them before the
-			// ABI write, mirroring LLVM (which stores into the result vars then lb_emit_defer_stmts).
-			// Fresh temps don't reach the named locals → a `defer if !ok {…}` saw the zero-init ok
-			// after `return true, nil` (THE json unmarshal_string_token bug: it freed the stored
-			// string). The marshal loop below reads toff[i], so named-local writes flow through.
+			// `return v0, v1, ...` — one expression per result. Evaluate ALL expressions into fresh
+			// temps FIRST, reading the current named-result locals, THEN copy into the named locals —
+			// otherwise `return b, a` (a,b ARE the named results) stores a=b before reading a, aliasing
+			// both to b. Mirrors LLVM's evaluate-then-store (SSA) ordering. The named-local write is kept
+			// so pending defers OBSERVE — and may MODIFY — the results before the ABI write (a `defer if
+			// !ok {…}` saw the zero-init ok after `return true, nil` — THE json unmarshal_string_token
+			// bug). The marshal loop below reads toff[i], so named-local writes flow through.
+			Array<i32> vtmp; array_init(&vtmp, temporary_allocator(), nres, nres);
 			for (int i = 0; i < nres && i < res_count; i++) {
 				i64 fsz = type_size_of(ttyp[i]); if (fsz <= 0) fsz = 1;
 				i64 fal = type_align_of(ttyp[i]); if (fal <= 0) fal = 1;
 				x64Value v = x64_build_expr(p, results[i]);
+				i32 vt = x64_alloc_local(p, fsz, fal);
+				x64_store_value(p, x64addr(x64_rbp_mem(vt), ttyp[i]), v); // converts to ttyp[i]
+				vtmp[i] = vt;
+			}
+			for (int i = 0; i < nres && i < res_count; i++) {
+				i64 fsz = type_size_of(ttyp[i]); if (fsz <= 0) fsz = 1;
 				Entity *re   = results_tuple->Tuple.variables[i];
 				i32    *nloff = (re->kind == Entity_Variable && re->token.string.len > 0)
 				                ? x64_var_get(&p->var_offsets, re) : nullptr;
-				i32 t = (nloff != nullptr) ? *nloff : x64_alloc_local(p, fsz, fal); toff[i] = t;
-				x64_store_value(p, x64addr(x64_rbp_mem(t), ttyp[i]), v);
+				if (nloff != nullptr) {
+					toff[i] = *nloff;
+					x64_copy_fixed(p, x64_rbp_mem(*nloff), x64_rbp_mem(vtmp[i]), fsz);
+				} else {
+					toff[i] = vtmp[i]; // no named local — the fresh temp IS the source
+				}
 			}
 		}
 

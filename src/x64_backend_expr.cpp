@@ -2286,6 +2286,7 @@ gb_internal x64Value x64_build_intrinsic(x64Procedure *p, Ast *expr, i32 id) {
 // lb_build_builtin_proc. These build aggregates/fields directly (no runtime call).
 gb_internal x64Value x64_emit_arith_matrix(x64Procedure *p, TokenKind op, x64Value lhs, x64Value rhs, Type *type, bool component_wise);
 gb_internal x64Value x64_emit_matrix_transpose(x64Procedure *p, x64Value m, Type *type);
+gb_internal x64Value x64_matrix_ev(x64Procedure *p, X64Mem mat, Type *mt, i64 row, i64 col);
 
 gb_internal bool x64_is_value_builtin(i32 id) {
 	switch (id) {
@@ -2767,6 +2768,47 @@ gb_internal x64Value x64_emit_conv(x64Procedure *p, x64Value src, Type *from, Ty
 		i32 dst_off = x64_alloc_local(p, type_size_of(to), type_align_of(to));
 		for (i64 i = 0; i < n; i++) {
 			x64_store_value(p, x64addr(x64_rbp_mem(dst_off + (i32)(i * dsz)), elem), ev);
+		}
+		return x64v_mem(x64_typed(to), x64_rbp_mem(dst_off));
+	}
+
+	// Matrix → matrix cast (mirrors lb_emit_conv's is_type_matrix(dst)&&is_type_matrix(src)). Same dims:
+	// element-wise copy (+ elem conv). Both square, different dims (submatrix cast): copy the overlapping
+	// top-left block, put 1 on the EXTENDED diagonal (i==j beyond src), 0 elsewhere. Same total count:
+	// column-major reshape. Was: fell through to a raw reinterpret → `mat4(mat2)` left the extended
+	// diagonal 0 (m4[2,2] should be 1). Must precede the scalar→matrix path (src IS a matrix here).
+	if (dst_base->kind == Type_Matrix && src_base != nullptr && src_base->kind == Type_Matrix) {
+		Type *delem = base_type(dst_base->Matrix.elem);
+		Type *selem = base_type(src_base->Matrix.elem);
+		i64 esz = type_size_of(delem); if (esz <= 0) esz = 1;
+		i64 ssz = type_size_of(selem); if (ssz <= 0) ssz = 1;
+		i64 dr = dst_base->Matrix.row_count, dc = dst_base->Matrix.column_count;
+		i64 sr = src_base->Matrix.row_count, sc = src_base->Matrix.column_count;
+		x64Value sm = x64_spill_value(p, src, from);
+		i32 dst_off = x64_alloc_local(p, type_size_of(to), type_align_of(to));
+		x64_zero_mem(p, x64_rbp_mem(dst_off), type_size_of(to));
+		if (dr == sr && dc == sc) {
+			for (i64 j = 0; j < dc; j++) for (i64 i = 0; i < dr; i++) {
+				x64Value s = x64_spill_value(p, x64_emit_conv(p, x64_matrix_ev(p, sm.mem, src_base, i, j), src_base->Matrix.elem, delem), delem);
+				x64_store_value(p, x64addr(x64_rbp_mem(dst_off + (i32)(matrix_indices_to_offset(dst_base, i, j) * esz)), delem), s);
+			}
+		} else if (dr == dc && sr == sc) {
+			for (i64 j = 0; j < dc; j++) for (i64 i = 0; i < dr; i++) {
+				if (i < sr && j < sc) {
+					x64Value s = x64_spill_value(p, x64_emit_conv(p, x64_matrix_ev(p, sm.mem, src_base, i, j), src_base->Matrix.elem, delem), delem);
+					x64_store_value(p, x64addr(x64_rbp_mem(dst_off + (i32)(matrix_indices_to_offset(dst_base, i, j) * esz)), delem), s);
+				} else if (i == j) {
+					x64Value one = x64_spill_value(p, x64_emit_conv(p, x64v_imm(t_int, 1), t_int, delem), delem);
+					x64_store_value(p, x64addr(x64_rbp_mem(dst_off + (i32)(matrix_indices_to_offset(dst_base, i, j) * esz)), delem), one);
+				}
+			}
+		} else {
+			i64 cnt = dr * dc; // same total element count (reshape)
+			for (i64 k = 0; k < cnt; k++) {
+				X64Mem sp = sm.mem; sp.disp += (i32)(matrix_column_major_index_to_offset(src_base, k) * ssz);
+				x64Value s = x64_spill_value(p, x64_emit_conv(p, x64_load_addr(p, x64addr(sp, selem)), src_base->Matrix.elem, delem), delem);
+				x64_store_value(p, x64addr(x64_rbp_mem(dst_off + (i32)(matrix_column_major_index_to_offset(dst_base, k) * esz)), delem), s);
+			}
 		}
 		return x64v_mem(x64_typed(to), x64_rbp_mem(dst_off));
 	}
@@ -3485,6 +3527,82 @@ gb_internal x64Value x64_emit_arith_i128(x64Procedure *p, TokenKind op, x64Value
 	return x64v_mem(result_type, x64_rbp_mem(res));
 }
 
+// Call a runtime helper `proc "contextless" (a, b: T) -> T` for complex/quaternion mul/div, where T is a
+// 16/32-byte aggregate passed BY POINTER + sret (RCX=&res, RDX=&a, R8=&b), or an 8-byte value in a reg.
+// lhs_m/rhs_m are the (already-converted) operand mem slots. Mirrors lb_emit_runtime_call's ABI lowering.
+gb_internal x64Value x64_complex_quat_runtime_call(x64Procedure *p, String name, X64Mem lhs_m, X64Mem rhs_m, Type *type) {
+	X64Assembler *a = &p->asm_;
+	AstPackage *rt = p->module->gen->info->runtime_package;
+	Entity *e = (rt != nullptr) ? scope_lookup_current(rt->scope, string_interner_insert(name)) : nullptr;
+	GB_ASSERT_MSG(e != nullptr && e->kind == Entity_Procedure, "x64: runtime helper '%.*s' not found", LIT(name));
+	if (!e->Procedure.is_foreign && e->min_dep_count.load(std::memory_order_relaxed) == 0) x64_enqueue_oncall(p, e);
+	i32 res = x64_alloc_local(p, type_size_of(type), type_align_of(type));
+	if (x64_arg_is_indirect(type)) {
+		i32 pr = x64_alloc_local(p, 8, 8), pa = x64_alloc_local(p, 8, 8), pb = x64_alloc_local(p, 8, 8);
+		x64_emit_lea(a, X64Reg_RAX, x64_rbp_mem(res)); x64_emit_mov_mr(a, X64OpSize_64, x64_rbp_mem(pr), X64Reg_RAX);
+		x64_emit_lea(a, X64Reg_RAX, lhs_m);            x64_emit_mov_mr(a, X64OpSize_64, x64_rbp_mem(pa), X64Reg_RAX);
+		x64_emit_lea(a, X64Reg_RAX, rhs_m);            x64_emit_mov_mr(a, X64OpSize_64, x64_rbp_mem(pb), X64Reg_RAX);
+		x64Value cargs[3] = { x64v_mem(t_rawptr, x64_rbp_mem(pr)), x64v_mem(t_rawptr, x64_rbp_mem(pa)), x64v_mem(t_rawptr, x64_rbp_mem(pb)) };
+		x64_emit_call(p, x64_get_entity_name(e), e->type, cargs, 3);
+	} else {
+		// 8-byte aggregate: value in a GP reg, returned in RAX.
+		x64Value cargs[2] = { x64v_mem(type, lhs_m), x64v_mem(type, rhs_m) };
+		x64Value r = x64_emit_call(p, x64_get_entity_name(e), e->type, cargs, 2);
+		x64_store_value(p, x64addr(x64_rbp_mem(res), type), r);
+	}
+	return x64v_mem(type, x64_rbp_mem(res));
+}
+
+// Complex / quaternion arithmetic (mirrors lb_emit_arith's is_type_complex / is_type_quaternion paths).
+// Add/Sub: component-wise. Complex Mul: (a+bi)(c+di) = (ac-bd)+(bc+ad)i inline. Complex Quo and
+// Quaternion Mul/Quo: runtime helpers (Hamilton product / division are non-trivial).
+gb_internal x64Value x64_emit_arith_complex_quat(x64Procedure *p, TokenKind op, x64Value lhs, x64Value rhs, Type *type) {
+	Type *ft = base_complex_elem_type(type);
+	i64   fsz = type_size_of(ft); if (fsz <= 0) fsz = 4;
+	bool  is_quat = is_type_quaternion(type);
+	int   n = is_quat ? 4 : 2;
+	x64Value lm = x64_spill_value(p, x64_emit_conv(p, lhs, lhs.type ? lhs.type : type, type), type);
+	x64Value rm = x64_spill_value(p, x64_emit_conv(p, rhs, rhs.type ? rhs.type : type, type), type);
+
+	if (op == Token_Add || op == Token_Sub) {
+		i32 res = x64_alloc_local(p, type_size_of(type), type_align_of(type));
+		for (int i = 0; i < n; i++) {
+			X64Mem la = lm.mem; la.disp += (i32)(i*fsz);
+			X64Mem ra = rm.mem; ra.disp += (i32)(i*fsz);
+			x64Value av = x64_spill_value(p, x64_load_addr(p, x64addr(la, ft)), ft);
+			x64Value bv = x64_spill_value(p, x64_load_addr(p, x64addr(ra, ft)), ft); // spill: emit_arith loads av into XMM0, clobbering an unspilled bv
+			x64Value cv = x64_emit_arith(p, op, av, bv, ft);
+			x64_store_value(p, x64addr(x64_rbp_mem(res + (i32)(i*fsz)), ft), cv);
+		}
+		return x64v_mem(type, x64_rbp_mem(res));
+	}
+
+	if (!is_quat && op == Token_Mul) {
+		X64Mem am = lm.mem, bm = lm.mem, cm = rm.mem, dm = rm.mem;
+		bm.disp += (i32)fsz; dm.disp += (i32)fsz;
+		x64Value av = x64_spill_value(p, x64_load_addr(p, x64addr(am, ft)), ft);
+		x64Value bv = x64_spill_value(p, x64_load_addr(p, x64addr(bm, ft)), ft);
+		x64Value cv = x64_spill_value(p, x64_load_addr(p, x64addr(cm, ft)), ft);
+		x64Value dv = x64_spill_value(p, x64_load_addr(p, x64addr(dm, ft)), ft);
+		x64Value ac = x64_spill_value(p, x64_emit_arith(p, Token_Mul, av, cv, ft), ft);
+		x64Value bd = x64_spill_value(p, x64_emit_arith(p, Token_Mul, bv, dv, ft), ft);
+		x64Value re = x64_spill_value(p, x64_emit_arith(p, Token_Sub, ac, bd, ft), ft);
+		x64Value bc = x64_spill_value(p, x64_emit_arith(p, Token_Mul, bv, cv, ft), ft);
+		x64Value ad = x64_spill_value(p, x64_emit_arith(p, Token_Mul, av, dv, ft), ft);
+		x64Value im = x64_spill_value(p, x64_emit_arith(p, Token_Add, bc, ad, ft), ft);
+		i32 res = x64_alloc_local(p, type_size_of(type), type_align_of(type));
+		x64_store_value(p, x64addr(x64_rbp_mem(res),           ft), re);
+		x64_store_value(p, x64addr(x64_rbp_mem(res + (i32)fsz), ft), im);
+		return x64v_mem(type, x64_rbp_mem(res));
+	}
+
+	String name;
+	if      (!is_quat)          name = (fsz == 2) ? str_lit("quo_complex32")    : (fsz == 4) ? str_lit("quo_complex64")     : str_lit("quo_complex128");
+	else if (op == Token_Mul)   name = (fsz == 2) ? str_lit("mul_quaternion64") : (fsz == 4) ? str_lit("mul_quaternion128") : str_lit("mul_quaternion256");
+	else                        name = (fsz == 2) ? str_lit("quo_quaternion64") : (fsz == 4) ? str_lit("quo_quaternion128") : str_lit("quo_quaternion256");
+	return x64_complex_quat_runtime_call(p, name, lm.mem, rm.mem, type);
+}
+
 gb_internal x64Value x64_emit_arith(x64Procedure *p, TokenKind op, x64Value lhs, x64Value rhs, Type *type) {
 	Type *lt          = x64_typed(lhs.type ? lhs.type : type);
 	Type *result_type = x64_typed(type ? type : lt);
@@ -3522,6 +3640,13 @@ gb_internal x64Value x64_emit_arith(x64Procedure *p, TokenKind op, x64Value lhs,
 			return x64_simd_binop_vec(p, bop, result_type, result_type, elem, la.mem, ra.mem, swap);
 		}
 		return x64_emit_arith_array(p, op, lhs, rhs, result_type); // no packed insn (u64 mul, rem, …) → scalar lanes
+	}
+
+	// Complex / quaternion arithmetic (add/sub component-wise, complex mul inline, complex-div &
+	// quaternion mul/div via runtime helpers). Must precede the f16 path (complex32/quaternion64 have
+	// f16 elements but are NOT scalar f16) and the scalar float/int paths.
+	if (rbt != nullptr && (is_type_complex(result_type) || is_type_quaternion(result_type))) {
+		return x64_emit_arith_complex_quat(p, op, lhs, rhs, result_type);
 	}
 
 	// f16 arithmetic via f32 promotion (x64 has no native f16 arith): a op b = f16(f32(a) op f32(b)).
@@ -3704,17 +3829,39 @@ gb_internal x64Value x64_emit_matrix_mul_vector(x64Procedure *p, x64Value lhs, x
 	return x64v_mem(x64_typed(type), x64_rbp_mem(res));
 }
 
-// Matrix arithmetic (mirrors lb_emit_arith_matrix): `*` → matrix*matrix / matrix*vector; component-wise
-// for +/-/scalar-`*` (a scalar operand broadcasts to every element). vector*matrix not yet implemented.
+// C = v * B (vector×matrix → array): the row vector v (1×Rr) times B (Rr×Rc) → row array [Rc]T,
+// C[j] = Σ_k v[k]·B[k,j]. Mirrors lb_emit_vector_mul_matrix (scalar path).
+gb_internal x64Value x64_emit_vector_mul_matrix(x64Procedure *p, x64Value lhs, x64Value rhs, Type *type) {
+	Type *mt = base_type(rhs.type);
+	Type *elem = base_type(base_array_type(type));
+	i64 Rr = mt->Matrix.row_count, Rc = mt->Matrix.column_count;
+	i64 esz = type_size_of(elem); if (esz <= 0) esz = 1;
+	x64Value lv  = x64_spill_value(p, lhs, lhs.type); // array [Rr]T
+	x64Value rmv = x64_spill_value(p, rhs, rhs.type); // matrix
+	i32 res = x64_alloc_local(p, type_size_of(type), type_align_of(type));
+	for (i64 j = 0; j < Rc; j++) {
+		x64Value acc = {};
+		for (i64 k = 0; k < Rr; k++) {
+			X64Mem vm = lv.mem; vm.disp += (i32)(k * esz);
+			x64Value a = x64_spill_value(p, x64_load_addr(p, x64addr(vm, elem)), elem);
+			x64Value b = x64_spill_value(p, x64_matrix_ev(p, rmv.mem, mt, k, j), elem);
+			x64Value prod = x64_spill_value(p, x64_emit_arith(p, Token_Mul, a, b, elem), elem);
+			acc = (k == 0) ? prod : x64_spill_value(p, x64_emit_arith(p, Token_Add, acc, prod, elem), elem);
+		}
+		x64_store_value(p, x64addr(x64_rbp_mem(res + (i32)(j * esz)), elem), acc);
+	}
+	return x64v_mem(x64_typed(type), x64_rbp_mem(res));
+}
+
+// Matrix arithmetic (mirrors lb_emit_arith_matrix): `*` → matrix*matrix / matrix*vector / vector*matrix;
+// component-wise for +/-/scalar-`*` (a scalar operand broadcasts to every element).
 gb_internal x64Value x64_emit_arith_matrix(x64Procedure *p, TokenKind op, x64Value lhs, x64Value rhs, Type *type, bool component_wise) {
 	bool lm = lhs.type != nullptr && is_type_matrix(lhs.type);
 	bool rm = rhs.type != nullptr && is_type_matrix(rhs.type);
 	if (op == Token_Mul && !component_wise) {
 		if (lm && rm) return x64_emit_matrix_mul(p, lhs, rhs, type);
 		if (lm && rhs.type != nullptr && is_type_array(rhs.type)) return x64_emit_matrix_mul_vector(p, lhs, rhs, type);
-		if (rm && lhs.type != nullptr && is_type_array(lhs.type)) {
-			GB_PANIC("x64 vector*matrix unimplemented — mirror lb_emit_matrix_mul (vector path)");
-		}
+		if (rm && lhs.type != nullptr && is_type_array(lhs.type)) return x64_emit_vector_mul_matrix(p, lhs, rhs, type);
 		// scalar*matrix / matrix*scalar fall through to the component-wise broadcast below.
 	}
 
@@ -4295,6 +4442,55 @@ gb_internal x64Value x64_build_slice_expr(x64Procedure *p, Ast *expr) {
 			    src_addr.mem.base == X64Reg_RBP && !src_addr.mem.rip_rel) {
 				if (p->local_size > p->escape_floor) p->escape_floor = p->local_size;
 			}
+		}
+
+		// #soa slice: `v[lo:hi]` on a #soa array/slice/dynamic → a #soa[] slice. The result is a struct of
+		// per-component `[^]Ci` pointers + a trailing len (mirrors lb_build_addr_slice_expr's Type_Struct
+		// soa case). Fixed source: component arrays are INLINE at src.offsets[i], ptr = src_base+off+lo*sz.
+		// Slice/Dynamic source: component ptr is LOADED from src+off, then + lo*sz. src len: Fixed=soa_count.
+		if (src_bt->kind == Type_Struct && src_bt->Struct.soa_kind != StructSoa_None) {
+			type_set_offsets(src_bt);
+			Type *dst_t  = x64_typed(tav.type);
+			Type *dst_bt = base_type(dst_t);
+			type_set_offsets(dst_bt);
+			bool fixed = src_bt->Struct.soa_kind == StructSoa_Fixed;
+			int  C     = (int)dst_bt->Struct.fields.count - 1; // component count (last dst field = len)
+
+			i32 lo_off = x64_alloc_local(p, 8, 8);
+			if (se->low != nullptr) { x64_value_to_reg(p, x64_build_expr(p, se->low), X64Reg_RAX); x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(lo_off), X64Reg_RAX); }
+			else                    { x64_emit_mov_mi(&p->asm_, X64OpSize_64, x64_rbp_mem(lo_off), 0); }
+
+			i32 hi_off = x64_alloc_local(p, 8, 8);
+			if (se->high != nullptr) {
+				x64_value_to_reg(p, x64_build_expr(p, se->high), X64Reg_RAX);
+				x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(hi_off), X64Reg_RAX);
+			} else if (fixed) {
+				x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RAX, (i64)src_bt->Struct.soa_count);
+				x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(hi_off), X64Reg_RAX);
+			} else {
+				// src len lives at the component-count'th field (Slice: fields=C+1; Dynamic: C+len,cap,alloc)
+				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(src_ea_off));
+				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_mem(X64Reg_RAX, (i32)src_bt->Struct.offsets[C]));
+				x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(hi_off), X64Reg_RAX);
+			}
+
+			i32 res_off = x64_alloc_local(p, x64_type_size(dst_t), x64_type_align(dst_t));
+			for (int i = 0; i < C; i++) {
+				Type *ci   = base_type(dst_bt->Struct.fields[i]->type); // [^]Ci
+				i64   csz  = (ci->kind == Type_MultiPointer) ? type_size_of(ci->MultiPointer.elem) : 8;
+				if (csz <= 0) csz = 1;
+				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(src_ea_off));
+				if (fixed) { if (src_bt->Struct.offsets[i] != 0) x64_emit_add_ri(&p->asm_, X64OpSize_64, X64Reg_RAX, (i32)src_bt->Struct.offsets[i]); }
+				else       { x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_mem(X64Reg_RAX, (i32)src_bt->Struct.offsets[i])); }
+				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RCX, x64_rbp_mem(lo_off));
+				if (csz != 1) x64_emit_imul_rri(&p->asm_, X64OpSize_64, X64Reg_RCX, X64Reg_RCX, (i32)csz);
+				x64_emit_add_rr(&p->asm_, X64OpSize_64, X64Reg_RAX, X64Reg_RCX);
+				x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(res_off + (i32)dst_bt->Struct.offsets[i]), X64Reg_RAX);
+			}
+			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(hi_off));
+			x64_emit_sub_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(lo_off));
+			x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(res_off + (i32)dst_bt->Struct.offsets[C]), X64Reg_RAX);
+			return x64v_mem(dst_t, x64_rbp_mem(res_off));
 		}
 
 		Type *elem_t = t_u8;
@@ -7257,6 +7453,34 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 					av = x64v_mem(deref, x64_mem(X64Reg_RAX, 0));
 					at = base_type(deref);
 				}
+				// len(cstring)/len(cstring16): O(N) NUL-terminator scan — a cstring is a bare pointer with
+				// no length field, so it fell through to none → nil (demo `len(x)` for x: cstring). Mirrors
+				// the inline strlen in x64_cstring_to_string. (cap has no meaning for a cstring.)
+				if (be->Builtin.id == BuiltinProc_len && at != nullptr && is_type_cstring(arg0->tav.type)) {
+					i64 usz = is_type_cstring16(arg0->tav.type) ? 2 : 1;
+					X64OpSize cmp_sz = (usz == 2) ? X64OpSize_16 : X64OpSize_8;
+					x64_value_to_reg(p, av, X64Reg_RAX); // RAX = cstring ptr
+					isize l_loop = x64_label_alloc(&p->asm_), l_done = x64_label_alloc(&p->asm_),
+					      l_nil  = x64_label_alloc(&p->asm_), l_end  = x64_label_alloc(&p->asm_);
+					x64_emit_test_rr(&p->asm_, X64OpSize_64, X64Reg_RAX, X64Reg_RAX);
+					x64_emit_jcc(&p->asm_, X64Cc_E, l_nil);
+					x64_emit_mov_rr(&p->asm_, X64OpSize_64, X64Reg_RCX, X64Reg_RAX);
+					x64_label_bind(&p->asm_, l_loop);
+					x64_emit_cmp_mi(&p->asm_, cmp_sz, x64_mem(X64Reg_RCX, 0), 0);
+					x64_emit_jcc(&p->asm_, X64Cc_E, l_done);
+					if (usz == 2) x64_emit_add_ri(&p->asm_, X64OpSize_64, X64Reg_RCX, 2);
+					else          x64_emit_inc_r(&p->asm_, X64OpSize_64, X64Reg_RCX);
+					x64_emit_jmp(&p->asm_, l_loop);
+					x64_label_bind(&p->asm_, l_done);
+					x64_emit_sub_rr(&p->asm_, X64OpSize_64, X64Reg_RCX, X64Reg_RAX);
+					if (usz == 2) x64_emit_shr_ri(&p->asm_, X64OpSize_64, X64Reg_RCX, 1);
+					x64_emit_mov_rr(&p->asm_, X64OpSize_64, X64Reg_RAX, X64Reg_RCX);
+					x64_emit_jmp(&p->asm_, l_end);
+					x64_label_bind(&p->asm_, l_nil);
+					x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RAX, 0);
+					x64_label_bind(&p->asm_, l_end);
+					return x64v_reg(t_int, X64Reg_RAX);
+				}
 				if (av.kind == x64Value_Mem && at != nullptr) {
 					i32 off = -1;
 					if (at->kind == Type_Map) {
@@ -7381,6 +7605,34 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 				Type *rt = tav.type ? x64_typed(tav.type) : x64_typed(ce->args[0]->tav.type);
 				x64Value xv = x64_build_expr(p, ce->args[0]);
 				if (rt == nullptr) return xv;
+				// abs(complex)/abs(quaternion) → magnitude via runtime helper (returns the scalar float
+				// element, NOT the complex type). Must key on the ARG type: tav.type is the float result,
+				// so the float-abs path below would bit-mask the 16-byte complex value → garbage (abs(q)=2).
+				{
+					Type *argt = x64_typed(ce->args[0]->tav.type);
+					Type *abt  = argt ? base_type(argt) : nullptr;
+					if (abt != nullptr && (is_type_complex(abt) || is_type_quaternion(abt))) {
+						Type *ft = base_complex_elem_type(argt);
+						i64   fsz = type_size_of(ft); if (fsz <= 0) fsz = 4;
+						String name = is_type_quaternion(abt)
+							? ((fsz == 2) ? str_lit("abs_quaternion64") : (fsz == 4) ? str_lit("abs_quaternion128") : str_lit("abs_quaternion256"))
+							: ((fsz == 2) ? str_lit("abs_complex32")    : (fsz == 4) ? str_lit("abs_complex64")     : str_lit("abs_complex128"));
+						AstPackage *rt_pkg = p->module->gen->info->runtime_package;
+						Entity *e = (rt_pkg != nullptr) ? scope_lookup_current(rt_pkg->scope, string_interner_insert(name)) : nullptr;
+						GB_ASSERT_MSG(e != nullptr && e->kind == Entity_Procedure, "x64: runtime helper '%.*s' not found", LIT(name));
+						if (!e->Procedure.is_foreign && e->min_dep_count.load(std::memory_order_relaxed) == 0) x64_enqueue_oncall(p, e);
+						x64Value xm = x64_spill_value(p, x64_emit_conv(p, xv, xv.type ? xv.type : argt, argt), argt);
+						if (x64_arg_is_indirect(argt)) {
+							i32 pa = x64_alloc_local(p, 8, 8);
+							x64_emit_lea(&p->asm_, X64Reg_RAX, xm.mem);
+							x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(pa), X64Reg_RAX);
+							x64Value cargs[1] = { x64v_mem(t_rawptr, x64_rbp_mem(pa)) };
+							return x64_emit_call(p, x64_get_entity_name(e), e->type, cargs, 1);
+						}
+						x64Value cargs[1] = { x64v_mem(argt, xm.mem) };
+						return x64_emit_call(p, x64_get_entity_name(e), e->type, cargs, 1);
+					}
+				}
 				if (x64_is_integer(rt) && !x64_is_signed_integer(rt)) return xv; // unsigned
 				if (x64_is_float(rt)) {
 					i64 fsz = type_size_of(rt); if (fsz <= 0) fsz = 8;
@@ -7742,24 +7994,41 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 						x64_emit_mov_mi(&p->asm_, X64OpSize_64, x64_rbp_mem(slice_off + 8), 0);
 						pvals[variadic_index] = x64v_mem(variadic_slice_type, x64_rbp_mem(slice_off));
 					} else {
-						// Backing array of `variadic_elem_type[vari_count]`, then a {ptr,len}.
+						// Backing array of `variadic_elem_type[N]`, then a {ptr,len}. A variadic positional
+						// arg that is a MULTI-VALUE call (tuple) spreads EACH of its fields into a separate
+						// element — `fmt.println(two())` → 2 `any`s, not one 16-byte tuple stored as one any
+						// (which read past the slot → garbage/crash). N = sum of the args' tuple arities.
 						Type *et  = x64_typed(variadic_elem_type);
 						i64   esz = type_size_of(et); if (esz <= 0) esz = 1;
 						i64   eal = type_align_of(et); if (eal <= 0) eal = 1;
-						i32 arr_off = x64_alloc_local(p, (i64)vari_count * esz, gb_max(eal, (i64)8));
-						for (int vi = 0; vi < vari_count; vi++) {
-							i32 slot_off = arr_off + vi * (i32)esz;
-							// Each element converts to the variadic elem type (mirrors LLVM
-							// lb_emit_conv to elem): `..any` boxes the value into an {data,typeid}
-							// any (or passes an already-`any` through); `..T` converts to T. The
-							// store does the conversion (x64_store_value → x64_emit_conv).
-							x64Value ev = x64_build_expr(p, positional[variadic_index + vi]);
-							x64_store_value(p, x64addr(x64_rbp_mem(slot_off), et), ev);
+						int total = 0;
+						for (int k = variadic_index; k < (int)positional.count; k++) {
+							Type *at = positional[k]->tav.type ? base_type(positional[k]->tav.type) : nullptr;
+							total += (at != nullptr && at->kind == Type_Tuple) ? (int)at->Tuple.variables.count : 1;
+						}
+						i32 arr_off = x64_alloc_local(p, (i64)total * esz, gb_max(eal, (i64)8));
+						int elem_i = 0;
+						for (int k = variadic_index; k < (int)positional.count; k++) {
+							// Each element converts to the variadic elem type (mirrors LLVM lb_emit_conv to
+							// elem): `..any` boxes into an {data,typeid} any; `..T` converts to T. store_value
+							// does the conversion. A tuple arg is read field-by-field at its canonical offset.
+							x64Value ev = x64_build_expr(p, positional[k]);
+							Type *at = positional[k]->tav.type ? base_type(x64_typed(positional[k]->tav.type)) : nullptr;
+							if (at != nullptr && at->kind == Type_Tuple) {
+								x64Value tup = x64_spill_value(p, ev, ev.type ? ev.type : positional[k]->tav.type);
+								for (isize fi = 0; fi < at->Tuple.variables.count; fi++, elem_i++) {
+									x64Addr fa = x64_emit_tuple_ep(p, tup, (i32)fi);
+									x64_store_value(p, x64addr(x64_rbp_mem(arr_off + elem_i*(i32)esz), et), x64v_mem(fa.type, fa.mem));
+								}
+							} else {
+								x64_store_value(p, x64addr(x64_rbp_mem(arr_off + elem_i*(i32)esz), et), ev);
+								elem_i++;
+							}
 						}
 						i32 slice_off = x64_alloc_local(p, 16, 8);
 						x64_emit_lea(&p->asm_, X64Reg_RAX, x64_rbp_mem(arr_off));
 						x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(slice_off), X64Reg_RAX);
-						x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RAX, (i64)vari_count);
+						x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RAX, (i64)total);
 						x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(slice_off + 8), X64Reg_RAX);
 						pvals[variadic_index] = x64v_mem(variadic_slice_type, x64_rbp_mem(slice_off));
 					}
