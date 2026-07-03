@@ -69,7 +69,7 @@ gb_internal i32 x64_ensure_local_context(x64Procedure *p) {
 		// enqueue min_dep==0 helpers ourselves or the symbol is unresolved at link.
 		if (!ic->Procedure.is_foreign &&
 		    ic->min_dep_count.load(std::memory_order_relaxed) == 0) {
-			array_add(&p->module->oncall_pending, ic);
+			x64_enqueue_oncall(p, ic);
 		}
 		i32 ptr = x64_alloc_local(p, 8, 8);
 		x64_emit_lea(&p->asm_, X64Reg_RAX, x64_rbp_mem(p->gen_context_off));
@@ -2247,7 +2247,7 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 			// module after the parallel pass (exactly one external definition).
 			if (!callee_ent->Procedure.is_foreign &&
 			    callee_ent->min_dep_count.load(std::memory_order_relaxed) == 0) {
-				array_add(&p->module->oncall_pending, callee_ent);
+				x64_enqueue_oncall(p, callee_ent);
 			}
 		} else {
 			callee_type_raw = ce->proc->tav.type;

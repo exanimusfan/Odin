@@ -115,19 +115,12 @@ struct x64Module {
 	// thread (mirrors LLVM's per-module parallel codegen).
 	Array<Entity *> compile_roots;
 
-	// On-demand worklist: min_dep_count==0 procs referenced by a call site (so NOT roots)
-	// — e.g. #force_inline runtime helpers LLVM inlines but we emit a real call to.
-	// Drained after the parallel pass into each proc's OWNER module so there is exactly
-	// one definition. See x64-no-on-demand.
-	Array<Entity *> oncall_pending;
-
-	// Deferred NESTED procs declared inside a proc in THIS module (mirrors LLVM's
-	// m->procedures_to_generate). Compiled into THIS module directly: a nested proc inside
-	// a generic instantiation has no standalone module mapping, so x64_module_of_entity
-	// returns null and oncall_pending would drop it → unresolved symbol. Compiling inline
-	// would re-enter x64_compile_procedure on the shared temp arena mid-codegen and corrupt
-	// the enclosing proc; see x64-nested-proc-defer.
-	Array<Entity *> nested_pending;
+	// Per-module proc worklist (mirrors LLVM's m->procedures_to_generate). MPSC: any worker
+	// may enqueue (a referenced min_dep==0 oncall proc goes to its OWNER module's queue; a
+	// nested proc goes to its enclosing module's queue), but only this module's worker dequeues
+	// — so every entry is compiled into THIS module by one thread. Drained to a fixpoint after
+	// the roots pass. See x64-no-on-demand, x64-nested-proc-defer.
+	MPSCQueue<Entity *> proc_queue;
 
 	// On-demand worklist for GLOBALS referenced/read in this module's code. Mirrors LLVM's
 	// lazy lb_find_value_from_entity: a global first referenced only by an on-demand
@@ -353,6 +346,7 @@ gb_internal x64Addr   x64_build_addr(x64Procedure *p, Ast *expr);
 
 gb_internal void      x64_compile_procedure (x64Module *m, Entity *e, Ast *body);
 gb_internal void      x64_build_nested_proc (x64Procedure *p, Ast *proc_lit, Entity *e);
+gb_internal void      x64_enqueue_oncall (x64Procedure *p, Entity *e);
 
 // Entry point from main.cpp; returns the generator, or nullptr on failure.
 gb_internal x64Generator *x64_generate_code(Checker *c);

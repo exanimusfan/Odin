@@ -136,8 +136,7 @@ gb_internal x64Module *x64_module_create(x64Generator *gen, AstPackage *pkg, Ast
 	array_init(&m->cv_file_ids,   a, 0, 8);
 	array_init(&m->cv_file_offs,  a, 0, 8);
 	array_init(&m->compile_roots, a, 0, 16);
-	array_init(&m->oncall_pending, a, 0, 8);
-	array_init(&m->nested_pending, a, 0, 8);
+	mpsc_init(&m->proc_queue, a);
 	array_init(&m->onref_globals, a, 0, 8);
 	string_map_init(&m->const_strings, 16);
 
@@ -251,11 +250,9 @@ gb_internal void x64_build_nested_proc(x64Procedure *p, Ast *proc_lit, Entity *e
 	if (proc_lit->ProcLit.body == nullptr) return;
 	// DEFER into THIS (enclosing) module — mirrors LLVM lb_build_nested_proc (enqueue, not
 	// inline). Compiling inline re-enters x64_compile_procedure on the SAME per-thread temp
-	// arena (reset via ArenaTempGuard) mid-codegen, corrupting the enclosing proc's arena
-	// state (asm buffer, var_offsets, …). The enclosing proc only needs the symbol. Per-module
-	// (not oncall_pending) since a nested proc has no module mapping (x64_module_of_entity →
-	// null → the driver would drop it).
-	array_add(&p->module->nested_pending, e);
+	// arena (reset via ArenaTempGuard) mid-codegen, corrupting the enclosing proc. Enclosing
+	// module (not the entity's owner) because a nested proc has no standalone module mapping.
+	mpsc_enqueue(&p->module->proc_queue, e);
 }
 
 gb_internal GB_COMPARE_PROC(x64_proc_entity_cmp) {
@@ -1223,6 +1220,13 @@ gb_internal x64Module *x64_module_of_entity(x64Generator *gen, Entity *e) {
 	return nullptr;
 }
 
+// Enqueue a referenced min_dep==0 proc into its OWNER module's queue (compiled there once),
+// falling back to the enclosing module if it has no mapping. MPSC-safe across worker threads.
+gb_internal void x64_enqueue_oncall(x64Procedure *p, Entity *e) {
+	x64Module *owner = x64_module_of_entity(p->module->gen, e);
+	mpsc_enqueue(&(owner ? owner : p->module)->proc_queue, e);
+}
+
 // Compile one module's root procedures. Thread-pool task — one module per worker, so
 // every write to this module's COFF happens on a single thread.
 gb_internal WORKER_TASK_PROC(x64_compile_module_worker) {
@@ -1278,31 +1282,37 @@ gb_internal WORKER_TASK_PROC(x64_write_module_worker) {
 	return 0;
 }
 
-// Move each module's pending oncall procs (referenced min_dep==0) not yet visited into `queue`.
-gb_internal void x64_drain_oncall_queue(x64Generator *gen, PtrSet<Entity *> *visited, Array<Entity *> *queue) {
-	for (auto const &entry : gen->modules) {
-		x64Module *m = entry.value;
-		for_array(i, m->oncall_pending) {
-			Entity *e = m->oncall_pending[i];
-			if (!ptr_set_exists(visited, e)) array_add(queue, e);
-		}
-		array_clear(&m->oncall_pending);
-	}
-}
-
-// Compile every referenced min_dep==0 proc into its OWNER module (one external definition
-// each); transitive, so loop to a fixpoint.
-gb_internal void x64_run_oncall_closure(x64Generator *gen, PtrSet<Entity *> *visited, Array<Entity *> *queue) {
-	x64_drain_oncall_queue(gen, visited, queue);
-	for (isize qi = 0; qi < queue->count; qi++) {
-		Entity *e = (*queue)[qi];
-		if (ptr_set_update(visited, e)) continue;
-		x64Module *m = x64_module_of_entity(gen, e);
-		if (m == nullptr) continue;
+// Drain THIS module's proc queue, compiling each entry into THIS module. Single consumer per
+// module (so all of m's COFF writes stay on one thread); compiling a proc may MPSC-enqueue more
+// into any module's queue. Mirrors lb_generate_procedures_worker_proc.
+gb_internal WORKER_TASK_PROC(x64_generate_pending_worker) {
+	x64Module *m = cast(x64Module *)data;
+	for (Entity *e = nullptr; mpsc_dequeue(&m->proc_queue, &e); /**/) {
 		DeclInfo *decl = decl_info_of_entity(e);
 		if (decl == nullptr || decl->proc_lit == nullptr) continue;
-		x64_compile_procedure(m, e, decl->proc_lit->ProcLit.body);
-		x64_drain_oncall_queue(gen, visited, queue); // pick up procs the new one referenced
+		x64_compile_procedure(m, e, decl->proc_lit->ProcLit.body); // dedups internally if already emitted
+	}
+	return 0;
+}
+
+// Drive the per-module proc queues to a fixpoint: a worker compiling a proc may enqueue into a
+// module whose worker already finished, so re-dispatch until every queue is empty. Mirrors
+// lb_generate_missing_procedures (single-queue variant; x64_compile_procedure dedups re-enqueues).
+gb_internal void x64_generate_pending(x64Generator *gen, bool threaded) {
+	isize retry = 0;
+	for (;;) {
+		if (threaded) {
+			for (auto const &entry : gen->modules) thread_pool_add_task(x64_generate_pending_worker, entry.value);
+			thread_pool_wait();
+		} else {
+			for (auto const &entry : gen->modules) x64_generate_pending_worker(entry.value);
+		}
+		bool any = false;
+		for (auto const &entry : gen->modules) {
+			if (entry.value->proc_queue.count.load(std::memory_order_relaxed) != 0) { any = true; break; }
+		}
+		if (!any) break;
+		GB_ASSERT(retry++ <= gen->modules.count); // bounded: each round drains ≥1 queue to no-ops
 	}
 }
 
@@ -1323,25 +1333,6 @@ gb_internal void x64_run_lazy_globals(x64Generator *gen, PtrSet<Entity *> *defin
 		}
 		array_clear(&m->onref_globals);
 	}
-}
-
-// Compile DEFERRED nested procs into their ENCLOSING module (mirrors LLVM's per-module
-// procedures_to_generate). Compiling one may append more; re-read .count picks them up.
-gb_internal bool x64_run_nested_procs(x64Generator *gen, PtrSet<Entity *> *visited) {
-	bool any = false;
-	for (auto const &entry : gen->modules) {
-		x64Module *m = entry.value;
-		for (isize i = 0; i < m->nested_pending.count; i++) {
-			Entity *e = m->nested_pending[i];
-			if (ptr_set_update(visited, e)) continue;
-			DeclInfo *decl = decl_info_of_entity(e);
-			if (decl == nullptr || decl->proc_lit == nullptr) continue;
-			x64_compile_procedure(m, e, decl->proc_lit->ProcLit.body);
-			any = true;
-		}
-		array_clear(&m->nested_pending);
-	}
-	return any;
 }
 
 // Register a foreign library entity once (thread-safe via foreign_mutex).
@@ -1461,26 +1452,14 @@ gb_internal x64Generator *x64_generate_code(Checker *c) {
 		}
 		if (threaded) thread_pool_wait();
 
-		// On-demand closure (sequential — parallel pass done). Workers queued every
-		// referenced min_dep==0 proc (#force_inline runtime helpers we emit real calls to)
-		// in oncall_pending. Compile each into its OWNER module (one external definition);
-		// transitive, so loop to a fixpoint (visited keeps it finite).
+		// On-demand closure (parallel pass done). Workers MPSC-enqueued every referenced
+		// min_dep==0 proc + deferred nested proc into per-module queues; drain to a fixpoint,
+		// then define the lazily-referenced globals.
 		{
-			PtrSet<Entity *> visited = {};
-			ptr_set_init(&visited, 64);
-			defer (ptr_set_destroy(&visited));
-
 			PtrSet<Entity *> defined = {};
 			ptr_set_init(&defined, 64);
-			defer (ptr_set_destroy(&defined));
 
-			Arena         *scratch = get_arena(ThreadArena_Temporary);
-			ArenaTempGuard scratch_guard(scratch);
-			Array<Entity *> queue;
-			array_init(&queue, arena_allocator(scratch), 0, 64);
-
-			x64_run_oncall_closure(gen, &visited, &queue);
-			while (x64_run_nested_procs(gen, &visited)) x64_run_oncall_closure(gen, &visited, &queue); // nested ⇄ oncall to a fixpoint
+			x64_generate_pending(gen, threaded);
 			x64_run_lazy_globals(gen, &defined);
 
 			// __$startup_runtime: runs the lazy globals' initializers (skipped by the eager
@@ -1494,7 +1473,7 @@ gb_internal x64Generator *x64_generate_code(Checker *c) {
 			}
 
 			// Startup initializers may reference more min_dep==0 procs/globals — drain them.
-			x64_run_oncall_closure(gen, &visited, &queue);
+			x64_generate_pending(gen, threaded);
 			x64_run_lazy_globals(gen, &defined);
 		}
 
