@@ -590,6 +590,8 @@ struct BuildContext {
 
 	bool   no_threaded_checker;
 
+	bool   use_x64_backend; // -x64-backend: use the fast x64 debug backend instead of LLVM
+
 	bool   show_debug_messages;
 
 	int    did_you_mean_limit;

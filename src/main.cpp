@@ -79,6 +79,12 @@ gb_global Timings global_timings = {0};
 
 #include "llvm_backend.cpp"
 
+#if defined(GB_SYSTEM_WINDOWS) && defined(GB_ARCH_64_BIT)
+#include "x64_encode.cpp"
+#include "coff_writer.cpp"
+#include "x64_backend.cpp"
+#endif
+
 #include "bug_report.cpp"
 
 // NOTE(bill): 'name' is used in debugging and profiling modes
@@ -357,6 +363,7 @@ enum BuildFlagKind {
 	BuildFlag_UseSingleModule,
 	BuildFlag_NoThreadedChecker,
 	BuildFlag_ShowDebugMessages,
+	BuildFlag_X64Backend,
 	BuildFlag_DidYouMeanLimit,
 
 	BuildFlag_ShowDefineables,
@@ -593,6 +600,7 @@ gb_internal bool parse_build_flags(Array<String> args) {
 	add_flag(&build_flags, BuildFlag_UseSingleModule,         str_lit("use-single-module"),         BuildFlagParam_None,    Command__does_build);
 	add_flag(&build_flags, BuildFlag_NoThreadedChecker,       str_lit("no-threaded-checker"),       BuildFlagParam_None,    Command__does_check);
 	add_flag(&build_flags, BuildFlag_ShowDebugMessages,       str_lit("show-debug-messages"),       BuildFlagParam_None,    Command_all);
+	add_flag(&build_flags, BuildFlag_X64Backend,             str_lit("x64-backend"),              BuildFlagParam_None,    Command__does_build);
 	add_flag(&build_flags, BuildFlag_DidYouMeanLimit,         str_lit("did-you-mean-limit"),        BuildFlagParam_Integer, Command__does_check);
 
 	add_flag(&build_flags, BuildFlag_ShowDefineables,         str_lit("show-defineables"),          BuildFlagParam_None,    Command__does_check);
@@ -1340,6 +1348,9 @@ gb_internal bool parse_build_flags(Array<String> args) {
 							break;
 						case BuildFlag_ShowDebugMessages:
 							build_context.show_debug_messages = true;
+							break;
+						case BuildFlag_X64Backend:
+							build_context.use_x64_backend = true;
 							break;
 
 						case BuildFlag_DidYouMeanLimit:
@@ -4249,6 +4260,41 @@ int main(int arg_count, char const **arg_ptr) {
 		}
 		failed_to_cache_parsing = true;
 	}
+
+	// x64 fast backend (Windows amd64 only, opt-level 0). Opt-in via `-x64-backend`,
+	// independent of `-debug`: with `-debug` it also emits CodeView (.debug$S/$T);
+	// without it, it's a plain fast codegen path (e.g. for future runtime/bytecode use).
+#if defined(GB_SYSTEM_WINDOWS) && defined(GB_ARCH_64_BIT)
+	if (build_context.use_x64_backend &&
+	    build_context.metrics.arch == TargetArch_amd64 &&
+	    build_context.metrics.os   == TargetOs_windows &&
+	    build_context.optimization_level <= 0) {
+		MAIN_TIME_SECTION("x64 debug backend");
+		x64Generator *x64gen = x64_generate_code(checker);
+		if (x64gen != nullptr) {
+			switch (build_context.build_mode) {
+			case BuildMode_Executable:
+			case BuildMode_StaticLibrary:
+			case BuildMode_DynamicLibrary: {
+				i32 result = linker_stage(x64gen);
+				if (result) {
+					if (build_context.show_timings) {
+						show_timings(checker, &global_timings);
+					}
+					if (build_context.show_import_graph) {
+						show_import_graph(checker);
+					}
+					if (build_context.export_dependencies_format != DependenciesExportUnspecified) {
+						export_dependencies(checker);
+					}
+					return result;
+				}
+			} break;
+			}
+			goto end_of_code_gen;
+		}
+	}
+#endif
 
 	{
 		lbGenerator *gen = permanent_alloc_item<lbGenerator>();
