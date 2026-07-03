@@ -7030,8 +7030,13 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 		bool is_cmp = op == Token_CmpEq || op == Token_NotEq || op == Token_Lt ||
 		              op == Token_Gt    || op == Token_LtEq  || op == Token_GtEq;
 		if (is_cmp) {
-			x64Value lhs = x64_spill_value(p, x64_build_expr(p, be->left), ltype);
-			x64Value rhs = x64_spill_value(p, x64_build_expr(p, be->right), rtype);
+			// Same deferred-operand rule as arith below: x64_emit_comp's integer path loads operands with
+			// value_to_reg, and its aggregate paths (i128/f16/string) spill them themselves, so a stable
+			// operand (immediate / RBP slot) needs no snapshot.
+			x64Value lhs = x64_build_binop_operand(p, be->left, ltype);
+			if (!x64_value_is_stable(lhs) || !x64_expr_side_effect_free(be->right)) lhs = x64_spill_value(p, lhs, ltype);
+			x64Value rhs = x64_build_binop_operand(p, be->right, rtype);
+			if (!x64_value_is_stable(rhs)) rhs = x64_spill_value(p, rhs, rtype);
 			return x64_emit_comp(p, op, lhs, rhs);
 		}
 		// Arith: spill only what needs a snapshot. A stable operand (immediate / RBP slot) survives
