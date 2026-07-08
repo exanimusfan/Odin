@@ -1,0 +1,7 @@
+# generated / built artifacts
+out/
+out_win/
+runner
+runner_win
+*.bin
+text_syms.h
