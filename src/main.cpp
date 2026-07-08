@@ -79,9 +79,10 @@ gb_global Timings global_timings = {0};
 
 #include "llvm_backend.cpp"
 
-#if defined(GB_SYSTEM_WINDOWS) && defined(GB_ARCH_64_BIT)
+#if defined(GB_ARCH_64_BIT)
 #include "x64_encode.cpp"
 #include "coff_writer.cpp"
+#include "macho_writer.cpp"
 #include "x64_backend.cpp"
 #endif
 
@@ -4261,13 +4262,21 @@ int main(int arg_count, char const **arg_ptr) {
 		failed_to_cache_parsing = true;
 	}
 
-	// x64 fast backend (Windows amd64 only, opt-level 0). Opt-in via `-x64-backend`,
-	// independent of `-debug`: with `-debug` it also emits CodeView (.debug$S/$T);
-	// without it, it's a plain fast codegen path (e.g. for future runtime/bytecode use).
-#if defined(GB_SYSTEM_WINDOWS) && defined(GB_ARCH_64_BIT)
+	// x64 fast backend (windows-amd64 target only for now, opt-level 0). Opt-in via
+	// `-x64-backend`, independent of `-debug`: with `-debug` it also emits CodeView
+	// (.debug$S/$T); without it, it's a plain fast codegen path (e.g. for future
+	// runtime/bytecode use). Compiles on any 64-bit host; targeting unix (Mach-O/ELF,
+	// SysV ABI) is work in progress.
+#if defined(GB_ARCH_64_BIT)
 	if (build_context.use_x64_backend &&
 	    build_context.metrics.arch == TargetArch_amd64 &&
-	    build_context.metrics.os   == TargetOs_windows &&
+	    (build_context.metrics.os == TargetOs_windows ||
+	     build_context.metrics.os == TargetOs_darwin || // SysV ABI + Mach-O objects, clang links
+	     // linux: SysV ABI codegen but still COFF objects, no linker support —
+	     // object build-mode only (extraction harnesses, see x64_rosetta/)
+	     // until an ELF writer lands.
+	     (build_context.metrics.os == TargetOs_linux &&
+	      build_context.build_mode == BuildMode_Object)) &&
 	    build_context.optimization_level <= 0) {
 		MAIN_TIME_SECTION("x64 debug backend");
 		x64Generator *x64gen = x64_generate_code(checker);
