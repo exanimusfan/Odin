@@ -100,7 +100,9 @@ struct X64Fixup {
 // Symbol relocations
 // ---------------------------------------------------------------------------
 
-// These map 1-to-1 to Windows COFF AMD64 relocation type values.
+// Values ≤ 0x00FF map 1-to-1 to Windows COFF AMD64 relocation type values.
+// Values ≥ 0x0100 are backend-private kinds for non-COFF targets (translated by
+// the Mach-O writer; must never reach the COFF writer).
 enum X64RelocType : u16 {
 	X64Reloc_ADDR64   = 0x0001, // 64-bit absolute VA
 	X64Reloc_ADDR32   = 0x0002, // 32-bit absolute VA
@@ -112,6 +114,11 @@ enum X64RelocType : u16 {
 	X64Reloc_REL32_4  = 0x0008,
 	X64Reloc_REL32_5  = 0x0009,
 	X64Reloc_SECREL   = 0x000B, // section-relative (CodeView debug info)
+
+	X64Reloc_TLV      = 0x0100, // darwin: RIP-relative ref to a __thread_vars TLV
+	                            // descriptor (→ Mach-O X86_64_RELOC_TLV)
+	X64Reloc_GOTLD    = 0x0101, // darwin: RIP-relative GOT load of a dylib-external
+	                            // data symbol's address (→ X86_64_RELOC_GOT_LOAD)
 };
 
 struct X64RelocEntry {
@@ -130,6 +137,12 @@ struct X64Assembler {
 	Array<isize>       labels;  // label targets; X64_LABEL_UNSET = unbound
 	Array<X64Fixup>    fixups;  // pending forward-branch fixups
 	Array<X64RelocEntry> relocs; // symbol relocations to hand off to COFF writer
+	// Invalidation clocks for the register cache (x64_backend_regcache.cpp), bumped here in the
+	// encoder so no emission site can be missed. merge_epoch: every label bind (a control-flow
+	// join — the cache's emission-order view of the registers doesn't hold for other inbound
+	// paths). call_epoch: every call (the callee may write locals through an escaped pointer).
+	u32                merge_epoch;
+	u32                call_epoch;
 };
 
 gb_internal void  x64_asm_init(X64Assembler *a, gbAllocator allocator);
@@ -196,8 +209,10 @@ gb_internal void x64_emit_movsx_rm(X64Assembler *a, X64OpSize src_sz, X64Reg dst
 gb_internal void x64_emit_lea    (X64Assembler *a, X64Reg dst, X64Mem src);
 // LEA r, [RIP + sym]  — emits REL32 relocation so global data can be addressed
 gb_internal void x64_emit_lea_sym(X64Assembler *a, X64Reg dst, String sym_name);
+gb_internal void x64_emit_got_load_sym(X64Assembler *a, X64Reg dst, String sym_name); // darwin GOT
 // &sym for this thread into RAX; clobbers RAX and R11. REL32 reloc to `_tls_index`, SECREL to `sym`.
 gb_internal void x64_emit_tls_addr(X64Assembler *a, String sym_name);
+gb_internal void x64_emit_tlv_addr(X64Assembler *a, String sym_name); // darwin TLV
 gb_internal void x64_emit_xchg_rr(X64Assembler *a, X64OpSize sz, X64Reg a_, X64Reg b);
 gb_internal void x64_emit_cmov_rr(X64Assembler *a, X64Cc cc, X64OpSize sz, X64Reg dst, X64Reg src);
 gb_internal void x64_emit_cmov_rm(X64Assembler *a, X64Cc cc, X64OpSize sz, X64Reg dst, X64Mem src);

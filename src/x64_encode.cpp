@@ -51,6 +51,8 @@ gb_internal void x64_asm_init(X64Assembler *a, gbAllocator allocator) {
 	array_init(&a->labels, allocator, 0, 16);
 	array_init(&a->fixups, allocator, 0, 16);
 	array_init(&a->relocs, allocator, 0, 16);
+	a->merge_epoch = 0;
+	a->call_epoch  = 0;
 }
 
 gb_internal void x64_asm_free(X64Assembler *a) {
@@ -79,6 +81,7 @@ gb_internal void x64_label_bind(X64Assembler *a, isize label) {
 	GB_ASSERT_MSG(a->labels[label] == X64_LABEL_UNSET, "label already bound");
 	isize target = a->code.count;
 	a->labels[label] = target;
+	a->merge_epoch++; // control-flow join → cached locals may not hold on other inbound paths
 
 	// Patch all pending fixups that reference this label.
 	for_array(i, a->fixups) {
@@ -573,16 +576,19 @@ gb_internal void x64_emit_jmp_m(X64Assembler *a, X64Mem m) {
 }
 
 gb_internal void x64_emit_call_r(X64Assembler *a, X64Reg r) {
+	a->call_epoch++; // callee may mutate memory through an escaped pointer
 	if (r >= 8) x64_enc_b(a, 0x41u);
 	x64_enc_b(a, 0xFFu);
 	x64_enc_b(a, cast(u8)(0xD0u + (r & 7u))); // ModRM: mod=11, /2, r/m=r
 }
 
 gb_internal void x64_emit_call_m(X64Assembler *a, X64Mem m) {
+	a->call_epoch++;
 	x64_enc_op_digit_m(a, X64OpSize_64, 0xFFu, 0xFFu, 2u, m);
 }
 
 gb_internal void x64_emit_call_sym(X64Assembler *a, String sym_name) {
+	a->call_epoch++;
 	x64_enc_b(a, 0xE8u); // CALL rel32
 	x64_enc_reloc_sym(a, X64Reloc_REL32, sym_name);
 }
@@ -730,6 +736,19 @@ gb_internal void x64_emit_lea_sym(X64Assembler *a, X64Reg dst, String sym_name) 
 	x64_enc_reloc_sym(a, X64Reloc_REL32, sym_name);
 }
 
+// Load the ADDRESS of a dylib-external data symbol into `dst` via the GOT (darwin):
+// MOV r64, [RIP + sym@GOTPCREL]. A direct LEA can't reach a symbol in another image;
+// ld64 fills the GOT slot with the symbol's runtime address. (ld64 relaxes this to a
+// LEA when the symbol turns out image-local — same trick as TLV; the MOV opcode is
+// the canonical form X86_64_RELOC_GOT_LOAD requires.)
+gb_internal void x64_emit_got_load_sym(X64Assembler *a, X64Reg dst, String sym_name) {
+	// MOV r64, [RIP + sym]  — REX.W 8B /r
+	x64_enc_rex(a, X64OpSize_64, dst, X64Reg_NONE, X64Reg_NONE);
+	x64_enc_b(a, 0x8Bu);
+	x64_enc_b(a, cast(u8)(0x00u | ((dst & 7u) << 3) | 5u)); // mod=00 reg=dst rm=101 (RIP)
+	x64_enc_reloc_sym(a, X64Reloc_GOTLD, sym_name);
+}
+
 // Windows x64 thread-local address (the standard MSVC sequence). Computes the address of
 // `sym` (a variable in the `.tls$` section) for the CURRENT thread into RAX, using R11 as
 // scratch:
@@ -751,6 +770,21 @@ gb_internal void x64_emit_tls_addr(X64Assembler *a, String sym_name) {
 	// lea rax, [rax + sym]   (48 REX.W, 8D, ModRM=80: mod=10 reg=RAX rm=RAX, disp32 = SECREL)
 	x64_enc_b(a, 0x48u); x64_enc_b(a, 0x8Du); x64_enc_b(a, 0x80u);
 	x64_enc_reloc_sym(a, X64Reloc_SECREL, sym_name);
+}
+
+// Load &sym (THIS thread's copy) into RAX — darwin TLV sequence. `sym` names the
+// variable's TLVDescriptor in __thread_vars; its first field is dyld's getter
+// (_tlv_bootstrap until load, then tlv_get_addr), which returns the address in RAX
+// and preserves every other register. Clobbers RAX, RDI, flags.
+gb_internal void x64_emit_tlv_addr(X64Assembler *a, String sym_name) {
+	// movq rdi, [rip + sym@TLVP]   (48 REX.W, 8B, ModRM=3D: mod=00 reg=RDI rm=101 RIP)
+	// MOVQ (not LEA) is the mandatory canonical form for X86_64_RELOC_TLV — ld64
+	// validates the opcode and RELAXES it to LEA when the descriptor is image-local
+	// (same trick as GOT_LOAD; a dylib-external descriptor keeps the load).
+	x64_enc_b(a, 0x48u); x64_enc_b(a, 0x8Bu); x64_enc_b(a, 0x3Du);
+	x64_enc_reloc_sym(a, X64Reloc_TLV, sym_name);
+	// call qword [rdi]   (FF /2, ModRM=17: mod=00 reg=2 rm=RDI)
+	x64_enc_b(a, 0xFFu); x64_enc_b(a, 0x17u);
 }
 
 gb_internal void x64_emit_xchg_rr(X64Assembler *a, X64OpSize sz, X64Reg a_, X64Reg b) {
