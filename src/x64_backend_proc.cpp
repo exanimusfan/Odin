@@ -142,6 +142,35 @@ gb_internal void x64_cv_finish_type(CoffSection *s, u32 len_pos) {
 	s->data[len_pos+1] = (u8)((length >> 8) & 0xFFu);
 }
 
+// One entry in a struct's CodeView field list. Members may OVERLAP by offset — that's how a union
+// is represented, and it's what lets a `using`-promoted field and its named parent both cover the
+// same bytes (see x64_cv_add_using_members).
+struct X64CVMember { Type *type; i64 off; String name; };
+enum { X64_CV_MAX_MEMBERS = 256 }; // direct fields + flattened `using` promotions (truncated past this)
+
+// Flatten `using`-promoted members of a struct-like `ut` into `mem[]` at absolute offsets relative to
+// `base_off`, recursing for chained `using`. This makes `outer.promoted` resolve in the debugger
+// ALONGSIDE the explicit `outer.named.promoted` (the named member is emitted separately by the
+// caller), mirroring Odin's source-level promotion — something LLVM's debug info doesn't do.
+// Only VALUE `using` of a struct flattens: a `using p: ^T` promotes through a pointer (the subfields
+// aren't at a fixed offset within `outer`), so base_type≠Struct returns and just the named ptr member
+// is emitted (its own `.p.field` still works).
+gb_internal void x64_cv_add_using_members(X64CVMember *mem, int *nmem, Type *ut, i64 base_off) {
+	Type *b = base_type(ut);
+	if (b == nullptr || b->kind != Type_Struct) return;
+	type_set_offsets(b);
+	for_array(i, b->Struct.fields) {
+		if (*nmem >= X64_CV_MAX_MEMBERS) return;
+		Entity *sf = b->Struct.fields[i];
+		i64 off = base_off + b->Struct.offsets[i];
+		mem[*nmem].type = sf->type;
+		mem[*nmem].off  = off;
+		mem[*nmem].name = sf->token.string;
+		(*nmem)++;
+		if (sf->flags & EntityFlag_Using) x64_cv_add_using_members(mem, nmem, sf->type, off);
+	}
+}
+
 // Emit (or look up) a CodeView .debug$T type record for `t` and return its index.
 gb_internal u32 x64_cv_type(x64Module *m, Type *t) {
 	if (m->debug_t == nullptr) return 0; // no type records outside -debug
@@ -195,19 +224,22 @@ gb_internal u32 x64_cv_type(x64Module *m, Type *t) {
 	}
 
 	// Struct-like: real structs, slices, strings, dynamic arrays, any.
-	struct CVMember { Type *type; i64 off; String name; };
-	CVMember mem[80];
+	X64CVMember mem[X64_CV_MAX_MEMBERS];
 	int nmem = 0;
 	String tname = {};
 	if (bt->kind == Type_Struct) {
 		type_set_offsets(bt);
 		for_array(i, bt->Struct.fields) {
-			if (nmem >= 80) break;
+			if (nmem >= X64_CV_MAX_MEMBERS) break;
 			Entity *f = bt->Struct.fields[i];
 			mem[nmem].type = f->type;
 			mem[nmem].off  = bt->Struct.offsets[i];
 			mem[nmem].name = f->token.string;
 			nmem++;
+			// `using base: Base` also promotes Base's fields onto the parent, so `outer.name`
+			// works too (not just `outer.base.name`). Emit them as extra members overlapping
+			// `base`'s bytes; the checker guarantees no name collision with a direct field.
+			if (f->flags & EntityFlag_Using) x64_cv_add_using_members(mem, &nmem, f->type, bt->Struct.offsets[i]);
 		}
 		gbString gs = type_to_string(t);
 		tname = copy_string(permanent_allocator(), make_string((u8 const *)gs, gb_string_length(gs)));
@@ -253,7 +285,7 @@ gb_internal u32 x64_cv_type(x64Module *m, Type *t) {
 	}
 	map_set(&m->cv_types, t, fwd);
 
-	u32 mty[80];
+	u32 mty[X64_CV_MAX_MEMBERS];
 	for (int i = 0; i < nmem; i++) mty[i] = x64_cv_type(m, mem[i].type);
 
 	u32 fl = m->cv_next_type++;
