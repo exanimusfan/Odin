@@ -169,7 +169,7 @@ gb_internal x64Value x64_context_ptr_value(x64Procedure *p) {
 	}
 	if (p->has_context && p->context_slot >= 0) {
 		return x64v_mem(t_context_ptr,
-		                x64_rbp_mem(x64_param_rbp_off(p->context_slot)));
+		                x64_rbp_mem(x64_param_home_off(p, p->context_slot)));
 	}
 	i32 off = x64_ensure_local_context(p);
 	i32 ptr = x64_alloc_local(p, 8, 8);
@@ -187,7 +187,7 @@ gb_internal X64Mem x64_current_context_body(x64Procedure *p) {
 	}
 	if (p->has_context && p->context_slot >= 0) {
 		x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX,
-		                x64_rbp_mem(x64_param_rbp_off(p->context_slot)));
+		                x64_rbp_mem(x64_param_home_off(p, p->context_slot)));
 		return x64_mem(X64Reg_RAX, 0);
 	}
 	i32 off = x64_ensure_local_context(p);
@@ -721,10 +721,12 @@ gb_internal bool x64_expr_side_effect_free(Ast *e) {
 	return false;
 }
 
-// Build a binary-expression operand. For a bare register-width scalar local/param read, return its
-// RBP memory operand directly (deferred load) so it's a stable operand needing no spill — the
-// arith emitter loads it on demand. Everything else builds normally (into a register/temp).
-gb_internal x64Value x64_build_binop_operand(x64Procedure *p, Ast *e, Type *t) {
+// Build a binary-expression operand. For a bare register-width scalar local/param read, prefer the
+// register cache (`use_cache`: returns a PINNED cache register — the CALLER must x64_rc_unpin_value
+// it after the emit consumes it), else return its RBP memory operand directly (deferred load) so
+// it's a stable operand needing no spill — the arith emitter loads it on demand. Everything else
+// builds normally (into a register/temp).
+gb_internal x64Value x64_build_binop_operand(x64Procedure *p, Ast *e, Type *t, bool use_cache) {
 	Ast *u = unparen_expr(e);
 	if (u != nullptr && u->kind == Ast_Ident && t != nullptr && x64_is_scalar(t) && !x64_is_float(t)) {
 		i64 sz = x64_type_size(t);
@@ -736,7 +738,13 @@ gb_internal x64Value x64_build_binop_operand(x64Procedure *p, Ast *e, Type *t) {
 				for (isize k = 0; k < p->indirect_params.count; k++) if (p->indirect_params[k] == ent) { indirect = true; break; }
 				if (!indirect) {
 					i32 *off = x64_var_get(&p->var_offsets, ent);
-					if (off != nullptr) return x64v_mem(t, x64_rbp_mem(*off));
+					if (off != nullptr) {
+						if (use_cache) {
+							x64Value cached = x64_rc_operand(p, ent, *off, t);
+							if (cached.kind != x64Value_None) return cached;
+						}
+						return x64v_mem(t, x64_rbp_mem(*off));
+					}
 				}
 			}
 		}
@@ -1762,7 +1770,7 @@ gb_internal x64Addr x64_build_addr(x64Procedure *p, Ast *expr) {
 				return x64addr(x64_rbp_mem(p->ctx_override_off), t_context);
 			}
 			if (p->has_context && p->context_slot >= 0) {
-				X64Mem ctx_ptr_mem = x64_rbp_mem(x64_param_rbp_off(p->context_slot));
+				X64Mem ctx_ptr_mem = x64_rbp_mem(x64_param_home_off(p, p->context_slot));
 				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, ctx_ptr_mem);
 				return x64addr(x64_mem(X64Reg_RAX, 0), t_context);
 			}
@@ -1989,7 +1997,7 @@ gb_internal x64Value x64_build_intrinsic(x64Procedure *p, Ast *expr, i32 id) {
 	X64Assembler *a = &p->asm_;
 
 	// alloca(size, align): grow the stack by `size` (16-aligned) and return a pointer ABOVE the
-	// fixed call area (shadow 32 + outgoing 64 = 96), which is rsp-relative and follows rsp down — so
+	// fixed call area (shadow + min-outgoing), which is rsp-relative and follows rsp down — so
 	// later calls write their shadow/args below the alloca region without clobbering it. rsp is
 	// restored to rbp in the epilogue, freeing it. Result is 16-aligned (covers align ≤ 16).
 	if (id == BuiltinProc_alloca) {
@@ -1998,7 +2006,7 @@ gb_internal x64Value x64_build_intrinsic(x64Procedure *p, Ast *expr, i32 id) {
 		x64_emit_add_ri(a, X64OpSize_64, X64Reg_RAX, 15);
 		x64_emit_and_ri(a, X64OpSize_64, X64Reg_RAX, -16);          // round size up to 16
 		x64_emit_sub_rr(a, X64OpSize_64, X64Reg_RSP, X64Reg_RAX);   // grow the stack
-		x64_emit_lea(a, X64Reg_RAX, x64_mem(X64Reg_RSP, 96));       // skip the 96-byte call area
+		x64_emit_lea(a, X64Reg_RAX, x64_mem(X64Reg_RSP, (x64_abi_win64 ? X64_ABI_SHADOW_SPACE : 0) + X64_ABI_MIN_OUTGOING)); // skip the fixed call area
 		return x64v_reg(t_rawptr, X64Reg_RAX);
 	}
 
@@ -2645,15 +2653,12 @@ gb_internal x64Value x64_emit_conv(x64Procedure *p, x64Value src, Type *from, Ty
 	// cvtsi2sd path below (which sees only the low 64 bits).
 	if (x64_is_float(dst_base) && src_base != nullptr && is_type_integer(src_base) && type_size_of(src_base) == 16) {
 		bool uns = !x64_is_signed_integer(src_base);
-		// floattidf/_unsigned take the i128/u128 by value, but Win64 passes a 16-byte scalar param
-		// INDIRECTLY (a pointer to a caller copy). x64_emit_call has no per-arg indirect lowering, so
-		// pass the address ourselves as a pointer-typed arg (mirrors the normal call path's indirect slot).
+		// floattidf/_unsigned take the i128/u128 by value; Win64 passes a 16-byte scalar param
+		// INDIRECTLY (a pointer to a caller copy), SysV as a GP register pair. x64_emit_call has
+		// no per-arg indirect lowering, so build the ABI slot ourselves.
 		x64Value slot = x64_spill_value(p, src, x64_typed(from));
 		GB_ASSERT(slot.kind == x64Value_Mem);
-		i32 ptr_off = x64_alloc_local(p, 8, 8);
-		x64_emit_lea(&p->asm_, X64Reg_RAX, slot.mem);
-		x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(ptr_off), X64Reg_RAX);
-		x64Value arg = x64v_mem(alloc_type_pointer(x64_typed(from)), x64_rbp_mem(ptr_off));
+		x64Value arg = x64_abi_value_or_addr_slot(p, x64_typed(from), slot.mem);
 		x64Value f64v = x64_emit_runtime_call(p, uns ? str_lit("floattidf_unsigned") : str_lit("floattidf"), &arg, 1);
 		if (x64_is_double(dst_base)) { f64v.type = x64_typed(to); return f64v; }
 		return x64_emit_conv(p, f64v, t_f64, to); // f64 → f32/f16
@@ -2981,15 +2986,12 @@ gb_internal void x64_emit_bounds_runtime_call(x64Procedure *p, TokenPos pos, Str
 	i32 file_slot = x64_alloc_local(p, 16, 8);
 	x64Value fs = x64_const_string(p, file);
 	x64_copy_fixed(p, x64_rbp_mem(file_slot), fs.mem, 16);
-	i32 fileptr_slot = x64_alloc_local(p, 8, 8);
-	x64_emit_lea(&p->asm_, X64Reg_RAX, x64_rbp_mem(file_slot));
-	x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(fileptr_slot), X64Reg_RAX);
 
 	if (!e->Procedure.is_foreign && e->min_dep_count.load(std::memory_order_relaxed) == 0) {
 		x64_enqueue_oncall(p, e);
 	}
 	x64Value cargs[8];
-	cargs[0] = x64v_mem(t_rawptr, x64_rbp_mem(fileptr_slot)); // &string (indirect param)
+	cargs[0] = x64_abi_value_or_addr_slot(p, t_string, x64_rbp_mem(file_slot)); // file string param
 	cargs[1] = x64v_imm(t_i32, line);
 	cargs[2] = x64v_imm(t_i32, column);
 	for (int i = 0; i < n_extra; i++) cargs[3 + i] = extra[i];
@@ -3188,10 +3190,12 @@ gb_internal x64Value x64_stabilize_value(x64Procedure *p, x64Value v) {
 	// mems and imm/none are already stable.
 	if (v.kind == x64Value_Mem && v.type != nullptr && !v.mem.rip_rel &&
 	    v.mem.base != X64Reg_RBP && v.mem.base != X64Reg_NONE) {
-		// A large indirect-ABI aggregate is passed BY POINTER (immutable param), so only its
-		// ADDRESS needs to survive — copying the whole value would put it on the stack (a huge
-		// by-value arg like `slot_map^` overflowed the stack). Spill the address; mark by_ref.
-		if (x64_arg_is_indirect(v.type)) {
+		// An aggregate the ABI never needs a caller-frame copy of (Win64 indirect: pointer
+		// is passed; SysV MEMORY class: emit_call_args copies straight into the outgoing
+		// area) keeps only its ADDRESS — copying the value would put it on the stack (a
+		// huge by-value arg like `slot_map^` overflowed the stack). Spill the address;
+		// mark by_ref.
+		if (x64_arg_stabilize_by_ref(v.type)) {
 			i32 ptr_off = x64_alloc_local(p, 8, 8);
 			x64_emit_lea(&p->asm_, X64Reg_RAX, v.mem);
 			x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(ptr_off), X64Reg_RAX);
@@ -3229,16 +3233,7 @@ gb_internal x64Value x64_reconstruct_call_result(x64Procedure *p, Type *ct, int 
 		last_off = ret_local_off; // already written by the callee via sret
 	} else {
 		last_off = x64_alloc_local(p, lsz > 0 ? lsz : 1, type_align_of(last_rt));
-		if (lsz > 0) {
-			if (x64_is_float(last_rt)) {
-				if (x64_is_double(last_rt)) x64_emit_movsd_mr(&p->asm_, x64_rbp_mem(last_off), X64XmmReg_XMM0);
-				else                         x64_emit_movss_mr(&p->asm_, x64_rbp_mem(last_off), X64XmmReg_XMM0);
-			} else {
-				X64OpSize os = (lsz >= 8) ? X64OpSize_64 : (lsz >= 4) ? X64OpSize_32
-				             : (lsz >= 2) ? X64OpSize_16 : X64OpSize_8;
-				x64_emit_mov_mr(&p->asm_, os, x64_rbp_mem(last_off), X64Reg_RAX);
-			}
-		}
+		x64_abi_spill_direct_result(p, last_rt, last_off);
 	}
 	Type *tuple = ct->Proc.results;
 	i32 tup = x64_alloc_local(p, type_size_of(tuple), type_align_of(tuple));
@@ -3261,7 +3256,6 @@ gb_internal x64Value x64_reconstruct_call_result(x64Procedure *p, Type *ct, int 
 // Conservative: only the common, safe shape is handled — everything else returns false and the
 // normal call path runs. Inlined instructions are attributed to the call-site line for clean
 // step-over debugging (Tier-1; S_INLINESITE inline-frames are a planned Tier-2 addition).
-#define X64_MAX_INLINE_DEPTH 8
 gb_internal bool x64_try_inline_call(x64Procedure *p, AstCallExpr *ce, Entity *callee, Type *ct, x64Value *out) {
 	// Mirror LLVM: at -O0 + -debug the pass manager runs NOTHING (not even the always-inliner), so
 	// LLVM leaves #force_inline procs as REAL CALLS in debug builds — a real call is trivially
@@ -3543,15 +3537,27 @@ gb_internal x64Value x64_emit_arith_i128(x64Procedure *p, TokenKind op, x64Value
 		Entity *e = (rt != nullptr) ? scope_lookup_current(rt->scope, string_interner_insert(name)) : nullptr;
 		if (e != nullptr && e->kind == Entity_Procedure) {
 			if (!e->Procedure.is_foreign && e->min_dep_count.load(std::memory_order_relaxed) == 0) x64_enqueue_oncall(p, e);
-			i32 pr = x64_alloc_local(p, 8, 8), pa = x64_alloc_local(p, 8, 8), pb = x64_alloc_local(p, 8, 8);
-			x64_emit_lea(a, X64Reg_RAX, rlo);              x64_emit_mov_mr(a, X64OpSize_64, x64_rbp_mem(pr), X64Reg_RAX);
-			x64_emit_lea(a, X64Reg_RAX, x64_rbp_mem(la));  x64_emit_mov_mr(a, X64OpSize_64, x64_rbp_mem(pa), X64Reg_RAX);
-			x64_emit_lea(a, X64Reg_RAX, x64_rbp_mem(rb));  x64_emit_mov_mr(a, X64OpSize_64, x64_rbp_mem(pb), X64Reg_RAX);
-			x64Value cargs[3];
-			cargs[0] = x64v_mem(t_rawptr, x64_rbp_mem(pr));
-			cargs[1] = x64v_mem(t_rawptr, x64_rbp_mem(pa));
-			cargs[2] = x64v_mem(t_rawptr, x64_rbp_mem(pb));
-			x64_emit_call(p, x64_get_entity_name(e), e->type, cargs, 3);
+			if (x64_single_value_by_pointer(result_type)) {
+				// Win64: sret + operands by pointer (RCX=&res, RDX=&a, R8=&b).
+				i32 pr = x64_alloc_local(p, 8, 8), pa = x64_alloc_local(p, 8, 8), pb = x64_alloc_local(p, 8, 8);
+				x64_emit_lea(a, X64Reg_RAX, rlo);              x64_emit_mov_mr(a, X64OpSize_64, x64_rbp_mem(pr), X64Reg_RAX);
+				x64_emit_lea(a, X64Reg_RAX, x64_rbp_mem(la));  x64_emit_mov_mr(a, X64OpSize_64, x64_rbp_mem(pa), X64Reg_RAX);
+				x64_emit_lea(a, X64Reg_RAX, x64_rbp_mem(rb));  x64_emit_mov_mr(a, X64OpSize_64, x64_rbp_mem(pb), X64Reg_RAX);
+				x64Value cargs[3];
+				cargs[0] = x64v_mem(t_rawptr, x64_rbp_mem(pr));
+				cargs[1] = x64v_mem(t_rawptr, x64_rbp_mem(pa));
+				cargs[2] = x64v_mem(t_rawptr, x64_rbp_mem(pb));
+				x64_emit_call(p, x64_get_entity_name(e), e->type, cargs, 3);
+			} else {
+				// SysV: i128 args in GP pairs, result back in RAX:RDX (spilled to a local
+				// by the ABI layer) — copy it into the result slot.
+				x64Value cargs[2];
+				cargs[0] = x64v_mem(result_type, x64_rbp_mem(la));
+				cargs[1] = x64v_mem(result_type, x64_rbp_mem(rb));
+				x64Value r = x64_emit_call(p, x64_get_entity_name(e), e->type, cargs, 2);
+				GB_ASSERT(r.kind == x64Value_Mem);
+				x64_copy_fixed(p, rlo, r.mem, 16);
+			}
 		} else {
 			GB_PANIC("x64 i128 quo/mod: runtime helper '%.*s' not found", LIT(name));
 		}
@@ -3573,15 +3579,25 @@ gb_internal x64Value x64_complex_quat_runtime_call(x64Procedure *p, String name,
 	GB_ASSERT_MSG(e != nullptr && e->kind == Entity_Procedure, "x64: runtime helper '%.*s' not found", LIT(name));
 	if (!e->Procedure.is_foreign && e->min_dep_count.load(std::memory_order_relaxed) == 0) x64_enqueue_oncall(p, e);
 	i32 res = x64_alloc_local(p, type_size_of(type), type_align_of(type));
-	if (x64_arg_is_indirect(type)) {
-		i32 pr = x64_alloc_local(p, 8, 8), pa = x64_alloc_local(p, 8, 8), pb = x64_alloc_local(p, 8, 8);
+	if (x64_single_value_by_pointer(type)) { // == x64_arg_is_indirect for these sizes on Win64
+		// sret call: hidden result pointer in slot 0. Win64 also passes the OPERANDS by
+		// pointer (indirect aggregates); SysV passes them by value (the ABI layer copies
+		// MEMORY-class values into the outgoing area / uses register pairs).
+		i32 pr = x64_alloc_local(p, 8, 8);
 		x64_emit_lea(a, X64Reg_RAX, x64_rbp_mem(res)); x64_emit_mov_mr(a, X64OpSize_64, x64_rbp_mem(pr), X64Reg_RAX);
-		x64_emit_lea(a, X64Reg_RAX, lhs_m);            x64_emit_mov_mr(a, X64OpSize_64, x64_rbp_mem(pa), X64Reg_RAX);
-		x64_emit_lea(a, X64Reg_RAX, rhs_m);            x64_emit_mov_mr(a, X64OpSize_64, x64_rbp_mem(pb), X64Reg_RAX);
-		x64Value cargs[3] = { x64v_mem(t_rawptr, x64_rbp_mem(pr)), x64v_mem(t_rawptr, x64_rbp_mem(pa)), x64v_mem(t_rawptr, x64_rbp_mem(pb)) };
-		x64_emit_call(p, x64_get_entity_name(e), e->type, cargs, 3);
+		if (x64_arg_is_indirect(type)) {
+			i32 pa = x64_alloc_local(p, 8, 8), pb = x64_alloc_local(p, 8, 8);
+			x64_emit_lea(a, X64Reg_RAX, lhs_m);            x64_emit_mov_mr(a, X64OpSize_64, x64_rbp_mem(pa), X64Reg_RAX);
+			x64_emit_lea(a, X64Reg_RAX, rhs_m);            x64_emit_mov_mr(a, X64OpSize_64, x64_rbp_mem(pb), X64Reg_RAX);
+			x64Value cargs[3] = { x64v_mem(t_rawptr, x64_rbp_mem(pr)), x64v_mem(t_rawptr, x64_rbp_mem(pa)), x64v_mem(t_rawptr, x64_rbp_mem(pb)) };
+			x64_emit_call(p, x64_get_entity_name(e), e->type, cargs, 3);
+		} else {
+			x64Value cargs[3] = { x64v_mem(t_rawptr, x64_rbp_mem(pr)), x64v_mem(type, lhs_m), x64v_mem(type, rhs_m) };
+			x64_emit_call(p, x64_get_entity_name(e), e->type, cargs, 3);
+		}
 	} else {
-		// 8-byte aggregate: value in a GP reg, returned in RAX.
+		// Register-sized aggregate: value in return register(s) (RAX / SysV pairs — the
+		// ABI layer spills pairs to a local, so `r` is Mem in that case).
 		x64Value cargs[2] = { x64v_mem(type, lhs_m), x64v_mem(type, rhs_m) };
 		x64Value r = x64_emit_call(p, x64_get_entity_name(e), e->type, cargs, 2);
 		x64_store_value(p, x64addr(x64_rbp_mem(res), type), r);
@@ -4012,15 +4028,9 @@ gb_internal x64Value x64_emit_comp(x64Procedure *p, TokenKind op, x64Value lhs, 
 				}
 				x64Value lm = x64_spill_value(p, lhs, t_string);
 				x64Value rm = x64_spill_value(p, rhs, t_string);
-				i32 lp = x64_alloc_local(p, 8, 8);
-				x64_emit_lea(&p->asm_, X64Reg_RAX, lm.mem);
-				x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(lp), X64Reg_RAX);
-				i32 rp = x64_alloc_local(p, 8, 8);
-				x64_emit_lea(&p->asm_, X64Reg_RAX, rm.mem);
-				x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(rp), X64Reg_RAX);
 				x64Value cargs[2];
-				cargs[0] = x64v_mem(t_rawptr, x64_rbp_mem(lp));
-				cargs[1] = x64v_mem(t_rawptr, x64_rbp_mem(rp));
+				cargs[0] = x64_abi_value_or_addr_slot(p, t_string, lm.mem);
+				cargs[1] = x64_abi_value_or_addr_slot(p, t_string, rm.mem);
 				return x64_emit_call(p, x64_get_entity_name(e), e->type, cargs, 2);
 			}
 		}
@@ -5024,7 +5034,7 @@ gb_internal x64Value x64_emit_or_return(x64Procedure *p, Ast *expr) {
 			int nres = (int)res_tup->variables.count;
 			if (nres > 0) {
 				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX,
-				                x64_rbp_mem(x64_param_rbp_off(0)));
+				                x64_rbp_mem(x64_param_home_off(p, 0)));
 				i64 last_off = 0;
 				for (int i = 0; i < nres - 1; i++) {
 					Entity *e = res_tup->variables[i];
@@ -6966,6 +6976,11 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 			x64Addr addr = x64_entity_is_local(p, e)
 			             ? x64_entity_addr(p, e)
 			             : x64addr(x64_global_mem(p, e), e->type);
+			// A whole register-width local at its own frame slot may already be cached in a reg.
+			if (addr.mem.base == X64Reg_RBP && addr.mem.index == X64Reg_NONE && !addr.mem.rip_rel) {
+				x64Value cached = x64_rc_read(p, e, addr.mem.disp, e->type);
+				if (cached.kind != x64Value_None) return cached;
+			}
 			return x64_load_addr(p, addr);
 		}
 		case Entity_TypeName:
@@ -7032,21 +7047,32 @@ gb_internal x64Value x64_build_expr(x64Procedure *p, Ast *expr) {
 		if (is_cmp) {
 			// Same deferred-operand rule as arith below: x64_emit_comp's integer path loads operands with
 			// value_to_reg, and its aggregate paths (i128/f16/string) spill them themselves, so a stable
-			// operand (immediate / RBP slot) needs no snapshot.
-			x64Value lhs = x64_build_binop_operand(p, be->left, ltype);
-			if (!x64_value_is_stable(lhs) || !x64_expr_side_effect_free(be->right)) lhs = x64_spill_value(p, lhs, ltype);
-			x64Value rhs = x64_build_binop_operand(p, be->right, rtype);
-			if (!x64_value_is_stable(rhs)) rhs = x64_spill_value(p, rhs, rtype);
-			return x64_emit_comp(p, op, lhs, rhs);
+			// operand (immediate / RBP slot) needs no snapshot. A PINNED cache register is stable across
+			// ANY rhs build — callee-saved (survives calls) and pinned (no later fill evicts it) — and
+			// holding the lhs-eval-time value is exactly left-to-right evaluation order.
+			x64Value lhs = x64_build_binop_operand(p, be->left, ltype, true);
+			if (!x64_rc_value_pinned(p, lhs) &&
+			    (!x64_value_is_stable(lhs) || !x64_expr_side_effect_free(be->right))) lhs = x64_spill_value(p, lhs, ltype);
+			x64Value rhs = x64_build_binop_operand(p, be->right, rtype, true);
+			if (!x64_rc_value_pinned(p, rhs) && !x64_value_is_stable(rhs)) rhs = x64_spill_value(p, rhs, rtype);
+			x64Value r = x64_emit_comp(p, op, lhs, rhs);
+			x64_rc_unpin_value(p, lhs);
+			x64_rc_unpin_value(p, rhs);
+			return r;
 		}
-		// Arith: spill only what needs a snapshot. A stable operand (immediate / RBP slot) survives
-		// register-clobbering sub-builds, so the emitter reads it directly. The LEFT operand still
-		// needs a snapshot if building the RIGHT could write memory that aliases it (a call).
-		x64Value lhs = x64_build_binop_operand(p, be->left, ltype);
-		if (!x64_value_is_stable(lhs) || !x64_expr_side_effect_free(be->right)) lhs = x64_spill_value(p, lhs, ltype);
-		x64Value rhs = x64_build_binop_operand(p, be->right, rtype);
-		if (!x64_value_is_stable(rhs)) rhs = x64_spill_value(p, rhs, rtype);
-		return x64_emit_arith(p, op, lhs, rhs, result_type);
+		// Arith: spill only what needs a snapshot. A stable operand (immediate / RBP slot / pinned
+		// cache register) survives register-clobbering sub-builds, so the emitter reads it directly.
+		// The LEFT operand still needs a snapshot if building the RIGHT could write memory that
+		// aliases it (a call) — unless it's a pinned cache reg, which snapshots by construction.
+		x64Value lhs = x64_build_binop_operand(p, be->left, ltype, true);
+		if (!x64_rc_value_pinned(p, lhs) &&
+		    (!x64_value_is_stable(lhs) || !x64_expr_side_effect_free(be->right))) lhs = x64_spill_value(p, lhs, ltype);
+		x64Value rhs = x64_build_binop_operand(p, be->right, rtype, true);
+		if (!x64_rc_value_pinned(p, rhs) && !x64_value_is_stable(rhs)) rhs = x64_spill_value(p, rhs, rtype);
+		x64Value r = x64_emit_arith(p, op, lhs, rhs, result_type);
+		x64_rc_unpin_value(p, lhs);
+		x64_rc_unpin_value(p, rhs);
+		return r;
 	} case_end;
 
 	// ── Type cast ─────────────────────────────────────────────────────────
@@ -8104,7 +8130,7 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 					if (params->variables[param_cursor]->kind == Entity_TypeName) { param_cursor++; continue; }
 				}
 				if (param_cursor >= n_params) continue;          // safety (non-variadic overflow)
-				x64Value av = defer_args ? x64_build_binop_operand(p, arg, x64_typed(arg->tav.type))
+				x64Value av = defer_args ? x64_build_binop_operand(p, arg, x64_typed(arg->tav.type), false)
 				                         : x64_build_expr(p, arg);
 				Type *abt = (av.type != nullptr) ? base_type(av.type) : nullptr;
 				// Spread a tuple-returning call across consecutive params only when the checker typed
@@ -8273,7 +8299,24 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 					if (want_in) {
 						for (int ai = first_explicit; ai < last_explicit; ai++) {
 							Type *at = args[ai].type ? args[ai].type : t_rawptr;
-							x64Value sv = x64_spill_value(p, args[ai], at);
+							x64Value sv;
+							if (args[ai].by_ref) {
+								// by_ref slot (SysV MEMORY-class value): the slot holds a POINTER to
+								// the data. Snapshot the pointer, keep the by_ref tag so the deferred
+								// emit_call_args copies from behind it (same pointee-outlives-defer
+								// assumption Win64's indirect pointer slots make).
+								i32 poff = x64_alloc_local(p, 8, 8);
+								x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, args[ai].mem);
+								x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(poff), X64Reg_RAX);
+								sv = x64v_mem(at, x64_rbp_mem(poff));
+								sv.by_ref = true;
+								if (by_ptr) { // deferred proc wants ^T — the pointer IS &value
+									sv = x64v_mem(alloc_type_pointer(at), x64_rbp_mem(poff));
+								}
+								dargs[di++] = sv;
+								continue;
+							}
+							sv = x64_spill_value(p, args[ai], at);
 							if (by_ptr) {
 								i32 poff = x64_alloc_local(p, 8, 8);
 								x64_emit_lea(&p->asm_, X64Reg_RAX, sv.mem);
@@ -8322,31 +8365,25 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 			return call_result;
 		}
 
-		// Indirect call: load callee into R10, then set up args
+		// Indirect call: load callee into R10 (not an arg register), then place args.
 		x64Value proc_v = x64_build_expr(p, ce->proc);
 		x64_value_to_reg(p, proc_v, X64Reg_R10);
 
-		// Place args (re-use the same logic as direct call, minus CALL sym)
-		int reg_count = gb_min(slot, 4);
-		for (int i = reg_count - 1; i >= 0; i--) {
-			if (x64_arg_is_float(args[i].type)) x64_value_to_xmm(p, args[i], X64_XMM_ARG_REGS[i]);
-			else                                 x64_value_to_reg (p, args[i], X64_INT_ARG_REGS[i]);
-		}
-		for (int i = 4; i < slot; i++) {
-			x64_value_to_reg(p, args[i], X64Reg_RAX);
-			x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_mem(X64Reg_RSP, 32 + (i-4)*8), X64Reg_RAX);
+		if (!x64_abi_win64) {
+			// SysV arg placement scratches R10/R11 (x64_copy_fixed stack copies, pair
+			// loads) — park the callee in a local across it and reload after. Win64's
+			// placement only scratches RAX/XMM0, so R10 survives there.
+			i32 callee_off = x64_alloc_local(p, 8, 8);
+			x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(callee_off), X64Reg_R10);
+			x64_abi_emit_call_args(p, args, slot, ct->Proc.c_vararg);
+			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_R10, x64_rbp_mem(callee_off));
+		} else {
+			x64_abi_emit_call_args(p, args, slot, ct->Proc.c_vararg);
 		}
 		x64_emit_call_r(&p->asm_, X64Reg_R10);
 
 		// Single-value register result (multi/sret handled inside reconstruct_call_result).
-		x64Value ind_rv = x64v_none();
-		if (!needs_rbp && ct->Proc.result_count == 1) {
-			Type *ret_t = ct->Proc.results->Tuple.variables[0]->type;
-			if (ret_t && type_size_of(ret_t) != 0) {
-				ind_rv = x64_is_float(ret_t) ? x64v_xmm(ret_t, X64XmmReg_XMM0)
-				                             : x64v_reg(ret_t, X64Reg_RAX);
-			}
-		}
+		x64Value ind_rv = x64_abi_direct_result(p, callee_type_raw);
 		x64Value ind_result = x64_reconstruct_call_result(p, ct, npartial, last_rt, needs_rbp, ret_local_off, partial_off, ind_rv);
 		if (ct->Proc.result_count > 1 && tav.type != nullptr && !is_type_tuple(tav.type) &&
 		    ind_result.kind == x64Value_Mem) {

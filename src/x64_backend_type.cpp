@@ -80,17 +80,6 @@ gb_internal bool x64_is_scalar(Type *t) {
 	return x64_is_integer(t) || x64_is_bool(t) || x64_is_ptr(t) || x64_is_float(t) || x64_is_f16(t);
 }
 
-// Win64 indirect-arg rule (lbAbiAmd64Win64::compute_arg_types + lbAbi386::non_struct):
-// an aggregate is passed BY POINTER unless size is exactly 1/2/4/8; likewise a non-float
-// scalar wider than 8 (i128). Zero-sized aggregates are dropped (elsewhere), not indirect.
-gb_internal bool x64_arg_is_indirect(Type *t) {
-	if (t == nullptr) return false;
-	i64 sz = x64_type_size(t);
-	if (sz == 0) return false;
-	if (x64_is_scalar(t)) return sz > 8;            // i128 by pointer; scalars ≤8 in register
-	return !(sz == 1 || sz == 2 || sz == 4 || sz == 8);
-}
-
 gb_internal bool x64_is_signed_integer(Type *t) {
 	t = base_type(t);
 	// An enum's signedness is its underlying integer's; else a signed enum (e.g. Ordering.Less = -1)
@@ -170,11 +159,6 @@ gb_internal i32 x64_alloc_local(x64Procedure *p, i64 size, i64 align) {
 	return -(i32)total;
 }
 
-// ABI parameter home: slot N is at [RBP + 16 + N*8].
-gb_internal gb_inline i32 x64_param_rbp_off(int slot) {
-	return 16 + slot * 8;
-}
-
 gb_internal gb_inline X64Mem x64_rbp_mem(i32 rbp_off) {
 	return x64_mem(X64Reg_RBP, rbp_off);
 }
@@ -206,7 +190,18 @@ gb_internal void x64_load_global_addr(x64Procedure *p, Entity *e) {
 	bool is_tls = e != nullptr && e->kind == Entity_Variable &&
 	              e->Variable.thread_local_model.len != 0;
 	if (is_tls) {
-		x64_emit_tls_addr(&p->asm_, x64_get_entity_name(e));
+		// Win64: inline gs:[0x58] TEB sequence. Darwin: TLV descriptor call
+		// (`lea rdi,[rip+desc]; call [rdi]`) — clobbers RDI besides RAX/R11, which
+		// is safe here: RDI is never live across expression steps (it's only used
+		// inside self-contained sequences: copy_fixed push/pops it, and the SysV
+		// arg-register pass never loads globals).
+		if (x64_abi_win64) x64_emit_tls_addr(&p->asm_, x64_get_entity_name(e));
+		else               x64_emit_tlv_addr(&p->asm_, x64_get_entity_name(e));
+	} else if (!x64_abi_win64 && e != nullptr && e->kind == Entity_Variable && e->Variable.is_foreign) {
+		// darwin: a foreign data global lives in another image (e.g. libc `__stdoutp`);
+		// its address must come through the GOT, not a direct RIP LEA (ld64 rejects a
+		// SIGNED reloc to a dylib symbol — "does not have address").
+		x64_emit_got_load_sym(&p->asm_, X64Reg_RAX, x64_get_entity_name(e));
 	} else {
 		x64_emit_lea_sym(&p->asm_, X64Reg_RAX, x64_get_entity_name(e));
 	}
@@ -232,6 +227,7 @@ gb_internal X64Mem x64_global_mem(x64Procedure *p, Entity *e) {
 gb_internal void x64_copy_fixed(x64Procedure *p, X64Mem dst, X64Mem src, i64 size) {
 	X64Assembler *a = &p->asm_;
 	if (size <= 0) return;
+	x64_rc_note_clobber(p, dst, size);
 
 	// Large aggregates: an unrolled mov chain explodes .text, so above a threshold use REP MOVSB
 	// (O(1) code). Preserve RSI/RDI/RCX to stay clobber-safe like the unrolled path. DF is clear.
@@ -376,6 +372,11 @@ gb_internal void x64_store_value(x64Procedure *p, x64Addr dst, x64Value src) {
 	Type         *t  = dst.type;
 	if (t != nullptr && x64_type_size(t) == 0) return; // zero-sized: nothing to store
 
+	// The value at dst is changing: drop overlapping cache entries (or all, if the store goes
+	// through a pointer that could alias a cached local). Noted BEFORE the conv-pin below — the
+	// base category (RBP vs pointer) is what matters and rebasing doesn't change it.
+	x64_rc_note_store(p, dst.mem, t);
+
 	// Convert src to the destination type FIRST, then store (mirrors lb_addr_store → lb_emit_conv
 	// → lb_emit_store); all conversion lives in x64_emit_conv, this is a dumb store.
 	// A zero-sized variant (empty struct, e.g. `union{Empty,…} = Empty{}`) builds to None: the
@@ -422,6 +423,7 @@ gb_internal void x64_store_value(x64Procedure *p, x64Addr dst, x64Value src) {
 	}
 	case x64Value_Reg:
 		x64_emit_mov_mr(a, sz, dst.mem, src.reg);
+		x64_rc_write(p, dst.mem, t, src.reg); // write-through: keep the new value cached too
 		break;
 	case x64Value_XmmReg:
 		if (x64_is_double(t)) x64_emit_movsd_mr(a, dst.mem, src.xmm);

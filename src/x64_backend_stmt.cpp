@@ -5,6 +5,7 @@
 gb_internal void x64_zero_mem(x64Procedure *p, X64Mem dst, i64 size) {
 	X64Assembler *a = &p->asm_;
 	if (size <= 0) return;
+	x64_rc_note_clobber(p, dst, size);
 
 	if (size <= 256) {
 		i32 off = dst.disp;
@@ -219,9 +220,9 @@ gb_internal void x64_build_return_stmt(x64Procedure *p, Slice<Ast *> const &resu
 				x64_run_deferred(p);
 				x64_emit_lea(&p->asm_, X64Reg_RAX, x64_rbp_mem(so));
 			}
-			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RDX, x64_rbp_mem(x64_param_rbp_off(0)));
+			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RDX, x64_rbp_mem(x64_param_home_off(p, 0)));
 			x64_copy_fixed(p, x64_mem(X64Reg_RDX, 0), x64_mem(X64Reg_RAX, 0), rsz);
-			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_rbp_off(0))); // RAX = sret ptr
+			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_home_off(p, 0))); // RAX = sret ptr
 		} else if (p->deferred.count == 0) {
 			// No defers: move directly — but convert to rt first if needed (store_value → emit_conv).
 			if (v.type != nullptr && rt != nullptr && !are_types_identical(v.type, rt)) {
@@ -230,8 +231,7 @@ gb_internal void x64_build_return_stmt(x64Procedure *p, Slice<Ast *> const &resu
 				x64_store_value(p, x64addr(x64_rbp_mem(so), rt), v);
 				v = x64v_mem(rt, x64_rbp_mem(so));
 			}
-			if (x64_is_float(rt)) x64_value_to_xmm(p, v, X64XmmReg_XMM0);
-			else                  x64_value_to_reg(p, v, X64Reg_RAX);
+			x64_abi_emit_return_value(p, v, rt);
 		} else {
 			// Defers pending: load from the named local (defers may have updated it; already holds v)
 			// or, for an unnamed result, spill to a temp that survives them.
@@ -241,12 +241,7 @@ gb_internal void x64_build_return_stmt(x64Procedure *p, Slice<Ast *> const &resu
 			else { so = x64_alloc_local(p, rsz, type_align_of(rt));
 			       x64_store_value(p, x64addr(x64_rbp_mem(so), rt), v); }
 			x64_run_deferred(p);
-			if (x64_is_float(rt)) {
-				if (x64_is_double(rt)) x64_emit_movsd_rm(&p->asm_, X64XmmReg_XMM0, x64_rbp_mem(so));
-				else                    x64_emit_movss_rm(&p->asm_, X64XmmReg_XMM0, x64_rbp_mem(so));
-			} else {
-				x64_value_to_reg(p, x64v_mem(rt, x64_rbp_mem(so)), X64Reg_RAX);
-			}
+			x64_abi_emit_return_from_local(p, rt, so);
 		}
 	} else {
 		// Split returns (mirror LLVM): results[0..N-2] go through hidden pointer args,
@@ -322,18 +317,15 @@ gb_internal void x64_build_return_stmt(x64Procedure *p, Slice<Ast *> const &resu
 			if (!is_last) {
 				if (fsz == 0) continue;
 				int s = p->first_partial_ret_slot + i;
-				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_rbp_off(s)));
+				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_home_off(p, s)));
 				x64_copy_fixed(p, x64_mem(X64Reg_RAX, 0), x64_rbp_mem(toff[i]), fsz);
 			} else if (fsz == 0) {
 				// zero-sized last result: nothing
 			} else if (p->returns_by_pointer) {
-				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_rbp_off(0)));
+				x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_home_off(p, 0)));
 				x64_copy_fixed(p, x64_mem(X64Reg_RAX, 0), x64_rbp_mem(toff[i]), fsz);
-			} else if (x64_is_float(ttyp[i])) {
-				if (x64_is_double(ttyp[i])) x64_emit_movsd_rm(&p->asm_, X64XmmReg_XMM0, x64_rbp_mem(toff[i]));
-				else                         x64_emit_movss_rm(&p->asm_, X64XmmReg_XMM0, x64_rbp_mem(toff[i]));
 			} else {
-				x64_value_to_reg(p, x64v_mem(ttyp[i], x64_rbp_mem(toff[i])), X64Reg_RAX);
+				x64_abi_emit_return_from_local(p, ttyp[i], toff[i]);
 			}
 		}
 	}
@@ -782,9 +774,12 @@ gb_internal void x64_build_range_string(x64Procedure *p, X64RangeStmt *c) {
 	x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(runep_off), X64Reg_RAX);
 
 	if (de != nullptr && de->kind == Entity_Procedure) {
-		// args: [string param (16B → indirect ptr)] [rune partial-return ptr]; width in RAX.
+		// args: [string param (Win64: indirect ptr; SysV: 16B value → GP pair)]
+		//       [rune partial-return ptr]; width in RAX.
+		Type *p0t = base_type(de->type)->Proc.params->Tuple.variables[0]->type;
 		x64Value cargs[2];
-		cargs[0] = x64v_mem(t_rawptr, x64_rbp_mem(subp_off));
+		cargs[0] = x64_arg_is_indirect(p0t) ? x64v_mem(t_rawptr, x64_rbp_mem(subp_off))
+		                                    : x64v_mem(p0t, x64_rbp_mem(sub_off));
 		cargs[1] = x64v_mem(t_rawptr, x64_rbp_mem(runep_off));
 		// Multi-result proc → x64_emit_call returns none, but the LAST result (width, int) is left in
 		// RAX. Read RAX directly (passing the none value through value_to_reg would zero RAX → width 0

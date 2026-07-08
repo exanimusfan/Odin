@@ -1,8 +1,11 @@
 // x64 fast debug backend — entry point and module management.
-// Compiled only on Windows x64 (guarded in main.cpp).
+// Compiled on any 64-bit host (guarded in main.cpp); targets windows-amd64 (Win64 ABI,
+// full support) and darwin/linux-amd64 (SysV ABI, object-only — see x64_abi.cpp).
 
 #include "x64_backend.hpp"
 #include "x64_backend_type.cpp"
+#include "x64_backend_regcache.cpp"
+#include "x64_abi.cpp"
 #include "x64_backend_const.cpp"
 #include "x64_backend_proc.cpp"
 #include "x64_backend_expr.cpp"
@@ -136,6 +139,13 @@ gb_internal x64Module *x64_module_create(x64Generator *gen, AstPackage *pkg, Ast
 	array_init(&m->rdata_f32_bits, a, 0, 8);
 	array_init(&m->rdata_f32_offs, a, 0, 8);
 
+	array_init(&m->dw_funcs, a, 0, 16);
+	array_init(&m->dw_lines, a, 0, 128);
+	array_init(&m->dw_vars,    a, 0, 128);
+	array_init(&m->dw_types,   a, 0, 32);
+	array_init(&m->dw_members, a, 0, 64);
+	map_init(&m->dw_type_cache, 32);
+
 	array_init(&m->cv_strtab,     a, 0, 64);
 	array_init(&m->cv_filechksms, a, 0, 32);
 	array_init(&m->cv_file_ids,   a, 0, 8);
@@ -189,6 +199,456 @@ gb_internal void x64_module_finalize_debug(x64Module *m) {
 	coff_section_write_u32(m->debug_s, (u32)m->cv_strtab.count);
 	coff_section_write(m->debug_s, m->cv_strtab.data, m->cv_strtab.count);
 	coff_section_align(m->debug_s, 4);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// darwin DWARF (-debug): serialize the banked per-proc line tables (dw_funcs /
+// dw_lines) into three sections the Mach-O writer maps to __DWARF,__debug_abbrev
+// / __debug_info / __debug_line. One DWARF v4 compile unit per module; per proc:
+// a DW_TAG_subprogram DIE (name + low/high pc) and one line-program sequence.
+// Addresses bind via ADDR64 relocs to the proc symbols — lldb reads the DWARF
+// straight out of the .o files (ld64 debug map / dsymutil), applying the relocs.
+// Line info + function ranges only; no variable or type DIEs (yet).
+// ─────────────────────────────────────────────────────────────────────────────
+
+static void x64_dw_uleb(CoffSection *s, u64 v) {
+	do {
+		u8 b = (u8)(v & 0x7F);
+		v >>= 7;
+		if (v != 0) b |= 0x80;
+		coff_section_write_u8(s, b);
+	} while (v != 0);
+}
+
+static void x64_dw_sleb(CoffSection *s, i64 v) {
+	for (;;) {
+		u8 b = (u8)(v & 0x7F);
+		v >>= 7; // arithmetic shift
+		if ((v == 0 && (b & 0x40) == 0) || (v == -1 && (b & 0x40) != 0)) {
+			coff_section_write_u8(s, b);
+			return;
+		}
+		coff_section_write_u8(s, (u8)(b | 0x80));
+	}
+}
+
+static void x64_dw_cstr(CoffSection *s, String str) {
+	coff_section_write(s, str.text, str.len);
+	coff_section_write_u8(s, 0);
+}
+
+// Encode a signed LEB128 into `buf`, returning the byte count (buf must hold ≥10).
+static int x64_dw_sleb_buf(u8 *buf, i64 v) {
+	int n = 0;
+	for (;;) {
+		u8 b = (u8)(v & 0x7F);
+		v >>= 7;
+		if ((v == 0 && (b & 0x40) == 0) || (v == -1 && (b & 0x40) != 0)) { buf[n++] = b; return n; }
+		buf[n++] = (u8)(b | 0x80);
+	}
+}
+
+static void x64_dw_patch_u32(CoffSection *s, isize at, u32 v) {
+	s->data[at + 0] = (u8)( v        & 0xFF);
+	s->data[at + 1] = (u8)((v >>  8) & 0xFF);
+	s->data[at + 2] = (u8)((v >> 16) & 0xFF);
+	s->data[at + 3] = (u8)((v >> 24) & 0xFF);
+}
+
+// DWARF base-type encodings (DW_ATE_*).
+enum { DW_ATE_address = 0x01, DW_ATE_boolean = 0x02, DW_ATE_float = 0x04,
+       DW_ATE_signed = 0x05, DW_ATE_signed_char = 0x06, DW_ATE_unsigned = 0x07,
+       DW_ATE_unsigned_char = 0x08 };
+
+// A type's display name (e.g. "Foo", "[]int"), copied into the module arena so it
+// survives to the write stage. type_to_string(shorthand) keeps named types short.
+static String x64_dw_type_name(x64Module *m, Type *t) {
+	gbString s = type_to_string(t, m->alloc);
+	return make_string(cast(u8 const *)s, gb_string_length(s));
+}
+
+// Reserve a fresh (empty) dw_types slot, cache it for `t`, and return its 1-based
+// index. Reserving BEFORE filling lets member/element recursion that cycles back to
+// `t` resolve to this same index instead of recursing forever.
+static u32 x64_dw_reserve(x64Module *m, Type *t) {
+	x64Module::DwType d = {};
+	array_add(&m->dw_types, d);
+	u32 idx = (u32)m->dw_types.count; // 1-based
+	if (t != nullptr) map_set(&m->dw_type_cache, t, idx);
+	return idx;
+}
+
+// Deepest struct/array nesting we expand into member DIEs; beyond it, aggregates
+// collapse to the generic word. Bounds both runaway recursion and DWARF size across
+// the runtime's deeply-nested types.
+enum { X64_DW_MAX_DEPTH = 4 };
+
+gb_internal u32 x64_dw_type_d(x64Module *m, Type *t, int depth); // recursive
+
+// Copy a C string into the module arena (survives to the write stage).
+static String x64_dw_str(x64Module *m, char const *s) {
+	isize n = gb_strlen(s);
+	u8 *buf = gb_alloc_array(m->alloc, u8, n + 1);
+	gb_memcopy(buf, s, n); buf[n] = 0;
+	return make_string(buf, n);
+}
+
+// Build one member into `out` (a per-struct local list). Interning the member's TYPE
+// may append OTHER types' members to m->dw_members, so members are collected here and
+// bulk-appended to m->dw_members contiguously only AFTER the field loop — otherwise a
+// nested struct's members would interleave into this struct's [mem_lo, mem_hi) range.
+static void x64_dw_push_member(x64Module *m, Array<x64Module::DwMember> *out,
+                               String name, Type *ftype, i64 off, int depth) {
+	x64Module::DwMember mem = {};
+	mem.name   = name; // caller passes a persistent String
+	mem.type   = x64_dw_type_d(m, ftype, depth);
+	mem.offset = (u32)off;
+	array_add(out, mem);
+}
+
+// Intern a DWARF type for Odin type `t`, returning a 1-based index into m->dw_types
+// (0 = void/unknown → no DW_AT_type). Scalars → precise base types; pointers →
+// pointer-to (pointee only when it's a base scalar, else void* — this also breaks
+// recursion through `^Node`-style cycles); structs/slices/strings/fixed-arrays/enums
+// get real DWARF aggregates with members; anything else → a generic 8-byte word.
+// `depth` bounds member expansion (see X64_DW_MAX_DEPTH).
+gb_internal u32 x64_dw_type_d(x64Module *m, Type *t, int depth) {
+	if (t == nullptr) return 0;
+	if (u32 *c = map_get(&m->dw_type_cache, t)) return *c;
+
+	if (x64_is_ptr(t)) {
+		Type *bt = base_type(t);
+		Type *elem = (bt != nullptr && bt->kind == Type_Pointer) ? bt->Pointer.elem : nullptr;
+		u32 inner = (elem != nullptr && x64_cv_is_builtin_scalar(elem)) ? x64_dw_type_d(m, elem, depth) : 0;
+		u32 idx = x64_dw_reserve(m, t);
+		x64Module::DwType *d = &m->dw_types[idx - 1];
+		d->kind = 1; d->inner = inner;
+		return idx;
+	}
+	if (x64_is_float(t)) {
+		u32 idx = x64_dw_reserve(m, t);
+		x64Module::DwType *d = &m->dw_types[idx - 1];
+		d->kind = 0; d->encoding = DW_ATE_float; d->size = (u32)type_size_of(x64_typed(t));
+		d->name = (d->size == 4) ? str_lit("f32") : str_lit("f64");
+		return idx;
+	}
+	if (x64_is_bool(t)) {
+		u32 idx = x64_dw_reserve(m, t);
+		x64Module::DwType *d = &m->dw_types[idx - 1];
+		d->kind = 0; d->encoding = DW_ATE_boolean; d->size = (u32)gb_max(type_size_of(x64_typed(t)), (i64)1);
+		d->name = str_lit("bool");
+		return idx;
+	}
+	if (x64_cv_is_builtin_scalar(t)) {
+		i64 sz = type_size_of(x64_typed(t)); if (sz <= 0) sz = 8;
+		bool sgn = x64_is_signed_integer(t);
+		u32 idx = x64_dw_reserve(m, t);
+		x64Module::DwType *d = &m->dw_types[idx - 1];
+		Type *bt = base_type(t);
+		d->kind = 0; d->encoding = (u8)(sgn ? DW_ATE_signed : DW_ATE_unsigned); d->size = (u32)sz;
+		d->name = (bt != nullptr && bt->kind == Type_Basic) ? bt->Basic.name : (sgn ? str_lit("int") : str_lit("uint"));
+		return idx;
+	}
+
+	Type *bt = base_type(t);
+	// Enum → its backing integer as a base type (right width, no enumerator names).
+	if (bt != nullptr && bt->kind == Type_Enum) {
+		return x64_dw_type_d(m, bt->Enum.base_type, depth);
+	}
+
+	// Aggregates expand into member DIEs only within the depth budget; past it (or for
+	// un-modelled kinds) they collapse to a generic 8-byte word — bounds recursion and
+	// keeps the runtime's deeply-nested types from exploding the DWARF.
+	bool expand = depth < X64_DW_MAX_DEPTH;
+	if (expand && bt != nullptr && bt->kind == Type_Array) {
+		u32 elem = x64_dw_type_d(m, bt->Array.elem, depth + 1);
+		u32 idx = x64_dw_reserve(m, t);
+		x64Module::DwType *d = &m->dw_types[idx - 1];
+		d->kind = 4; d->inner = elem; d->size = (u32)bt->Array.count;
+		return idx;
+	}
+	if (expand && bt != nullptr && bt->kind == Type_Struct && !bt->Struct.is_raw_union) {
+		type_set_offsets(bt);
+		u32 idx = x64_dw_reserve(m, t);
+		Array<x64Module::DwMember> mine;
+		array_init(&mine, m->alloc, 0, bt->Struct.fields.count);
+		for_array(fi, bt->Struct.fields) {
+			Entity *fe = bt->Struct.fields[fi];
+			// Field names are checker-owned (persistent); synthesize + arena-copy only
+			// for anonymous fields.
+			String fn = fe->token.string;
+			if (fn.len == 0) { char b[24]; gb_snprintf(b, gb_size_of(b), "_%d", (int)fi); fn = x64_dw_str(m, b); }
+			x64_dw_push_member(m, &mine, fn, fe->type, type_offset_of(bt, fi), depth + 1);
+		}
+		i32 lo = (i32)m->dw_members.count;
+		for_array(k, mine) array_add(&m->dw_members, mine[k]);
+		x64Module::DwType *d = &m->dw_types[idx - 1]; // re-fetch: dw_types may have grown
+		d->kind = 3; d->size = (u32)type_size_of(bt); d->name = x64_dw_type_name(m, t);
+		d->mem_lo = lo; d->mem_hi = (i32)m->dw_members.count;
+		return idx;
+	}
+	if (expand && bt != nullptr && (bt->kind == Type_Slice || is_type_string(t))) {
+		Type *elem = (bt->kind == Type_Slice) ? bt->Slice.elem : t_u8;
+		Type *dptr = alloc_type_pointer(elem);
+		u32 idx = x64_dw_reserve(m, t);
+		Array<x64Module::DwMember> mine;
+		array_init(&mine, m->alloc, 0, 2);
+		x64_dw_push_member(m, &mine, str_lit("data"), dptr,  0, depth + 1);
+		x64_dw_push_member(m, &mine, str_lit("len"),  t_int, 8, depth + 1);
+		i32 lo = (i32)m->dw_members.count;
+		for_array(k, mine) array_add(&m->dw_members, mine[k]);
+		x64Module::DwType *d = &m->dw_types[idx - 1];
+		d->kind = 3; d->size = 16;
+		d->name = (bt->kind == Type_Slice) ? x64_dw_type_name(m, t) : str_lit("string");
+		d->mem_lo = lo; d->mem_hi = (i32)m->dw_members.count;
+		return idx;
+	}
+
+	// Everything else (unions, maps, procs, raw unions, or past the depth budget):
+	// generic 8-byte word.
+	u32 idx = x64_dw_reserve(m, t);
+	x64Module::DwType *d = &m->dw_types[idx - 1];
+	d->kind = 2; d->encoding = DW_ATE_unsigned; d->size = 8; d->name = str_lit("__word");
+	return idx;
+}
+
+gb_internal u32 x64_dw_type(x64Module *m, Type *t) { return x64_dw_type_d(m, t, 0); }
+
+gb_internal void x64_dwarf_finalize(x64Module *m) {
+	if (m->dw_funcs.count == 0) return;
+
+	// ── Unique source files, first-seen order → DWARF file indices (1-based) ──
+	Array<i32> files;
+	array_init(&files, m->alloc, 0, 8);
+	for_array(i, m->dw_lines) {
+		i32 fid = m->dw_lines[i].file_id;
+		bool seen = false;
+		for_array(k, files) { if (files[k] == fid) { seen = true; break; } }
+		if (!seen) array_add(&files, fid);
+	}
+	if (files.count == 0) return;
+
+	u32 sec_flags = COFF_SCN_CNT_IDATA | COFF_SCN_MEM_READ | COFF_SCN_ALIGN_1;
+	CoffSection *abb = coff_section_add(&m->coff, str_lit(".dwabb"), sec_flags);
+	CoffSection *inf = coff_section_add(&m->coff, str_lit(".dwinf"), sec_flags);
+	CoffSection *lin = coff_section_add(&m->coff, str_lit(".dwlin"), sec_flags);
+
+	// ── .debug_abbrev ─────────────────────────────────────────────────────
+	// Forms: 0x08 string, 0x0B data1, 0x0F udata, 0x17 sec_offset, 0x01 addr,
+	//        0x07 data8, 0x13 ref4, 0x18 exprloc, 0x19 flag_present.
+	// 1: compile_unit (children): name, language, stmt_list
+	x64_dw_uleb(abb, 1); x64_dw_uleb(abb, 0x11); coff_section_write_u8(abb, 1);
+	x64_dw_uleb(abb, 0x03); x64_dw_uleb(abb, 0x08);
+	x64_dw_uleb(abb, 0x13); x64_dw_uleb(abb, 0x0B);
+	x64_dw_uleb(abb, 0x10); x64_dw_uleb(abb, 0x17);
+	x64_dw_uleb(abb, 0); x64_dw_uleb(abb, 0);
+	// 2: subprogram (children): name, decl_line(udata), low_pc, high_pc, frame_base(exprloc), external(flag_present)
+	x64_dw_uleb(abb, 2); x64_dw_uleb(abb, 0x2E); coff_section_write_u8(abb, 1);
+	x64_dw_uleb(abb, 0x03); x64_dw_uleb(abb, 0x08);
+	x64_dw_uleb(abb, 0x3B); x64_dw_uleb(abb, 0x0F); // DW_AT_decl_line, udata
+	x64_dw_uleb(abb, 0x11); x64_dw_uleb(abb, 0x01); // low_pc, addr
+	x64_dw_uleb(abb, 0x12); x64_dw_uleb(abb, 0x07); // high_pc, data8
+	x64_dw_uleb(abb, 0x40); x64_dw_uleb(abb, 0x18); // DW_AT_frame_base, exprloc
+	x64_dw_uleb(abb, 0x3F); x64_dw_uleb(abb, 0x19); // DW_AT_external, flag_present
+	x64_dw_uleb(abb, 0); x64_dw_uleb(abb, 0);
+	// 3: formal_parameter (leaf): name, type(ref4), location(exprloc)
+	x64_dw_uleb(abb, 3); x64_dw_uleb(abb, 0x05); coff_section_write_u8(abb, 0);
+	x64_dw_uleb(abb, 0x03); x64_dw_uleb(abb, 0x08);
+	x64_dw_uleb(abb, 0x49); x64_dw_uleb(abb, 0x13); // DW_AT_type, ref4
+	x64_dw_uleb(abb, 0x02); x64_dw_uleb(abb, 0x18); // DW_AT_location, exprloc
+	x64_dw_uleb(abb, 0); x64_dw_uleb(abb, 0);
+	// 4: variable (leaf): name, type(ref4), location(exprloc)
+	x64_dw_uleb(abb, 4); x64_dw_uleb(abb, 0x34); coff_section_write_u8(abb, 0);
+	x64_dw_uleb(abb, 0x03); x64_dw_uleb(abb, 0x08);
+	x64_dw_uleb(abb, 0x49); x64_dw_uleb(abb, 0x13);
+	x64_dw_uleb(abb, 0x02); x64_dw_uleb(abb, 0x18);
+	x64_dw_uleb(abb, 0); x64_dw_uleb(abb, 0);
+	// 5: base_type (leaf): name, encoding(data1), byte_size(data1)
+	x64_dw_uleb(abb, 5); x64_dw_uleb(abb, 0x24); coff_section_write_u8(abb, 0);
+	x64_dw_uleb(abb, 0x03); x64_dw_uleb(abb, 0x08);
+	x64_dw_uleb(abb, 0x3E); x64_dw_uleb(abb, 0x0B); // DW_AT_encoding, data1
+	x64_dw_uleb(abb, 0x0B); x64_dw_uleb(abb, 0x0B); // DW_AT_byte_size, data1
+	x64_dw_uleb(abb, 0); x64_dw_uleb(abb, 0);
+	// 6: pointer_type with pointee: byte_size(data1), type(ref4)
+	x64_dw_uleb(abb, 6); x64_dw_uleb(abb, 0x0F); coff_section_write_u8(abb, 0);
+	x64_dw_uleb(abb, 0x0B); x64_dw_uleb(abb, 0x0B);
+	x64_dw_uleb(abb, 0x49); x64_dw_uleb(abb, 0x13);
+	x64_dw_uleb(abb, 0); x64_dw_uleb(abb, 0);
+	// 7: pointer_type void*: byte_size(data1)
+	x64_dw_uleb(abb, 7); x64_dw_uleb(abb, 0x0F); coff_section_write_u8(abb, 0);
+	x64_dw_uleb(abb, 0x0B); x64_dw_uleb(abb, 0x0B);
+	x64_dw_uleb(abb, 0); x64_dw_uleb(abb, 0);
+	// 8: structure_type (children): name(string), byte_size(udata)
+	x64_dw_uleb(abb, 8); x64_dw_uleb(abb, 0x13); coff_section_write_u8(abb, 1);
+	x64_dw_uleb(abb, 0x03); x64_dw_uleb(abb, 0x08);
+	x64_dw_uleb(abb, 0x0B); x64_dw_uleb(abb, 0x0F); // DW_AT_byte_size, udata
+	x64_dw_uleb(abb, 0); x64_dw_uleb(abb, 0);
+	// 9: member (leaf): name(string), type(ref4), data_member_location(udata)
+	x64_dw_uleb(abb, 9); x64_dw_uleb(abb, 0x0D); coff_section_write_u8(abb, 0);
+	x64_dw_uleb(abb, 0x03); x64_dw_uleb(abb, 0x08);
+	x64_dw_uleb(abb, 0x49); x64_dw_uleb(abb, 0x13);
+	x64_dw_uleb(abb, 0x38); x64_dw_uleb(abb, 0x0F); // DW_AT_data_member_location, udata
+	x64_dw_uleb(abb, 0); x64_dw_uleb(abb, 0);
+	// 10: array_type (children): type(ref4)
+	x64_dw_uleb(abb, 10); x64_dw_uleb(abb, 0x01); coff_section_write_u8(abb, 1);
+	x64_dw_uleb(abb, 0x49); x64_dw_uleb(abb, 0x13);
+	x64_dw_uleb(abb, 0); x64_dw_uleb(abb, 0);
+	// 11: subrange_type (leaf): count(udata)
+	x64_dw_uleb(abb, 11); x64_dw_uleb(abb, 0x21); coff_section_write_u8(abb, 0);
+	x64_dw_uleb(abb, 0x37); x64_dw_uleb(abb, 0x0F); // DW_AT_count, udata
+	x64_dw_uleb(abb, 0); x64_dw_uleb(abb, 0);
+	x64_dw_uleb(abb, 0); // table terminator
+
+	// Intern DWARF types for every banked variable up front (fills m->dw_types).
+	for_array(vi, m->dw_vars) x64_dw_type(m, m->dw_vars[vi].type);
+
+	// ── .debug_info: one v4 CU ────────────────────────────────────────────
+	isize cu_len_at = coff_section_len(inf);
+	coff_section_write_u32(inf, 0);      // unit_length (patched)
+	coff_section_write_u16(inf, 4);      // version
+	coff_section_write_u32(inf, 0);      // debug_abbrev offset (one table at 0)
+	coff_section_write_u8 (inf, 8);      // address_size
+	x64_dw_uleb(inf, 1);                 // DW_TAG_compile_unit
+	// CU name must be a SOURCE PATH (ld64 synthesizes the debug-map N_SO stab from
+	// it — a non-path name suppresses the whole debug map). Absolute path → no
+	// comp_dir needed. Use the module's first-seen file as the representative.
+	x64_dw_cstr(inf, get_file_path_string(files[0]));
+	coff_section_write_u8 (inf, 0x0C);   // DW_LANG_C99 (nearest well-known)
+	coff_section_write_u32(inf, 0);      // stmt_list → our line program at 0
+
+	// Type DIEs first (as CU children); record each one's CU offset for ref4. A CU
+	// starts at .debug_info offset 0 here, so section offset == CU-relative offset.
+	// A struct is reserved BEFORE its members are interned, so members get HIGHER
+	// indices — their offsets aren't known when the struct is written. Collect each
+	// ref4 as a fixup (byte position + target index) and patch after the sweep.
+	Array<u32> type_off; // dw_types index → DIE offset (0 = void/none)
+	array_init(&type_off, m->alloc, m->dw_types.count + 1, m->dw_types.count + 1);
+	type_off[0] = 0;
+	Array<u32> ref_fixups; // pairs (position, target_type_index)
+	array_init(&ref_fixups, m->alloc, 0, 32);
+	auto emit_ref4 = [&](u32 target_idx) {
+		array_add(&ref_fixups, (u32)coff_section_len(inf));
+		array_add(&ref_fixups, target_idx);
+		coff_section_write_u32(inf, 0); // patched below
+	};
+	for_array(ti, m->dw_types) {
+		x64Module::DwType *dt = &m->dw_types[ti];
+		type_off[ti + 1] = (u32)coff_section_len(inf);
+		switch (dt->kind) {
+		case 1: // pointer
+			if (dt->inner != 0) {
+				x64_dw_uleb(inf, 6); coff_section_write_u8(inf, 8); emit_ref4(dt->inner);
+			} else {
+				x64_dw_uleb(inf, 7); coff_section_write_u8(inf, 8);
+			}
+			break;
+		case 3: { // structure_type + members
+			x64_dw_uleb(inf, 8);
+			x64_dw_cstr(inf, dt->name);
+			x64_dw_uleb(inf, dt->size); // byte_size (udata)
+			for (i32 mi = dt->mem_lo; mi < dt->mem_hi; mi++) {
+				x64Module::DwMember *mem = &m->dw_members[mi];
+				x64_dw_uleb(inf, 9);
+				x64_dw_cstr(inf, mem->name);
+				emit_ref4(mem->type);
+				x64_dw_uleb(inf, mem->offset); // data_member_location (udata)
+			}
+			x64_dw_uleb(inf, 0); // end of members
+		} break;
+		case 4: // array_type + subrange
+			x64_dw_uleb(inf, 10);
+			emit_ref4(dt->inner);
+			x64_dw_uleb(inf, 11);
+			x64_dw_uleb(inf, dt->size); // count (udata)
+			x64_dw_uleb(inf, 0); // end of array children
+			break;
+		default: // base type (kind 0) or generic word (kind 2)
+			x64_dw_uleb(inf, 5);
+			x64_dw_cstr(inf, dt->name);
+			coff_section_write_u8(inf, dt->encoding);
+			coff_section_write_u8(inf, (u8)dt->size);
+			break;
+		}
+	}
+	for (isize k = 0; k + 1 < ref_fixups.count; k += 2) {
+		u32 pos = ref_fixups[k], tgt = ref_fixups[k + 1];
+		x64_dw_patch_u32(inf, pos, type_off[tgt]);
+	}
+
+	for_array(fi, m->dw_funcs) {
+		x64Module::DwFunc *f = &m->dw_funcs[fi];
+		x64_dw_uleb(inf, 2);             // DW_TAG_subprogram (has children)
+		x64_dw_cstr(inf, f->link_name);
+		x64_dw_uleb(inf, (u64)gb_max(f->decl_line, 0)); // decl_line
+		coff_reloc_add(inf, (u32)coff_section_len(inf), f->link_name, COFF_REL_ADDR64);
+		coff_section_write_u64(inf, 0);  // low_pc  (reloc → proc)
+		coff_section_write_u64(inf, f->code_size); // high_pc (size form)
+		coff_section_write_u8(inf, 1); coff_section_write_u8(inf, 0x56); // frame_base = DW_OP_reg6 (RBP)
+		// (DW_AT_external is flag_present — no data byte.)
+
+		for (i32 vi = f->var_lo; vi < f->var_hi; vi++) {
+			x64Module::DwVar *dv = &m->dw_vars[vi];
+			u32 tix = x64_dw_type(m, dv->type);
+			x64_dw_uleb(inf, dv->is_param ? 3 : 4); // formal_parameter / variable
+			x64_dw_cstr(inf, dv->name);
+			coff_section_write_u32(inf, type_off[tix]); // DW_AT_type ref4
+			// location = DW_OP_fbreg(rbp_off): value at [frame_base + off] = [RBP + off].
+			// exprloc = uleb(len) + DW_OP_fbreg(0x91) + sleb(off) — measure sleb, then emit.
+			u8 sleb[10];
+			int n = x64_dw_sleb_buf(sleb, dv->rbp_off);
+			x64_dw_uleb(inf, (u64)(1 + n));
+			coff_section_write_u8(inf, 0x91); // DW_OP_fbreg
+			coff_section_write(inf, sleb, n);
+		}
+		x64_dw_uleb(inf, 0); // end of subprogram children
+	}
+	x64_dw_uleb(inf, 0); // end of CU children
+	x64_dw_patch_u32(inf, cu_len_at, (u32)(coff_section_len(inf) - cu_len_at - 4));
+
+	// ── .debug_line: v4 header + one sequence per proc ────────────────────
+	isize ul_at = coff_section_len(lin);
+	coff_section_write_u32(lin, 0);      // unit_length (patched)
+	coff_section_write_u16(lin, 4);      // version
+	isize hl_at = coff_section_len(lin);
+	coff_section_write_u32(lin, 0);      // header_length (patched)
+	coff_section_write_u8(lin, 1);       // minimum_instruction_length
+	coff_section_write_u8(lin, 1);       // maximum_operations_per_instruction
+	coff_section_write_u8(lin, 1);       // default_is_stmt
+	coff_section_write_u8(lin, 0xFB);    // line_base = -5
+	coff_section_write_u8(lin, 14);      // line_range
+	coff_section_write_u8(lin, 13);      // opcode_base (no special opcodes used)
+	{
+		static u8 const std_lens[12] = {0,1,1,1,1,0,0,0,1,0,0,1};
+		coff_section_write(lin, std_lens, 12);
+	}
+	coff_section_write_u8(lin, 0);       // include_directories: empty
+	for_array(k, files) {
+		x64_dw_cstr(lin, get_file_path_string(files[k])); // absolute path
+		x64_dw_uleb(lin, 0); x64_dw_uleb(lin, 0); x64_dw_uleb(lin, 0); // dir/mtime/size
+	}
+	coff_section_write_u8(lin, 0);       // file_names terminator
+	x64_dw_patch_u32(lin, hl_at, (u32)(coff_section_len(lin) - hl_at - 4));
+
+	for_array(fi, m->dw_funcs) {
+		x64Module::DwFunc *f = &m->dw_funcs[fi];
+		// DW_LNE_set_address(proc) — the operand carries an ADDR64 reloc.
+		coff_section_write_u8(lin, 0); x64_dw_uleb(lin, 9); coff_section_write_u8(lin, 0x02);
+		coff_reloc_add(lin, (u32)coff_section_len(lin), f->link_name, COFF_REL_ADDR64);
+		coff_section_write_u64(lin, 0);
+		u32 cur_off = 0, cur_line = 1; i32 cur_file = 1;
+		for (i32 li = f->line_lo; li < f->line_hi; li++) {
+			x64Module::DwLine *e = &m->dw_lines[li];
+			i32 fidx = 1;
+			for_array(k, files) { if (files[k] == e->file_id) { fidx = (i32)k + 1; break; } }
+			if (fidx != cur_file) { coff_section_write_u8(lin, 0x04); x64_dw_uleb(lin, (u64)fidx); cur_file = fidx; }
+			if (e->line != cur_line) { coff_section_write_u8(lin, 0x03); x64_dw_sleb(lin, (i64)e->line - (i64)cur_line); cur_line = e->line; }
+			if (e->offset != cur_off) { coff_section_write_u8(lin, 0x02); x64_dw_uleb(lin, e->offset - cur_off); cur_off = e->offset; }
+			coff_section_write_u8(lin, 0x01); // DW_LNS_copy
+		}
+		if (f->code_size > cur_off) { coff_section_write_u8(lin, 0x02); x64_dw_uleb(lin, f->code_size - cur_off); }
+		coff_section_write_u8(lin, 0); x64_dw_uleb(lin, 1); coff_section_write_u8(lin, 0x01); // DW_LNE_end_sequence
+	}
+	x64_dw_patch_u32(lin, ul_at, (u32)(coff_section_len(lin) - ul_at - 4));
 }
 
 gb_internal void x64_compile_procedure(x64Module *m, Entity *e, Ast *body) {
@@ -251,6 +711,8 @@ gb_internal void x64_compile_procedure(x64Module *m, Entity *e, Ast *body) {
 	array_init(&p->inline_sites,    a, 0, 2);
 	p->cur_inline_site = -1;
 	p->fallthrough_lbl = -1;
+	x64_rc_init(p);
+	x64_rc_escape_prescan(p, body); // which locals may be aliased → who survives calls cached
 	p->cur_line = -1;
 	p->cur_file_id = -1;
 	// Line-table file from the BODY, not the entity token (mirrors LLVM's node->file()):
@@ -480,7 +942,107 @@ gb_internal CoffSection *x64_module_tls_section(x64Module *m) {
 // references go through the TLS access sequence — see x64_emit_tls_addr). Const initializer
 // becomes the template (copied to every thread); else zero-fill (a runtime initializer sets
 // only the running thread, matching LLVM/Odin). EXTERNAL symbol (cross-module via SECREL).
+// Define or upgrade (UNDEF→defined) an EXTERNAL data symbol at `off` in section `secnum`.
+static void x64_define_data_sym(x64Module *m, String name, i16 secnum, u32 off, u8 storage_class) {
+	u32 *existing = string_map_get(&m->coff.sym_map, name);
+	if (existing != nullptr) {
+		CoffSymEntry &se = m->coff.syms[*existing];
+		se.value          = off;
+		se.section_number = secnum;
+		se.type           = COFF_SYM_TYPE_NULL;
+		se.storage_class  = storage_class;
+		return;
+	}
+	u32 sym_idx = (u32)m->coff.syms.count;
+	CoffSymEntry sym_e = {};
+	sym_e.name           = name;
+	sym_e.value          = off;
+	sym_e.section_number = secnum;
+	sym_e.type           = COFF_SYM_TYPE_NULL;
+	sym_e.storage_class  = storage_class;
+	array_add(&m->coff.syms, sym_e);
+	string_map_set(&m->coff.sym_map, name, sym_idx);
+}
+
+// darwin @(thread_local): emit the variable's initializer template into
+// .tdata/.tbss with a LOCAL `name$tlv$init` marker, and a 24-byte TLVDescriptor
+// {_tlv_bootstrap, key=0, &init} into .tlv — the variable's PUBLIC symbol points at
+// the DESCRIPTOR (code reaches the data via x64_emit_tlv_addr's `call [rdi]`).
+// ld64 recognizes __thread_vars and rewrites the offset field; dyld installs the
+// real getter over _tlv_bootstrap at load.
+static void x64_emit_global_tlv_darwin(x64Module *m, Entity *e, DeclInfo *d) {
+	String name = x64_get_entity_name(e);
+	{
+		u32 *existing = string_map_get(&m->coff.sym_map, name);
+		if (existing != nullptr && m->coff.syms[*existing].section_number != COFF_SECT_UNDEF) {
+			return; // already defined
+		}
+	}
+	Type *t  = x64_typed(e->type);
+	i64   sz = type_size_of(t); if (sz <= 0) sz = 1;
+	i64   al = type_align_of(t); if (al <= 0) al = 1;
+
+	// ── Initializer template + local $tlv$init marker ─────────────────────
+	bool const_init = x64_global_has_const_init(d, e);
+	CoffSection *init_sec;
+	i16          init_secnum;
+	if (const_init) {
+		if (m->tdata == nullptr) {
+			m->tdata = coff_section_add(&m->coff, str_lit(".tdata"),
+			    COFF_SCN_CNT_IDATA | COFF_SCN_MEM_READ | COFF_SCN_MEM_WRITE | COFF_SCN_ALIGN_16);
+			m->tdata_secnum = (i16)m->coff.sections.count;
+		}
+		init_sec = m->tdata; init_secnum = m->tdata_secnum;
+	} else {
+		if (m->tbss == nullptr) {
+			m->tbss = coff_section_add(&m->coff, str_lit(".tbss"),
+			    COFF_SCN_CNT_UDATA | COFF_SCN_MEM_READ | COFF_SCN_MEM_WRITE | COFF_SCN_ALIGN_16);
+			m->tbss_secnum = (i16)m->coff.sections.count;
+		}
+		init_sec = m->tbss; init_secnum = m->tbss_secnum;
+	}
+	u32 init_off;
+	if (const_init) {
+		init_off = x64_const_reserve(init_sec, al, sz);
+		TypeAndValue tav = type_and_value_of_expr(d->init_expr);
+		x64_const_value(m, init_sec, init_off, t, tav.value, tav.type);
+	} else {
+		coff_section_align(init_sec, (isize)al);
+		init_off = (u32)coff_section_len(init_sec);
+		for (i64 b = 0; b < sz; b++) coff_section_write_u8(init_sec, 0);
+	}
+	u8 *ibuf = gb_alloc_array(m->alloc, u8, name.len + 10);
+	gb_memcopy(ibuf, name.text, name.len);
+	gb_memcopy(ibuf + name.len, "$tlv$init", 9);
+	String init_name = make_string(ibuf, name.len + 9);
+	x64_define_data_sym(m, init_name, init_secnum, init_off, COFF_SYM_CLASS_STATIC);
+
+	// ── TLVDescriptor in .tlv; the variable's public symbol addresses it ──
+	if (m->tlv == nullptr) {
+		m->tlv = coff_section_add(&m->coff, str_lit(".tlv"),
+		    COFF_SCN_CNT_IDATA | COFF_SCN_MEM_READ | COFF_SCN_MEM_WRITE | COFF_SCN_ALIGN_8);
+		m->tlv_secnum = (i16)m->coff.sections.count;
+	}
+	coff_section_align(m->tlv, 8);
+	u32 desc_off = (u32)coff_section_len(m->tlv);
+	coff_reloc_add(m->tlv, desc_off + 0, str_lit("_tlv_bootstrap"), COFF_REL_ADDR64);
+	coff_section_write_u64(m->tlv, 0); // getter (filled by reloc + dyld)
+	coff_section_write_u64(m->tlv, 0); // key (assigned by dyld)
+	coff_reloc_add(m->tlv, desc_off + 16, init_name, COFF_REL_ADDR64);
+	coff_section_write_u64(m->tlv, 0); // &init (ld64 turns into the TLS-block offset)
+
+	x64_define_data_sym(m, name, m->tlv_secnum, desc_off, COFF_SYM_CLASS_EXTERNAL);
+}
+
 gb_internal void x64_emit_global_tls(x64Module *m, Entity *e, DeclInfo *d) {
+	if (!x64_abi_win64) {
+		if (e->Variable.is_foreign) {
+			coff_sym_find_or_add_extern(&m->coff, x64_get_entity_name(e));
+			return;
+		}
+		x64_emit_global_tlv_darwin(m, e, d);
+		return;
+	}
 	if (e->Variable.is_foreign) {
 		coff_sym_find_or_add_extern(&m->coff, x64_get_entity_name(e));
 		return;
@@ -631,6 +1193,7 @@ gb_internal void x64_emit_startup_runtime(x64Module *m, x64Generator *gen, PtrSe
 	array_init(&p->inline_sites,    a, 0, 2);
 	p->cur_inline_site = -1;
 	p->fallthrough_lbl = -1;
+	x64_rc_init(p); // no prescan (synthesized body) → scan_ok=false → cached but no call-survival
 	p->cur_line = -1;
 	p->cur_file_id = -1;
 	p->file_id  = 0;
@@ -706,6 +1269,7 @@ gb_internal void x64_emit_test_main(x64Module *m, x64Generator *gen) {
 	array_init(&p->inline_sites,    a, 0, 2);
 	p->cur_inline_site = -1;
 	p->fallthrough_lbl = -1;
+	x64_rc_init(p); // no prescan (synthesized body) → scan_ok=false → cached but no call-survival
 	p->cur_line = -1;
 	p->cur_file_id = -1;
 	p->file_id  = 0;
@@ -713,11 +1277,15 @@ gb_internal void x64_emit_test_main(x64Module *m, x64Generator *gen) {
 	x64_proc_begin(p);
 	p->is_startup = true;
 
-	// args__ = argv[:argc]  (argc=ECX, argv=RDX at entry; the prologue doesn't touch them).
+	// args__ = argv[:argc]. C main receives argc/argv in the target's first two integer
+	// arg registers — Win64: ECX/RDX; SysV (darwin): EDI/RSI. The prologue doesn't touch
+	// them (no params → no homing, rc-saves only hit RBX/R12-R15).
 	if (args_e != nullptr) {
-		x64_emit_mov_rr(&p->asm_, X64OpSize_32, X64Reg_R8, X64Reg_RCX);   // R8 = argc (zero-extended; argc≥0)
+		X64Reg argc_reg = x64_abi_win64 ? X64Reg_RCX : X64Reg_RDI;
+		X64Reg argv_reg = x64_abi_win64 ? X64Reg_RDX : X64Reg_RSI;
+		x64_emit_mov_rr(&p->asm_, X64OpSize_32, X64Reg_R8, argc_reg);   // R8 = argc (zero-extended; argc≥0)
 		x64_emit_lea_sym(&p->asm_, X64Reg_RAX, x64_get_entity_name(args_e));
-		x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_mem(X64Reg_RAX, 0), X64Reg_RDX); // .data = argv
+		x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_mem(X64Reg_RAX, 0), argv_reg); // .data = argv
 		x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_mem(X64Reg_RAX, 8), X64Reg_R8);  // .len  = argc
 	}
 
@@ -763,12 +1331,11 @@ gb_internal void x64_emit_test_main(x64Module *m, x64Generator *gen) {
 	x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RAX, N);
 	x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(sl + 8), X64Reg_RAX);
 
-	// runner(slice) — the slice (16B) is passed indirect (by pointer); context is the last Odin arg.
-	i32 slp = x64_alloc_local(p, 8, 8);
-	x64_emit_lea(&p->asm_, X64Reg_RAX, x64_rbp_mem(sl));
-	x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(slp), X64Reg_RAX);
+	// runner(slice) — the 16B slice is indirect (by pointer) on Win64, a GP pair on SysV;
+	// context is the last Odin arg.
+	Type *runner_p0t = base_type(runner->type)->Proc.params->Tuple.variables[0]->type;
 	x64Value rargs[2];
-	rargs[0] = x64v_mem(t_rawptr, x64_rbp_mem(slp));
+	rargs[0] = x64_abi_value_or_addr_slot(p, runner_p0t, x64_rbp_mem(sl));
 	rargs[1] = x64_context_ptr_value(p);
 	x64Value rres = x64_emit_call(p, x64_get_entity_name(runner), runner->type, rargs, 2); // bool → RAX
 
@@ -1564,6 +2131,10 @@ gb_internal WORKER_TASK_PROC(x64_write_module_worker) {
 	}
 
 	x64_module_finalize_debug(m);
+	if (!x64_abi_win64) x64_dwarf_finalize(m); // no-op unless -debug banked line tables
+
+	// darwin targets get Mach-O .o (linkable by ld64/clang); everything else COFF .obj.
+	bool is_macho = build_context.metrics.os == TargetOs_darwin;
 
 	String   output_base = build_context.build_paths[BuildPath_Output].basename;
 	gbString path_s = gb_string_make_length(temporary_allocator(), output_base.text, output_base.len);
@@ -1572,10 +2143,12 @@ gb_internal WORKER_TASK_PROC(x64_write_module_worker) {
 	if (m->file != nullptr) {
 		path_s = gb_string_append_fmt(path_s, "_%d", (int)m->file->id); // unique per file
 	}
-	path_s = gb_string_appendc(path_s, "_x64.obj");
+	path_s = gb_string_appendc(path_s, is_macho ? "_x64.o" : "_x64.obj");
 	String filepath = make_string(cast(u8 const *)path_s, gb_string_length(path_s));
 
-	if (!coff_writer_emit(&m->coff, filepath)) {
+	bool emitted = is_macho ? macho_writer_emit(&m->coff, filepath)
+	                        : coff_writer_emit(&m->coff, filepath);
+	if (!emitted) {
 		m->obj_failed = true;
 	} else {
 		m->obj_path = copy_string(permanent_allocator(), filepath);
@@ -1664,6 +2237,8 @@ gb_internal void x64_add_foreign_lib(x64Generator *gen, Entity *lib) {
 gb_internal x64Generator *x64_generate_code(Checker *c) {
 	CheckerInfo *info = &c->info;
 	gbAllocator  a    = heap_allocator();
+
+	x64_abi_init_target(); // Win64 vs SysV calling convention, from the TARGET os
 
 	x64Generator *gen = gb_alloc_item(a, x64Generator);
 	gen->info  = info;

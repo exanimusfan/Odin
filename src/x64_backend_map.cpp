@@ -198,10 +198,8 @@ gb_internal x64Value x64_map_null_loc(x64Procedure *p) {
 	i64 al = type_align_of(t_source_code_location); if (al <= 0) al = 8;
 	i32 off = x64_alloc_local(p, sz, al);
 	x64_zero_mem(p, x64_rbp_mem(off), sz);
-	i32 po = x64_alloc_local(p, 8, 8);
-	x64_emit_lea(&p->asm_, X64Reg_RAX, x64_rbp_mem(off));
-	x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(po), X64Reg_RAX);
-	return x64v_mem(t_rawptr, x64_rbp_mem(po));
+	// ABI slot for the by-value Source_Code_Location param (Win64: pointer; SysV: value).
+	return x64_abi_value_or_addr_slot(p, t_source_code_location, x64_rbp_mem(off));
 }
 
 // Build the key value from `key_expr`, convert to the map's key type, spill it, and return a
@@ -386,12 +384,12 @@ gb_internal x64Value x64_map_hash_is_valid(x64Procedure *p, x64Value hash) {
 
 // Address of param `slot` (a rawptr) loaded into RAX; returns a pointer-in-local mem ref.
 gb_internal x64Value x64_synth_ptr_param(x64Procedure *p, int slot) {
-	return x64v_mem(t_rawptr, x64_rbp_mem(x64_param_rbp_off(slot)));
+	return x64v_mem(t_rawptr, x64_rbp_mem(x64_param_home_off(p, slot)));
 }
 
 // Compute (param0 data ptr) + offset → a stable pointer local.
 gb_internal x64Value x64_synth_field_ptr(x64Procedure *p, int data_slot, i64 offset) {
-	x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_rbp_off(data_slot)));
+	x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_home_off(p, data_slot)));
 	if (offset != 0) x64_emit_add_ri(&p->asm_, X64OpSize_64, X64Reg_RAX, cast(i32)offset);
 	return x64_map_spill_u64(p, x64v_reg(t_rawptr, X64Reg_RAX), t_rawptr);
 }
@@ -411,7 +409,7 @@ gb_internal void x64_synth_call_child_hasher(x64Procedure *p, Type *child, x64Va
 gb_internal void x64_emit_hasher_body(x64Procedure *p, Type *type, i32 res_off) {
 	Type *t = core_type(type);
 	x64Value data = x64_synth_ptr_param(p, 0);
-	x64Value seed = x64v_mem(t_uintptr, x64_rbp_mem(x64_param_rbp_off(1)));
+	x64Value seed = x64v_mem(t_uintptr, x64_rbp_mem(x64_param_home_off(p, 1)));
 
 	if (is_type_simple_compare(t)) {
 		x64Value a[3]; a[0] = data; a[1] = seed; a[2] = x64v_imm(t_int, type_size_of(t));
@@ -433,7 +431,7 @@ gb_internal void x64_emit_hasher_body(x64Procedure *p, Type *type, i32 res_off) 
 		// load *data into a local, widen to f64, default_hasher_f64(v, seed)
 		i64 fsz = type_size_of(t); if (fsz <= 0) fsz = 4;
 		i32 lo = x64_alloc_local(p, fsz, fsz);
-		x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_rbp_off(0)));
+		x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_home_off(p, 0)));
 		x64_copy_mem(p, x64_rbp_mem(lo), x64_mem(X64Reg_RAX, 0), fsz);
 		x64Value v = x64_emit_conv(p, x64v_mem(t, x64_rbp_mem(lo)), t, t_f64);
 		v = x64_map_spill_u64(p, v, t_f64);
@@ -473,7 +471,7 @@ gb_internal void x64_emit_hasher_body(x64Procedure *p, Type *type, i32 res_off) 
 		x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(idx_off));
 		x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RCX, esz);
 		x64_emit_imul_rr(&p->asm_, X64OpSize_64, X64Reg_RAX, X64Reg_RCX);
-		x64_emit_add_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_rbp_off(0)));
+		x64_emit_add_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_home_off(p, 0)));
 		x64Value ep = x64_map_spill_u64(p, x64v_reg(t_rawptr, X64Reg_RAX), t_rawptr);
 		x64_synth_call_child_hasher(p, elem, ep, seed_off);
 		x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(idx_off));
@@ -495,7 +493,7 @@ gb_internal void x64_emit_hasher_body(x64Procedure *p, Type *type, i32 res_off) 
 		for (Type *v : t->Union.variants) {
 			i64 tag_val = union_variant_index_checked(t, v);
 			isize next = x64_label_alloc(&p->asm_);
-			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_rbp_off(0))); // data ptr
+			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_home_off(p, 0))); // data ptr
 			x64_emit_union_tag_value(p, x64_mem(X64Reg_RAX, 0), t, X64Reg_RCX); // tag
 			x64_emit_cmp_ri(&p->asm_, X64OpSize_64, X64Reg_RCX, cast(i32)tag_val);
 			x64_emit_jcc(&p->asm_, X64Cc_NE, next);
@@ -525,8 +523,8 @@ gb_internal void x64_emit_equal_body(x64Procedure *p, Type *type, i32 res_off) {
 	isize end = x64_label_alloc(&p->asm_);
 
 	// Fast path: identical pointers → equal.
-	x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_rbp_off(0)));
-	x64_emit_cmp_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_rbp_off(1)));
+	x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_home_off(p, 0)));
+	x64_emit_cmp_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_home_off(p, 1)));
 	isize diff = x64_label_alloc(&p->asm_);
 	x64_emit_jcc(&p->asm_, X64Cc_NE, diff);
 	x64_emit_mov_ri(&p->asm_, X64OpSize_64, X64Reg_RAX, 1);
@@ -542,7 +540,7 @@ gb_internal void x64_emit_equal_body(x64Procedure *p, Type *type, i32 res_off) {
 		X64OpSize tsz = tag_sz <= 1 ? X64OpSize_8 : (tag_sz == 2 ? X64OpSize_16 : (tag_sz == 4 ? X64OpSize_32 : X64OpSize_64));
 		i32 tag_off = cast(i32)t->Union.variant_block_size;
 
-		x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_rbp_off(0)));
+		x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_home_off(p, 0)));
 		if (tsz == X64OpSize_64) {
 			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_R8, x64_mem(X64Reg_RAX, tag_off));
 		} else if (tsz == X64OpSize_32) {
@@ -553,7 +551,7 @@ gb_internal void x64_emit_equal_body(x64Procedure *p, Type *type, i32 res_off) {
 		i32 ltag = x64_alloc_local(p, 8, 8);
 		x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(ltag), X64Reg_R8);
 
-		x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_rbp_off(1)));
+		x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_home_off(p, 1)));
 		if (tsz == X64OpSize_64) {
 			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_R9, x64_mem(X64Reg_RAX, tag_off));
 		} else if (tsz == X64OpSize_32) {
@@ -585,10 +583,10 @@ gb_internal void x64_emit_equal_body(x64Procedure *p, Type *type, i32 res_off) {
 			isize nxt = x64_label_alloc(&p->asm_);
 			x64_emit_jcc(&p->asm_, X64Cc_NE, nxt);
 			i32 lv = x64_alloc_local(p, vsz, val);
-			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_rbp_off(0)));
+			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_home_off(p, 0)));
 			x64_copy_mem(p, x64_rbp_mem(lv), x64_mem(X64Reg_RAX, 0), vsz);
 			i32 rv = x64_alloc_local(p, vsz, val);
-			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_rbp_off(1)));
+			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_home_off(p, 1)));
 			x64_copy_mem(p, x64_rbp_mem(rv), x64_mem(X64Reg_RAX, 0), vsz);
 			x64Value eq = x64_emit_comp(p, Token_CmpEq, x64v_mem(vt, x64_rbp_mem(lv)), x64v_mem(vt, x64_rbp_mem(rv)));
 			x64_value_to_reg(p, eq, X64Reg_RAX);
@@ -619,10 +617,10 @@ gb_internal void x64_emit_equal_body(x64Procedure *p, Type *type, i32 res_off) {
 			i64 fal = type_align_of(ft); if (fal <= 0) fal = 1;
 			// load lhs.field, rhs.field into locals
 			i32 la = x64_alloc_local(p, fsz, fal);
-			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_rbp_off(0)));
+			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_home_off(p, 0)));
 			x64_copy_mem(p, x64_rbp_mem(la), x64_mem(X64Reg_RAX, cast(i32)off), fsz);
 			i32 ra = x64_alloc_local(p, fsz, fal);
-			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_rbp_off(1)));
+			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_home_off(p, 1)));
 			x64_copy_mem(p, x64_rbp_mem(ra), x64_mem(X64Reg_RAX, cast(i32)off), fsz);
 			x64Value eq = x64_emit_comp(p, Token_CmpEq, x64v_mem(ft, x64_rbp_mem(la)), x64v_mem(ft, x64_rbp_mem(ra)));
 			x64_value_to_reg(p, eq, X64Reg_RAX);
@@ -642,10 +640,10 @@ gb_internal void x64_emit_equal_body(x64Procedure *p, Type *type, i32 res_off) {
 	i64 sz = type_size_of(t); if (sz <= 0) sz = 1;
 	i64 al = type_align_of(t); if (al <= 0) al = 1;
 	i32 la = x64_alloc_local(p, sz, al);
-	x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_rbp_off(0)));
+	x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_home_off(p, 0)));
 	x64_copy_mem(p, x64_rbp_mem(la), x64_mem(X64Reg_RAX, 0), sz);
 	i32 ra = x64_alloc_local(p, sz, al);
-	x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_rbp_off(1)));
+	x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_home_off(p, 1)));
 	x64_copy_mem(p, x64_rbp_mem(ra), x64_mem(X64Reg_RAX, 0), sz);
 	x64Value eq = x64_emit_comp(p, Token_CmpEq, x64v_mem(t, x64_rbp_mem(la)), x64v_mem(t, x64_rbp_mem(ra)));
 	x64_value_to_reg(p, eq, X64Reg_RAX);

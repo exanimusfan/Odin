@@ -100,6 +100,45 @@ struct x64Module {
 	i16            tls_secnum; // 1-based COFF section number of `tls` (0 until created)
 	CoffSection   *drectve; // .drectve — linker directives (/INCLUDE, /EXPORT), created lazily
 
+	// darwin TLV (created lazily, SysV targets only; mapped by the Mach-O writer to
+	// __thread_data / __thread_bss / __thread_vars):
+	CoffSection   *tdata;   // .tdata — const-initialized thread-local templates
+	CoffSection   *tbss;    // .tbss  — zero-initialized thread-local storage
+	CoffSection   *tlv;     // .tlv   — TLVDescriptor {getter, key, &init} per variable
+	i16            tdata_secnum, tbss_secnum, tlv_secnum;
+
+	// darwin DWARF (-debug): per-proc source-line records collected at proc_end and
+	// serialized by x64_dwarf_finalize into .dwabb/.dwinf/.dwlin (mapped by the
+	// Mach-O writer to __DWARF,__debug_abbrev/__debug_info/__debug_line; lldb reads
+	// them from the .o files through ld64's debug map / dsymutil). Line entry code
+	// offsets are PROC-relative; addresses bind via ADDR64 relocs to the proc symbol.
+	struct DwFunc {
+		String link_name;
+		u32    code_size;
+		i32    line_lo, line_hi; // index range [lo, hi) into dw_lines
+		i32    decl_line;        // proc's source line (DW_AT_decl_line)
+		i32    var_lo, var_hi;   // index range [lo, hi) into dw_vars
+	};
+	struct DwLine { u32 offset; u32 line; i32 file_id; };
+	// A local/param: name @ [RBP + rbp_off], of Odin type `type` (resolved to a
+	// DWARF type index at finalize). (SysV addresses MEMORY-class params in place, so
+	// there are no by-pointer slots to special-case, unlike Win64/CodeView.)
+	struct DwVar { String name; i32 rbp_off; Type *type; bool is_param; };
+	Array<DwFunc> dw_funcs;
+	Array<DwLine> dw_lines;
+	Array<DwVar>  dw_vars;
+	// Interned DWARF type descriptors → assigned .debug_info offset at finalize. kind:
+	//   0 base type   — encoding + size + name
+	//   1 pointer     — inner = pointee type index (0 = void*)
+	//   2 generic word— unsigned u8[8] fallback for un-modelled aggregates
+	//   3 struct      — name + size, members [mem_lo, mem_hi) in dw_members
+	//   4 array       — inner = element type index, size = element count
+	struct DwType { u8 kind; u8 encoding; u32 size; u32 inner; String name; i32 mem_lo, mem_hi; };
+	struct DwMember { String name; u32 type; u32 offset; };
+	Array<DwType>       dw_types;
+	Array<DwMember>     dw_members;
+	PtrMap<Type *, u32> dw_type_cache; // Odin Type* → index into dw_types (+1; 0 = none)
+
 	// CodeView type records: Type* → CV type index (>= 0x1000); builtins < 0x1000.
 	PtrMap<Type *, u32> cv_types;
 	u32 cv_next_type;
@@ -220,6 +259,53 @@ gb_internal gb_inline void x64_var_set(x64VarMap *vm, Entity *e, i32 off) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// x64RegCache: local register cache. Register-width NAMED locals are mirrored
+// in callee-saved registers so repeated reads (and reads after a write-through
+// store) hit a register instead of the stack slot. Memory stays authoritative —
+// every write also stores to the slot — so debug info and aliasing stay
+// correct. See x64_backend_regcache.cpp for the coherence rules.
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum { X64_RC_GP = 5 }; // RBX, R12..R15 (callee-saved GP the rest of the backend never scratches)
+
+struct x64RegSlot {
+	i32   off;      // RBP offset of the named local held here (0 = empty; RBP+0 is never a local)
+	Type *type;     // the local's type (drives load/store width)
+	u32   age;      // LRU clock stamp
+	bool  survives; // local's address is provably never taken → entry survives calls
+};
+
+// Arena-backed Entity* set (same rationale as x64VarMap: N is small, arena beats heap).
+struct x64EntSet {
+	Entity     **keys;
+	i32          count;
+	i32          cap;
+	gbAllocator  alloc;
+};
+
+struct x64RegCache {
+	x64RegSlot gp[X64_RC_GP];   // parallels x64_rc_gp[] (RBX,R12..R15)
+	u8   pins[X64_RC_GP];       // in-flight operand holds: a pinned reg is never re-filled/evicted,
+	                            // even after its ENTRY is invalidated (the x64Value still references
+	                            // the register). Counted: `x + x` pins the same slot twice.
+	i32  save_off[X64_RC_GP];   // RBP offset of each reg's spill slot (0 = not yet allocated)
+	u32  clock;                 // LRU tick
+	u32  merge_stamp;           // asm merge_epoch at which gp[] was last coherent (lazy flush)
+	u32  call_stamp;            // asm call_epoch  at which non-surviving entries were last coherent
+	u32  seq_stamp;             // proc named_seq: a new named local may REUSE a dropped local's
+	                            // frame offset (block-scope slot reclaim) with different escape
+	                            // status — drop everything when it changes
+	i32  pend_off;              // one-shot write-through handshake, see x64_rc_note_store/x64_rc_write
+	bool pend_survives;
+	u8   used_gp;               // bitmask of gp[] ever populated (drives prologue save/restore + unwind)
+	bool enabled;               // per-proc master switch
+	bool scan_ok;               // escape prescan ran and understood the whole body (gates `survives`)
+	x64EntSet escaped;          // locals whose address may be materialized (from the prescan)
+};
+
+#define X64_MAX_INLINE_DEPTH 8 // manual #force_inline nesting cap (x64_try_inline_call + escape prescan)
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Procedure: per-procedure compilation state
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -290,6 +376,12 @@ struct x64Procedure {
 	// Total incoming ABI parameter slots (ret_ptr + explicit + partial-rets + context).
 	i32  total_param_slots;
 
+	// SysV only: RBP-relative home of each incoming ABI slot, filled by
+	// x64_abi_home_params (register slots get callee-allocated frame locals — SysV has
+	// no caller-provided shadow space; stack slots point at the incoming stack arg).
+	// Win64 leaves this null and uses the fixed RBP+16+slot*8 formula.
+	i32 *abi_slot_home;
+
 	// Split returns (mirrors LLVM): for an N-result proc the first N-1 results are
 	// returned through hidden pointer args placed AFTER the explicit params and
 	// BEFORE the context. These record where they sit and how many there are.
@@ -297,7 +389,7 @@ struct x64Procedure {
 	i32  num_partial_rets;       // N-1 for N>1 results, else 0
 
 	// entity → RBP-relative offset
-	// Params: positive offsets (param slot N lives at RBP + 16 + N*8)
+	// Params: positive offsets (slot homes assigned by x64_abi_home_params)
 	// Locals: negative offsets (alloc'd with x64_alloc_local)
 	x64VarMap var_offsets;
 
@@ -379,6 +471,14 @@ struct x64Procedure {
 	};
 	Array<InlineSiteRec> inline_sites;
 	i32 cur_inline_site;
+
+	// Local register cache. Cached locals live in callee-saved regs, so any that get
+	// used are spilled once in the prologue and reloaded in every epilogue. The exact
+	// set isn't known until the body is built, so a fixed-size NOP region is reserved at
+	// each site and patched (with the real MOVs + UNWIND_CODE SAVE_NONVOLs) in proc_end.
+	x64RegCache  regcache;
+	isize        rc_save_region;      // code offset of the prologue spill region (-1 = none)
+	Array<isize> rc_restore_regions;  // code offsets of each epilogue reload region
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -411,10 +511,25 @@ gb_internal String     x64_get_entity_name(Entity *e);
 
 // Procedure helpers
 gb_internal i32        x64_alloc_local    (x64Procedure *p, i64 size, i64 align);
-gb_internal i32        x64_param_rbp_off  (int slot); // → RBP + 16 + slot*8
 gb_internal x64Addr    x64_entity_addr    (x64Procedure *p, Entity *e);
 gb_internal void       x64_store_value    (x64Procedure *p, x64Addr dst, x64Value src);
 gb_internal x64Value   x64_load_addr      (x64Procedure *p, x64Addr addr);
+
+// Local register cache — see x64_backend_regcache.cpp
+gb_internal void       x64_rc_init            (x64Procedure *p);
+gb_internal void       x64_rc_escape_prescan  (x64Procedure *p, Ast *body);      // fills regcache.escaped/scan_ok
+gb_internal void       x64_rc_note_store      (x64Procedure *p, X64Mem dst, Type *t); // called from x64_store_value
+gb_internal void       x64_rc_note_clobber    (x64Procedure *p, X64Mem dst, i64 size); // bulk writers (zero_mem/copy_fixed)
+gb_internal void       x64_rc_write           (x64Procedure *p, X64Mem dst, Type *t, X64Reg src); // write-through refill
+gb_internal x64Value   x64_rc_read            (x64Procedure *p, Entity *e, i32 off, Type *t);
+gb_internal x64Value   x64_rc_operand         (x64Procedure *p, Entity *e, i32 off, Type *t); // read + pin
+gb_internal void       x64_rc_unpin_value     (x64Procedure *p, x64Value v);
+gb_internal bool       x64_rc_value_pinned    (x64Procedure *p, x64Value v);
+gb_internal void       x64_rc_emit_saves      (x64Procedure *p);       // reserve prologue spill region
+gb_internal void       x64_rc_reserve_restore (x64Procedure *p);       // reserve one epilogue reload region
+gb_internal void       x64_rc_ensure_save_slots(x64Procedure *p);      // assign frame slots to used regs
+gb_internal void       x64_rc_patch           (x64Procedure *p);       // fill the reserved regions
+gb_internal int        x64_rc_used_count      (x64RegCache *rc);       // # cache regs actually used
 // Conversion (mirrors lb_emit_conv): the single authority for value→type conversion. Every
 // store/return/arg site routes through here so a conversion always actually converts.
 gb_internal x64Value   x64_emit_conv      (x64Procedure *p, x64Value src, Type *from, Type *to);
@@ -449,9 +564,26 @@ gb_internal void      x64_cv_pad4(CoffSection *s); // CodeView .debug$S padding
 // CodeView .debug$T type index for a type (emits LF_* records as needed).
 gb_internal u32       x64_cv_type(x64Module *m, Type *t);
 
-// Does this proc type return its result via a hidden pointer? (Proc.return_by_pointer
-// is never set for the x64 path; compute it ourselves.)
+// ── Calling-convention layer (x64_abi.cpp) ──────────────────────────────────
+// ALL knowledge of where args/returns/params physically live. Win64 and SysV
+// (darwin/linux) implementations behind the same seam, selected by x64_abi_win64.
+// Defined here (not x64_abi.cpp) so files compiled earlier in the unity build
+// (x64_backend_type.cpp's TLS check) can read it. Set by x64_abi_init_target.
+gb_internal bool x64_abi_win64 = true;
+gb_internal bool      x64_arg_is_float(Type *t);
+gb_internal bool      x64_arg_is_indirect(Type *t);          // arg SLOT holds a pointer (Win64 only)
+gb_internal bool      x64_arg_stabilize_by_ref(Type *t);     // stabilize keeps address, not a copy
+gb_internal bool      x64_single_value_by_pointer(Type *rt); // sret rule for one value
 gb_internal bool      x64_returns_by_pointer(Type *proc_type);
+gb_internal int       x64_num_partial_returns(Type *proc_type);
+gb_internal Type     *x64_last_result_type(Type *proc_type);
+gb_internal i32       x64_param_home_off(x64Procedure *p, int slot); // incoming slot's RBP home
+gb_internal void      x64_abi_home_params(x64Procedure *p);          // slot assignment + homing
+gb_internal void      x64_abi_emit_call_args(x64Procedure *p, x64Value *args, int arg_count, bool c_vararg);
+gb_internal x64Value  x64_abi_direct_result(x64Procedure *p, Type *callee_type_raw); // value left in return reg(s); SysV pairs spilled to a local
+gb_internal void      x64_abi_emit_return_value(x64Procedure *p, x64Value v, Type *rt);
+gb_internal void      x64_abi_emit_return_from_local(x64Procedure *p, Type *rt, i32 off);
+gb_internal void      x64_abi_spill_direct_result(x64Procedure *p, Type *rt, i32 dst_off);
 
 // Loop/switch break+continue target lookup (defined in stmt.cpp, used by
 // OrBranchExpr in expr.cpp which is compiled earlier in the unity build).

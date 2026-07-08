@@ -1,13 +1,5 @@
 // x64 debug backend — procedure prologue / epilogue / call helpers.
-
-static const X64Reg    X64_INT_ARG_REGS[4] = { X64Reg_RCX, X64Reg_RDX, X64Reg_R8, X64Reg_R9 };
-static const X64XmmReg X64_XMM_ARG_REGS[4] = { X64XmmReg_XMM0, X64XmmReg_XMM1, X64XmmReg_XMM2, X64XmmReg_XMM3 };
-
-// Indirect-ABI params at or below this size are copied into a frame-local on entry;
-// larger ones are accessed through the incoming pointer (no copy) to avoid huge stack copies.
-#define X64_INDIRECT_PARAM_COPY_MAX 4096
-
-gb_internal bool x64_arg_is_float(Type *t) { return x64_is_float(t); }
+// (Calling-convention decisions — slot homes, arg placement, return regs — live in x64_abi.cpp.)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CodeView line-number helpers
@@ -296,45 +288,6 @@ gb_internal u32 x64_cv_type(x64Module *m, Type *t) {
 	return full;
 }
 
-// Is a SINGLE value of type `rt` returned via a hidden pointer (vs RAX/XMM0)?
-// Win64 return ABI (mirrors LLVM lbArg_Indirect): register-sized scalar → RAX/XMM0;
-// aggregates → hidden pointer unless size is 1/2/4/8. Zero-sized returns nothing.
-gb_internal bool x64_single_value_by_pointer(Type *rt) {
-	if (rt == nullptr) return false;
-	i64 sz = type_size_of(rt);
-	if (sz == 0) return false;                      // direct empty aggregate
-	if (x64_is_scalar(rt) && sz <= 8) return false; // RAX / XMM0
-	return !(sz == 1 || sz == 2 || sz == 4 || sz == 8);
-}
-
-// Number of results returned via HIDDEN POINTER ARGS: the first N-1 of an N-result
-// tuple (mirrors LLVM split returns / lb_abi_modify_return_is_tuple). 0 for single/void.
-gb_internal int x64_num_partial_returns(Type *proc_type) {
-	Type *pt = base_type(proc_type);
-	if (pt == nullptr || pt->kind != Type_Proc) return 0;
-	if (pt->Proc.result_count > 1) return (int)pt->Proc.result_count - 1;
-	return 0;
-}
-
-// The "real" return value's type: the LAST result for a multi-result proc, the sole
-// result for single-result, or null for void (mirrors LLVM; the rest are pointer outputs).
-gb_internal Type *x64_last_result_type(Type *proc_type) {
-	Type *pt = base_type(proc_type);
-	if (pt == nullptr || pt->kind != Type_Proc) return nullptr;
-	if (pt->Proc.result_count == 0 || pt->Proc.results == nullptr) return nullptr;
-	auto &vars = pt->Proc.results->Tuple.variables;
-	return vars[vars.count-1]->type;
-}
-
-// For N>1 results only the LAST determines whether a hidden sret pointer (param slot 0)
-// is needed; the first N-1 use their own hidden pointer args (see x64_num_partial_returns).
-gb_internal bool x64_returns_by_pointer(Type *proc_type) {
-	Type *pt = base_type(proc_type);
-	if (pt == nullptr || pt->kind != Type_Proc) return false;
-	if (pt->Proc.result_count == 0 || pt->Proc.results == nullptr) return false;
-	return x64_single_value_by_pointer(x64_last_result_type(pt));
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Prologue
 // ─────────────────────────────────────────────────────────────────────────────
@@ -343,40 +296,6 @@ gb_internal void x64_proc_begin(x64Procedure *p) {
 	X64Assembler *a   = &p->asm_;
 	Type         *pt  = p->type;
 	GB_ASSERT(pt->kind == Type_Proc);
-
-	p->returns_by_pointer = x64_returns_by_pointer(pt);
-	p->has_context = (pt->Proc.calling_convention == ProcCC_Odin);
-
-	// Count ABI slots: [ret_ptr?] [explicit_params...] [partial_ret_ptrs...] [context?]
-	// (partial-return ptrs = first N-1 results of a multi-result proc; see x64_num_partial_returns.)
-	int slot = p->returns_by_pointer ? 1 : 0;
-	int first_explicit = slot;
-
-	if (pt->Proc.params != nullptr) {
-		TypeTuple *params = &pt->Proc.params->Tuple;
-		for_array(i, params->variables) {
-			Entity *e = params->variables[i];
-			if (e->kind != Entity_Variable) continue;
-			if (e->flags & EntityFlag_CVarArg) continue;
-			if (x64_type_size(e->type) == 0) continue; // zero-sized: no ABI slot
-			slot++;
-		}
-	}
-
-	p->num_partial_rets = x64_num_partial_returns(pt);
-	if (p->num_partial_rets > 0) {
-		p->first_partial_ret_slot = slot;
-		slot += p->num_partial_rets;
-	} else {
-		p->first_partial_ret_slot = -1;
-	}
-
-	if (p->has_context) {
-		p->context_slot = slot++;
-	} else {
-		p->context_slot = -1;
-	}
-	p->total_param_slots = slot;
 
 	// ── Prologue ────────────────────────────────────────────────────────
 	x64_emit_push_r(a, X64Reg_RBP);
@@ -392,100 +311,13 @@ gb_internal void x64_proc_begin(x64Procedure *p) {
 	p->sub_rsp_patch = (isize)(a->code.count - 4);         // imm32 sits at -4
 	for (int i = 0; i < 6; i++) x64_enc_b(a, 0x90u);       // NOP pad → 13-byte region
 
-	// ── Home register parameters into shadow slots ───────────────────────
-	int explicit_slot = first_explicit;
+	// Register-cache spill region (NOPs now; patched with the used regs' spills in proc_end).
+	// Placed after the frame allocation so the spill slots are within the reserved frame, and
+	// before param-homing (which touches only RAX / the arg regs, never a cache reg).
+	x64_rc_emit_saves(p);
 
-	if (p->returns_by_pointer && p->total_param_slots >= 1) {
-		// Slot 0: hidden return pointer in RCX
-		x64_emit_mov_mr(a, X64OpSize_64, x64_rbp_mem(x64_param_rbp_off(0)), X64Reg_RCX);
-	}
-
-	if (pt->Proc.params != nullptr) {
-		TypeTuple *params = &pt->Proc.params->Tuple;
-		for_array(i, params->variables) {
-			Entity *e = params->variables[i];
-			if (e->kind != Entity_Variable) continue;
-			if (e->flags & EntityFlag_CVarArg) continue;
-
-			// Zero-sized param (empty struct/[0]T): no data, no ABI slot. Map it to a
-			// non-dereferenced offset so references resolve (loads are no-ops).
-			if (x64_type_size(e->type) == 0) {
-				x64_var_set(&p->var_offsets, e, x64_alloc_local(p, 0, 1));
-				continue;
-			}
-
-			int s = explicit_slot++;
-			i32 off = x64_param_rbp_off(s);
-
-			if (s < 4) {
-				// register param — home into shadow slot
-				if (x64_arg_is_float(e->type)) {
-					if (x64_is_double(e->type)) x64_emit_movsd_mr(a, x64_rbp_mem(off), X64_XMM_ARG_REGS[s]);
-					else                         x64_emit_movss_mr(a, x64_rbp_mem(off), X64_XMM_ARG_REGS[s]);
-					x64_var_set(&p->var_offsets, e, off);
-				} else {
-					i64 esz = x64_type_size(e->type);
-					x64_emit_mov_mr(a, X64OpSize_64, x64_rbp_mem(off), X64_INT_ARG_REGS[s]);
-					if (x64_arg_is_indirect(e->type)) {
-						// Win64: indirect params arrive as a pointer (homed to [off]).
-						if (esz > X64_INDIRECT_PARAM_COPY_MAX) {
-							// Too big to copy onto the stack — keep the pointer slot and
-							// deref through it on access (mirrors LLVM byval-immutable).
-							x64_var_set(&p->var_offsets, e, off);
-							array_add(&p->indirect_params, e);
-						} else {
-							// Small: copy the data into a local so accesses work directly.
-							i64 eal = type_align_of(e->type);
-							i32 data_off = x64_alloc_local(p, esz, eal);
-							x64_emit_mov_rm(a, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(off));
-							x64_copy_fixed(p, x64_rbp_mem(data_off), x64_mem(X64Reg_RAX, 0), esz);
-							x64_var_set(&p->var_offsets, e, data_off);
-						}
-					} else {
-						x64_var_set(&p->var_offsets, e, off);
-					}
-				}
-			} else {
-				// Stack parameter (slot ≥4) lives at [RBP + off].
-				i64 esz = x64_type_size(e->type);
-				if (x64_arg_is_indirect(e->type)) {
-					// Win64: indirect aggregate passed by pointer — the stack slot
-					// holds the pointer.
-					if (esz > X64_INDIRECT_PARAM_COPY_MAX) {
-						// Too big to copy — deref through the pointer slot on access.
-						x64_var_set(&p->var_offsets, e, off);
-						array_add(&p->indirect_params, e);
-					} else {
-						// Small: deref + copy the data into a local.
-						i64 eal = type_align_of(e->type);
-						i32 data_off = x64_alloc_local(p, esz, eal);
-						x64_emit_mov_rm(a, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(off));
-						x64_copy_fixed(p, x64_rbp_mem(data_off), x64_mem(X64Reg_RAX, 0), esz);
-						x64_var_set(&p->var_offsets, e, data_off);
-					}
-				} else {
-					x64_var_set(&p->var_offsets, e, off);
-				}
-			}
-		}
-	}
-
-	// Home the partial-return pointers (split returns): each is just a pointer that,
-	// if it arrives in a register (slot < 4), must be spilled to its shadow slot so
-	// x64_emit_named_returns / ReturnStmt can load it to write the result back.
-	for (int k = 0; k < p->num_partial_rets; k++) {
-		int s = p->first_partial_ret_slot + k;
-		if (s < 4) {
-			x64_emit_mov_mr(a, X64OpSize_64, x64_rbp_mem(x64_param_rbp_off(s)), X64_INT_ARG_REGS[s]);
-		}
-	}
-
-	// Context pointer is in the last slot (if within reg range)
-	if (p->has_context && p->context_slot < 4) {
-		int s = p->context_slot;
-		x64_emit_mov_mr(a, X64OpSize_64, x64_rbp_mem(x64_param_rbp_off(s)),
-		                X64_INT_ARG_REGS[s]);
-	}
+	// ── Incoming parameters: ABI slot assignment + register homing ───────
+	x64_abi_home_params(p);
 
 	// Named returns: zero-init stack locals, written back in x64_emit_named_returns.
 	if (pt->Proc.results != nullptr) {
@@ -550,7 +382,7 @@ gb_internal void x64_emit_named_returns(x64Procedure *p) {
 			// Partial return: dst pointer is the hidden arg slot; copy the local to it.
 			if (loff == nullptr || sz == 0) continue;
 			int s = p->first_partial_ret_slot + i;
-			x64_emit_mov_rm(a, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_rbp_off(s)));
+			x64_emit_mov_rm(a, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_home_off(p, s)));
 			x64_copy_fixed(p, x64_mem(X64Reg_RAX, 0), x64_rbp_mem(*loff), sz);
 			continue;
 		}
@@ -558,13 +390,10 @@ gb_internal void x64_emit_named_returns(x64Procedure *p) {
 		// Last (real) result.
 		if (loff == nullptr || sz == 0) continue;
 		if (p->returns_by_pointer) {
-			x64_emit_mov_rm(a, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_rbp_off(0)));
+			x64_emit_mov_rm(a, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(x64_param_home_off(p, 0)));
 			x64_copy_fixed(p, x64_mem(X64Reg_RAX, 0), x64_rbp_mem(*loff), sz);
-		} else if (x64_is_float(e->type)) {
-			if (x64_is_double(e->type)) x64_emit_movsd_rm(a, X64XmmReg_XMM0, x64_rbp_mem(*loff));
-			else                         x64_emit_movss_rm(a, X64XmmReg_XMM0, x64_rbp_mem(*loff));
 		} else {
-			x64_value_to_reg(p, x64v_mem(e->type, x64_rbp_mem(*loff)), X64Reg_RAX);
+			x64_abi_emit_return_from_local(p, e->type, *loff);
 		}
 	}
 }
@@ -575,6 +404,9 @@ gb_internal void x64_emit_named_returns(x64Procedure *p) {
 
 gb_internal void x64_proc_emit_epilogue(x64Procedure *p) {
 	X64Assembler *a = &p->asm_;
+	// Register-cache reload region (NOPs now; patched to reload the spilled callee-saved regs in
+	// proc_end). Emitted before the teardown so the reloads still read the live frame slots.
+	x64_rc_reserve_restore(p);
 	x64_emit_mov_rr(a, X64OpSize_64, X64Reg_RSP, X64Reg_RBP);
 	x64_emit_pop_r(a, X64Reg_RBP);
 }
@@ -745,12 +577,18 @@ gb_internal void x64_proc_end(x64Procedure *p) {
 
 	x64_emit_ret(a);
 
-	// frame = locals + shadow space (32) + outgoing stack args, 16-byte aligned. The outgoing
-	// area is the peak over all calls (max_outgoing_bytes), floored at 64 so the alloca path's
-	// fixed rsp+96 (shadow 32 + 64) assumption holds.
-	i32 outgoing = gb_max(p->max_outgoing_bytes, 64);
-	i32 frame = ((p->frame_max + 32 + outgoing + 15) & ~15);
-	if (frame < 0x1000) {
+	// Give each used cache register a frame spill slot (grows frame_max) BEFORE sizing the frame.
+	x64_rc_ensure_save_slots(p);
+
+	// frame = locals + shadow space (Win64 only) + outgoing stack args, 16-byte aligned.
+	// The outgoing area is the peak over all calls (max_outgoing_bytes), floored so the
+	// alloca path's fixed rsp + (shadow + min-outgoing) assumption holds.
+	i32 shadow   = x64_abi_win64 ? X64_ABI_SHADOW_SPACE : 0;
+	i32 outgoing = gb_max(p->max_outgoing_bytes, X64_ABI_MIN_OUTGOING);
+	i32 frame = ((p->frame_max + shadow + outgoing + 15) & ~15);
+	if (frame < 0x1000 || !x64_abi_win64) {
+		// SysV (darwin/linux): no guard-page-commit protocol — the OS grows the stack on
+		// any fault within the mapping, so a plain SUB RSP is always correct (no __chkstk).
 		// Under one page: plain SUB RSP is safe (a deep push still hits & commits
 		// the guard page). NOP pad follows.
 		x64_enc_patch_d(a, p->sub_rsp_patch, frame);
@@ -771,6 +609,9 @@ gb_internal void x64_proc_end(x64Procedure *p) {
 		array_add(&a->relocs, r);
 	}
 
+	// Fill the reserved prologue/epilogue regions with the spill/reload MOVs for the used regs.
+	x64_rc_patch(p);
+
 	x64Module *m       = p->module;
 	u32        base_off = (u32)coff_section_len(m->text);
 
@@ -784,19 +625,92 @@ gb_internal void x64_proc_end(x64Procedure *p) {
 	coff_section_write(m->text, a->code.data, a->code.count);
 	coff_apply_x64_relocs(m->text, a, &m->coff, base_off);
 
+	// darwin -debug: bank this proc's line table for the module's DWARF (__debug_line
+	// via x64_dwarf_finalize). p->lines lives in the per-proc arena — copy now.
+	// Static (synth) procs are skipped: no meaningful source lines, and their local
+	// symbols aren't unique across modules.
+	if (!x64_abi_win64 && m->debug_s != nullptr && p->lines.count > 0 && !p->is_static) {
+		x64Module::DwFunc f = {};
+		f.link_name = p->link_name;
+		f.code_size = (u32)a->code.count;
+		f.decl_line = (p->entity != nullptr) ? p->entity->token.pos.line : (i32)p->lines[0].line;
+		f.line_lo   = (i32)m->dw_lines.count;
+		for_array(li, p->lines) {
+			x64Module::DwLine dl = {};
+			dl.offset  = p->lines[li].offset;
+			dl.line    = p->lines[li].line;
+			dl.file_id = p->lines[li].file_id;
+			array_add(&m->dw_lines, dl);
+		}
+		f.line_hi = (i32)m->dw_lines.count;
+
+		// Bank named locals/params as DWARF variables. Type* and token strings are
+		// checker-owned (persistent); resolved to DWARF types at finalize. Skip
+		// inline-site locals (var_offsets includes them but they belong to their
+		// own inlined scope; the flat top-level list would misattribute them).
+		f.var_lo = (i32)m->dw_vars.count;
+		for (i32 vi = 0; vi < p->var_offsets.count; vi++) {
+			Entity *ve = p->var_offsets.keys[vi];
+			if (ve == nullptr) continue;
+			String vn = ve->token.string;
+			if (vn.len == 0) continue; // unnamed results: skip (kept simple for now)
+
+			bool is_inlined = false;
+			for (isize s = 0; s < p->inline_sites.count && !is_inlined; s++) {
+				for (isize li = 0; li < p->inline_sites[s].locals.count; li++) {
+					if (p->inline_sites[s].locals[li].entity == ve) { is_inlined = true; break; }
+				}
+			}
+			if (is_inlined) continue;
+
+			x64Module::DwVar dv = {};
+			dv.name    = vn;
+			dv.rbp_off = p->var_offsets.vals[vi];
+			dv.type    = ve->type;
+			// SysV spills register params to negative (callee-allocated) homes just like
+			// locals, so the offset sign can't distinguish them — use the checker flag.
+			dv.is_param = (ve->flags & EntityFlag_Param) != 0;
+			array_add(&m->dw_vars, dv);
+		}
+		f.var_hi = (i32)m->dw_vars.count;
+
+		array_add(&m->dw_funcs, f);
+	}
+
 	// ── Win64 unwind info (.xdata UNWIND_INFO + .pdata RUNTIME_FUNCTION) ──────
 	// Required for the debugger/OS to walk the stack past the current frame.
-	// Prologue is fixed: push rbp(1) ; mov rbp,rsp(3) ; sub rsp,imm32(7).
+	// Prologue: push rbp(1) ; mov rbp,rsp(3) ; sub rsp,imm32(7) [@11] ; NOP pad ;
+	// register-cache spills (7 bytes each, after the frame alloc).
 	if (m->xdata && m->pdata) {
 		u32 proc_sz   = (u32)a->code.count;
 		u32 xdata_off = (u32)coff_section_len(m->xdata);
 
+		x64RegCache *rc  = &p->regcache;
+		int  used        = x64_rc_used_count(rc);
 		bool alloc_small = (frame <= 128);
+		int  base_slots  = alloc_small ? 3 : 4;       // ALLOC(1|2) + SET_FPREG(1) + PUSH rbp(1)
+		int  total_slots = base_slots + 2*used;       // SAVE_NONVOL = 2 slots each
+		// SizeOfProlog extends to just past the last spill MOV (0 spills → the fixed 11).
+		u8   size_prolog = (used > 0) ? (u8)(p->rc_save_region + used*X64_RC_MOV_LEN) : (u8)11;
+
 		coff_section_write_u8(m->xdata, 0x01);                  // Version=1, Flags=0
-		coff_section_write_u8(m->xdata, 11);                    // SizeOfProlog
-		coff_section_write_u8(m->xdata, alloc_small ? 3u : 4u); // CountOfCodes
+		coff_section_write_u8(m->xdata, size_prolog);           // SizeOfProlog
+		coff_section_write_u8(m->xdata, (u8)total_slots);       // CountOfCodes
 		coff_section_write_u8(m->xdata, 0x05);                  // FrameReg=RBP(5), FrameOff=0
-		// Unwind codes, descending prolog offset:
+		// Unwind codes in DESCENDING prolog offset. The spills sit after the frame allocation, so
+		// they have the highest offsets and come first. Each SAVE_NONVOL is 2 slots:
+		// {offsetInProlog, (regNum<<4)|UWOP_SAVE_NONVOL(4)} then {frameSlotOffset/8}. The offset is
+		// from the post-prologue RSP (frame base): slot at RBP+save_off → RSP-relative frame+save_off.
+		for (int k = used - 1; k >= 0; k--) {
+			int idx = -1, seen = 0;
+			for (int i = 0; i < X64_RC_GP; i++) { if (rc->used_gp & (1u<<i)) { if (seen == k) { idx = i; break; } seen++; } }
+			u8  code_off = (u8)(p->rc_save_region + (k+1)*X64_RC_MOV_LEN);
+			u8  reg_num  = (u8)x64_rc_gp[idx];
+			u16 slot_sc  = (u16)((frame + rc->save_off[idx]) / 8); // save_off is negative
+			coff_section_write_u8 (m->xdata, code_off);
+			coff_section_write_u8 (m->xdata, (u8)((reg_num << 4) | 4u));
+			coff_section_write_u16(m->xdata, slot_sc);
+		}
 		if (alloc_small) {
 			coff_section_write_u8(m->xdata, 11);                              // ALLOC_SMALL @11
 			coff_section_write_u8(m->xdata, (u8)((((frame/8) - 1) << 4) | 2));
@@ -807,7 +721,7 @@ gb_internal void x64_proc_end(x64Procedure *p) {
 		}
 		coff_section_write_u8(m->xdata, 4);    coff_section_write_u8(m->xdata, 0x03); // SET_FPREG @4
 		coff_section_write_u8(m->xdata, 1);    coff_section_write_u8(m->xdata, 0x50); // PUSH_NONVOL RBP @1
-		if (alloc_small) coff_section_write_u16(m->xdata, 0); // pad to even slot count
+		if ((total_slots & 1) != 0) coff_section_write_u16(m->xdata, 0); // pad to even slot count
 
 		// RUNTIME_FUNCTION: {BeginAddress, EndAddress, UnwindInfoAddress} (RVAs).
 		u32 poff = (u32)coff_section_len(m->pdata);
@@ -1021,59 +935,12 @@ gb_internal x64Value x64_emit_call(x64Procedure *p,
                                     x64Value     *args,
                                     int           arg_count)
 {
-	X64Assembler *a  = &p->asm_;
-	Type         *ct = base_type(callee_type_raw);
+	Type *ct = base_type(callee_type_raw);
 	GB_ASSERT(ct->kind == Type_Proc);
 
-	// Reserve enough outgoing stack-arg space for THIS call (args beyond the 4 register slots);
-	// x64_proc_end sizes the frame's outgoing area from this peak.
-	if (arg_count > 4) {
-		i32 ob = (arg_count - 4) * 8;
-		if (ob > p->max_outgoing_bytes) p->max_outgoing_bytes = ob;
-	}
-
-	// Stack args (slots 4+), reverse order
-	for (int i = gb_max(arg_count - 1, 3); i >= 4; i--) {
-		x64Value v = args[i];
-		X64Mem stack_slot = x64_mem(X64Reg_RSP, 32 + (i - 4) * 8);
-		if (x64_arg_is_float(v.type)) {
-			x64_value_to_xmm(p, v, X64XmmReg_XMM0);
-			if (x64_is_double(v.type)) x64_emit_movsd_mr(a, stack_slot, X64XmmReg_XMM0);
-			else                        x64_emit_movss_mr(a, stack_slot, X64XmmReg_XMM0);
-		} else {
-			x64_value_to_reg(p, v, X64Reg_RAX);
-			x64_emit_mov_mr(a, X64OpSize_64, stack_slot, X64Reg_RAX);
-		}
-	}
-
-	// Register args (slots 0-3), reverse order to avoid clobbering: fill R9/XMM3 first.
-	// Win64 variadic ABI: an FP arg in a register slot of a c_vararg callee must ALSO be
-	// placed in the corresponding GP register (the callee reads `...` args from GP).
-	bool variadic_abi = ct->Proc.c_vararg;
-	int reg_count = gb_min(arg_count, 4);
-	for (int i = reg_count - 1; i >= 0; i--) {
-		x64Value v = args[i];
-		if (x64_arg_is_float(v.type)) {
-			x64_value_to_xmm(p, v, X64_XMM_ARG_REGS[i]);
-			if (variadic_abi) x64_value_to_reg(p, v, X64_INT_ARG_REGS[i]); // duplicate FP bits into GP
-		} else {
-			x64_value_to_reg(p, v, X64_INT_ARG_REGS[i]);
-		}
-	}
-
-	x64_emit_call_sym(a, callee_name);
-
-	Type *ret_type = nullptr;
-	if (ct->Proc.results != nullptr && ct->Proc.result_count == 1) {
-		ret_type = ct->Proc.results->Tuple.variables[0]->type;
-	}
-	if (x64_returns_by_pointer(callee_type_raw) || ct->Proc.result_count != 1) {
-		return x64v_none();
-	}
-	if (ret_type && type_size_of(ret_type) == 0) return x64v_none(); // zero-sized: no value
-	if (ret_type && x64_is_float(ret_type)) return x64v_xmm(ret_type, X64XmmReg_XMM0);
-	if (ret_type) return x64v_reg(ret_type, X64Reg_RAX);
-	return x64v_none();
+	x64_abi_emit_call_args(p, args, arg_count, ct->Proc.c_vararg);
+	x64_emit_call_sym(&p->asm_, callee_name);
+	return x64_abi_direct_result(p, callee_type_raw);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
