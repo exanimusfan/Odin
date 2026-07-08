@@ -306,6 +306,25 @@ static void x64_dw_push_member(x64Module *m, Array<x64Module::DwMember> *out,
 	array_add(out, mem);
 }
 
+// Flatten `using`-promoted members of a struct-like `ut` into `out` at absolute offsets relative to
+// `base_off`, recursing for chained `using`. Mirrors x64_cv_add_using_members (CodeView): the darwin
+// DWARF then resolves both `outer.promoted` and `outer.named.promoted`, matching Odin's source-level
+// promotion. Value `using` of a struct only — `using p: ^T` promotes through a pointer (base_type is
+// not a Struct → returns), so only the named pointer member is emitted (its `.p.field` still works).
+static void x64_dw_add_using_members(x64Module *m, Array<x64Module::DwMember> *out,
+                                     Type *ut, i64 base_off, int depth) {
+	Type *b = base_type(ut);
+	if (b == nullptr || b->kind != Type_Struct || b->Struct.is_raw_union) return;
+	type_set_offsets(b);
+	for_array(i, b->Struct.fields) {
+		Entity *sf = b->Struct.fields[i];
+		if (sf->token.string.len == 0) continue; // anonymous promoted field: no name to reference
+		i64 off = base_off + type_offset_of(b, i);
+		x64_dw_push_member(m, out, sf->token.string, sf->type, off, depth);
+		if (sf->flags & EntityFlag_Using) x64_dw_add_using_members(m, out, sf->type, off, depth);
+	}
+}
+
 // Intern a DWARF type for Odin type `t`, returning a 1-based index into m->dw_types
 // (0 = void/unknown → no DW_AT_type). Scalars → precise base types; pointers →
 // pointer-to (pointee only when it's a base scalar, else void* — this also breaks
@@ -379,6 +398,9 @@ gb_internal u32 x64_dw_type_d(x64Module *m, Type *t, int depth) {
 			String fn = fe->token.string;
 			if (fn.len == 0) { char b[24]; gb_snprintf(b, gb_size_of(b), "_%d", (int)fi); fn = x64_dw_str(m, b); }
 			x64_dw_push_member(m, &mine, fn, fe->type, type_offset_of(bt, fi), depth + 1);
+			// `using` promotion: also flatten the field's members onto the parent so `outer.name`
+			// resolves alongside `outer.base.name` (mirrors the CodeView path; overlaps by offset).
+			if (fe->flags & EntityFlag_Using) x64_dw_add_using_members(m, &mine, fe->type, type_offset_of(bt, fi), depth + 1);
 		}
 		i32 lo = (i32)m->dw_members.count;
 		for_array(k, mine) array_add(&m->dw_members, mine[k]);
