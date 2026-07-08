@@ -2112,46 +2112,70 @@ gb_internal WORKER_TASK_PROC(x64_compile_module_worker) {
 	return 0;
 }
 
-// Finalize CodeView and serialize+write one module's COFF to disk. Thread-pool task —
-// each module is an independent file; byte buffer from the module's own arena (no CRT
-// heap lock). Results in m->obj_path/obj_failed, collected sequentially after the barrier.
-gb_internal WORKER_TASK_PROC(x64_write_module_worker) {
-	x64Module *m = cast(x64Module *)data;
-	m->obj_path   = {};
-	m->obj_failed = false;
+// A module with no linkable content: empty text/data/bss AND empty .rdata (a package referenced
+// only for its read-only globals still has a non-empty .rdata, so all four must be empty).
+gb_internal bool x64_module_is_empty(x64Module *m) {
+	return coff_section_len(m->text)  == 0 &&
+	       coff_section_len(m->rdata) == 0 &&
+	       coff_section_len(m->data)  == 0 &&
+	       coff_section_len(m->bss)   == 0;
+}
 
-	// Write any module with real content. .rdata matters: a package referenced only for its
-	// read-only globals has empty text/data/bss but a non-empty .rdata — skipping it would
-	// leave those globals undefined.
-	if (coff_section_len(m->text)  == 0 &&
-	    coff_section_len(m->rdata) == 0 &&
-	    coff_section_len(m->data)  == 0 &&
-	    coff_section_len(m->bss)   == 0) {
-		return 0; // empty module — nothing to emit
+// Output path for a module's object file. Mirrors lb_filepath_obj_for_module: executable builds
+// isolate their objects in a temp directory with a per-module-unique suffix, so an exe build and a
+// dll build sharing the output directory (and their common package short-names — runtime/core/src)
+// cannot stomp each other's objects. Non-executable builds keep deterministic {out_name}-{pkg}
+// names in the output directory. Must run on the MAIN thread: temp-dir creation isn't thread-safe.
+gb_internal String x64_filepath_obj_for_module(x64Module *m) {
+	String basename = build_context.build_paths[BuildPath_Output].basename;
+	String name     = build_context.build_paths[BuildPath_Output].name;
+
+	bool use_temporary_directory = false;
+	if (build_context.build_mode == BuildMode_Executable) {
+		String dir = temporary_directory(permanent_allocator());
+		if (dir.len != 0) {
+			basename = dir;
+			use_temporary_directory = true;
+		}
 	}
-
-	x64_module_finalize_debug(m);
-	if (!x64_abi_win64) x64_dwarf_finalize(m); // no-op unless -debug banked line tables
 
 	// darwin targets get Mach-O .o (linkable by ld64/clang); everything else COFF .obj.
 	bool is_macho = build_context.metrics.os == TargetOs_darwin;
 
-	String   output_base = build_context.build_paths[BuildPath_Output].basename;
-	gbString path_s = gb_string_make_length(temporary_allocator(), output_base.text, output_base.len);
-	path_s = gb_string_appendc(path_s, "/");
-	path_s = gb_string_append_length(path_s, m->pkg->name.text, m->pkg->name.len);
-	if (m->file != nullptr) {
-		path_s = gb_string_append_fmt(path_s, "_%d", (int)m->file->id); // unique per file
+	gbString path = gb_string_make_length(permanent_allocator(), basename.text, basename.len);
+	path = gb_string_appendc(path, "/");
+	path = gb_string_append_length(path, name.text, name.len); // output name disambiguates builds
+	if (m->pkg != nullptr) {
+		path = gb_string_appendc(path, "-");
+		path = gb_string_append_length(path, m->pkg->name.text, m->pkg->name.len);
 	}
-	path_s = gb_string_appendc(path_s, is_macho ? "_x64.o" : "_x64.obj");
-	String filepath = make_string(cast(u8 const *)path_s, gb_string_length(path_s));
+	if (m->file != nullptr) {
+		path = gb_string_append_fmt(path, "_%d", (int)m->file->id); // unique per file (runtime split)
+	}
+	if (use_temporary_directory) {
+		path = gb_string_append_fmt(path, "-%p", m); // ensure uniqueness within the shared temp dir
+	}
+	path = gb_string_appendc(path, is_macho ? "_x64.o" : "_x64.obj");
+	return make_string(cast(u8 const *)path, gb_string_length(path));
+}
 
-	bool emitted = is_macho ? macho_writer_emit(&m->coff, filepath)
-	                        : coff_writer_emit(&m->coff, filepath);
+// Finalize CodeView and serialize+write one module's COFF to disk. Thread-pool task — each module
+// is an independent file; byte buffer from the module's own arena (no CRT heap lock). m->obj_path
+// is precomputed on the main thread (empty ⇒ skip); the worker clears it + sets m->obj_failed on a
+// write failure. Collected sequentially after the barrier.
+gb_internal WORKER_TASK_PROC(x64_write_module_worker) {
+	x64Module *m = cast(x64Module *)data;
+	if (m->obj_path.len == 0) return 0; // empty module — nothing to emit
+
+	x64_module_finalize_debug(m);
+	if (!x64_abi_win64) x64_dwarf_finalize(m); // no-op unless -debug banked line tables
+
+	bool is_macho = build_context.metrics.os == TargetOs_darwin;
+	bool emitted = is_macho ? macho_writer_emit(&m->coff, m->obj_path)
+	                        : coff_writer_emit(&m->coff, m->obj_path);
 	if (!emitted) {
 		m->obj_failed = true;
-	} else {
-		m->obj_path = copy_string(permanent_allocator(), filepath);
+		m->obj_path   = {};
 	}
 	// No coff_writer_free: all COFF data is in the module arena (reclaimed at exit). Freeing
 	// would string_map_destroy the heap-backed sym_map — a CRT-heap free under the global lock
@@ -2425,8 +2449,16 @@ gb_internal x64Generator *x64_generate_code(Checker *c) {
 		}
 	}
 
-	// Serialize + write one COFF object per module in parallel (independent files).
+	// Serialize + write one COFF object per module in parallel (independent files). Object paths are
+	// resolved here on the main thread first (temp-dir creation isn't thread-safe); empty modules
+	// get no path and are skipped by the worker.
 	{
+		for (auto const &entry : gen->modules) {
+			x64Module *m = entry.value;
+			m->obj_failed = false;
+			if (x64_module_is_empty(m)) m->obj_path = {};
+			else                        m->obj_path = x64_filepath_obj_for_module(m);
+		}
 		bool threaded = global_thread_pool.threads.count > 1;
 		for (auto const &entry : gen->modules) {
 			if (threaded) thread_pool_add_task(x64_write_module_worker, entry.value);

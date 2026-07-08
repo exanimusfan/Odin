@@ -2528,7 +2528,7 @@ gb_internal void export_linked_libraries(LinkerData *gen) {
 	}
 }
 
-gb_internal void remove_temp_files(lbGenerator *gen) {
+gb_internal void remove_temp_files(LinkerData *gen) {
 	if (build_context.keep_temp_files) return;
 
 	switch (build_context.build_mode) {
@@ -4298,6 +4298,10 @@ int main(int arg_count, char const **arg_ptr) {
 					}
 					return result;
 				}
+				// Link succeeded: delete the intermediate object files (mirrors the LLVM path's
+				// remove_temp_files). Without this the x64 backend leaves {out}-{pkg}_x64.obj litter
+				// in the output dir, which then collides across exe/dll builds sharing that dir.
+				remove_temp_files(x64gen);
 			} break;
 			}
 			goto end_of_code_gen;
