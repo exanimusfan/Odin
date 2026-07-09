@@ -133,10 +133,13 @@ struct x64Module {
 	//   2 generic word— unsigned u8[8] fallback for un-modelled aggregates
 	//   3 struct      — name + size, members [mem_lo, mem_hi) in dw_members
 	//   4 array       — inner = element type index, size = element count
+	//   5 enum        — name + size, inner = underlying int type, enumerators [mem_lo, mem_hi) in dw_enums
 	struct DwType { u8 kind; u8 encoding; u32 size; u32 inner; String name; i32 mem_lo, mem_hi; };
 	struct DwMember { String name; u32 type; u32 offset; };
+	struct DwEnum { String name; i64 value; }; // one enumerator (value may be negative / 64-bit)
 	Array<DwType>       dw_types;
 	Array<DwMember>     dw_members;
+	Array<DwEnum>       dw_enums;
 	PtrMap<Type *, u32> dw_type_cache; // Odin Type* → index into dw_types (+1; 0 = none)
 
 	// CodeView type records: Type* → CV type index (>= 0x1000); builtins < 0x1000.

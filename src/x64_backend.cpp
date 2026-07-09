@@ -144,6 +144,7 @@ gb_internal x64Module *x64_module_create(x64Generator *gen, AstPackage *pkg, Ast
 	array_init(&m->dw_vars,    a, 0, 128);
 	array_init(&m->dw_types,   a, 0, 32);
 	array_init(&m->dw_members, a, 0, 64);
+	array_init(&m->dw_enums,   a, 0, 32);
 	map_init(&m->dw_type_cache, 32);
 
 	array_init(&m->cv_strtab,     a, 0, 64);
@@ -370,9 +371,24 @@ gb_internal u32 x64_dw_type_d(x64Module *m, Type *t, int depth) {
 	}
 
 	Type *bt = base_type(t);
-	// Enum → its backing integer as a base type (right width, no enumerator names).
+	// Enum → DW_TAG_enumeration_type with a DW_TAG_enumerator (name + value) per member, so lldb/gdb
+	// show the enumerator NAME; DW_AT_type still carries the underlying int for the right width.
 	if (bt != nullptr && bt->kind == Type_Enum) {
-		return x64_dw_type_d(m, bt->Enum.base_type, depth);
+		u32 uty = x64_dw_type_d(m, bt->Enum.base_type, depth); // underlying int (interns first)
+		u32 idx = x64_dw_reserve(m, t);
+		i32 lo = (i32)m->dw_enums.count;
+		for_array(fi, bt->Enum.fields) {
+			Entity *f = bt->Enum.fields[fi];
+			if (f == nullptr || f->kind != Entity_Constant) continue;
+			x64Module::DwEnum en;
+			en.name  = f->token.string;
+			en.value = exact_value_to_i64(f->Constant.value);
+			array_add(&m->dw_enums, en);
+		}
+		x64Module::DwType *d = &m->dw_types[idx - 1]; // re-fetch: dw_types may have grown via uty
+		d->kind = 5; d->size = (u32)type_size_of(bt); d->name = x64_dw_type_name(m, t); d->inner = uty;
+		d->mem_lo = lo; d->mem_hi = (i32)m->dw_enums.count;
+		return idx;
 	}
 
 	// Aggregates expand into member DIEs only within the depth budget; past it (or for
@@ -519,6 +535,17 @@ gb_internal void x64_dwarf_finalize(x64Module *m) {
 	x64_dw_uleb(abb, 11); x64_dw_uleb(abb, 0x21); coff_section_write_u8(abb, 0);
 	x64_dw_uleb(abb, 0x37); x64_dw_uleb(abb, 0x0F); // DW_AT_count, udata
 	x64_dw_uleb(abb, 0); x64_dw_uleb(abb, 0);
+	// 12: enumeration_type (children): name(string), byte_size(udata), type(ref4 = underlying int)
+	x64_dw_uleb(abb, 12); x64_dw_uleb(abb, 0x04); coff_section_write_u8(abb, 1);
+	x64_dw_uleb(abb, 0x03); x64_dw_uleb(abb, 0x08);
+	x64_dw_uleb(abb, 0x0B); x64_dw_uleb(abb, 0x0F); // DW_AT_byte_size, udata
+	x64_dw_uleb(abb, 0x49); x64_dw_uleb(abb, 0x13); // DW_AT_type, ref4
+	x64_dw_uleb(abb, 0); x64_dw_uleb(abb, 0);
+	// 13: enumerator (leaf): name(string), const_value(sdata — handles negative / 64-bit)
+	x64_dw_uleb(abb, 13); x64_dw_uleb(abb, 0x28); coff_section_write_u8(abb, 0);
+	x64_dw_uleb(abb, 0x03); x64_dw_uleb(abb, 0x08);
+	x64_dw_uleb(abb, 0x1C); x64_dw_uleb(abb, 0x0D); // DW_AT_const_value, sdata
+	x64_dw_uleb(abb, 0); x64_dw_uleb(abb, 0);
 	x64_dw_uleb(abb, 0); // table terminator
 
 	// Intern DWARF types for every banked variable up front (fills m->dw_types).
@@ -584,6 +611,19 @@ gb_internal void x64_dwarf_finalize(x64Module *m) {
 			x64_dw_uleb(inf, dt->size); // count (udata)
 			x64_dw_uleb(inf, 0); // end of array children
 			break;
+		case 5: { // enumeration_type + enumerators
+			x64_dw_uleb(inf, 12);
+			x64_dw_cstr(inf, dt->name);
+			x64_dw_uleb(inf, dt->size); // byte_size (udata)
+			emit_ref4(dt->inner);       // underlying int type (ref4)
+			for (i32 ei = dt->mem_lo; ei < dt->mem_hi; ei++) {
+				x64Module::DwEnum *en = &m->dw_enums[ei];
+				x64_dw_uleb(inf, 13);
+				x64_dw_cstr(inf, en->name);
+				x64_dw_sleb(inf, en->value); // const_value (sdata)
+			}
+			x64_dw_uleb(inf, 0); // end of enumerators
+		} break;
 		default: // base type (kind 0) or generic word (kind 2)
 			x64_dw_uleb(inf, 5);
 			x64_dw_cstr(inf, dt->name);
