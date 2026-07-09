@@ -501,6 +501,14 @@ try_cross_linking:;
 					if (lib.len == 0) {
 						continue;
 					}
+					// A `.lib` is a Windows import library — never linkable on a non-Windows
+					// target (a `system:Foo.lib` foreign import compiled cross-platform, e.g.
+					// core:sys/windows pulled in by dxgi). Skip it so the link doesn't fail with
+					// a confusing "library 'Foo.lib' not found"; any symbol actually referenced
+					// in live code still surfaces as a clear undefined-symbol error.
+					if (build_context.metrics.os != TargetOs_windows && string_ends_with(lib, str_lit(".lib"))) {
+						continue;
+					}
 					if (has_asm_extension(lib)) {
 						if (string_set_update(&asm_files, lib)) {
 							continue; // already handled
