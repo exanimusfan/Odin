@@ -142,6 +142,26 @@ gb_internal void x64_cv_finish_type(CoffSection *s, u32 len_pos) {
 	s->data[len_pos+1] = (u8)((length >> 8) & 0xFFu);
 }
 
+// An LF_ENUMERATE value field (an LF_numeric): a small non-negative is written directly; anything else
+// needs a signed leaf. x64_cv_numeric is unsigned-only (offsets/sizes), so enum values get their own.
+gb_internal void x64_cv_enum_value(CoffSection *s, i64 v) {
+	if (v >= 0 && v < 0x8000) {
+		coff_section_write_u16(s, (u16)v);            // direct literal
+	} else if (v == (i64)(i32)v) {
+		coff_section_write_u16(s, 0x8003u);           // LF_LONG (signed i32)
+		coff_section_write_u32(s, (u32)(i32)v);
+	} else {
+		coff_section_write_u16(s, 0x8009u);           // LF_QUADWORD (signed i64)
+		coff_section_write_u64(s, (u64)v);
+	}
+}
+// Byte count x64_cv_enum_value will write for `v` — used to predict field-list record size for splitting.
+gb_internal isize x64_cv_enum_value_size(i64 v) {
+	if (v >= 0 && v < 0x8000) return 2;
+	if (v == (i64)(i32)v)     return 6;   // LF_LONG  (2-byte leaf + i32)
+	return 10;                            // LF_QUADWORD (2-byte leaf + i64)
+}
+
 // One entry in a struct's CodeView field list. Members may OVERLAP by offset — that's how a union
 // is represented, and it's what lets a `using`-promoted field and its named parent both cover the
 // same bytes (see x64_cv_add_using_members).
@@ -195,14 +215,68 @@ gb_internal u32 x64_cv_type(x64Module *m, Type *t) {
 		}
 	}
 	if (bt->kind == Type_Proc) return 0x0603u; // void* (no signature modelling)
-	// Enum → its backing integer (e.g. `enum byte` → u8), so the debugger reads the right WIDTH
-	// (not a generic 8-byte blob that pulls in adjacent stack bytes). No enumerator names.
-	if (bt->kind == Type_Enum) return x64_cv_type(m, bt->Enum.base_type);
-
 	u32 *cached = map_get(&m->cv_types, t);
 	if (cached) return *cached;
 
 	CoffSection *T = m->debug_t;
+
+	// Enum → a real LF_ENUM (underlying int + one LF_ENUMERATE per member) so the debugger shows the
+	// enumerator NAME (Color.Green) rather than the raw backing integer. The underlying type still
+	// carries the correct width for any consumer that ignores the enumerators. Enums aren't
+	// self-referential, so no forward-ref is needed (emit the full record directly, then cache).
+	if (bt->kind == Type_Enum) {
+		enum { X64_FL_CAP = 0xFF00 }; // keep each LF_FIELDLIST record well under the u16 length limit
+		u32 utype = x64_cv_type(m, bt->Enum.base_type); // backing int → a builtin index, emits no record
+
+		// A big enum's enumerates overflow the u16 record length, so the field list is SPLIT across
+		// several LF_FIELDLIST records, each closed by a trailing LF_INDEX (0x1404) chaining to the
+		// next. Chunks are emitted consecutively, so each forward index is just the next allocated
+		// one. The LF_ENUM points at the first chunk (first_fl).
+		u32 first_fl = m->cv_next_type++;
+		u16 ne = 0;
+		u32 lp = (u32)coff_section_len(T); coff_section_write_u16(T, 0);
+		coff_section_write_u16(T, 0x1203u); // LF_FIELDLIST
+		for_array(i, bt->Enum.fields) {
+			Entity *f = bt->Enum.fields[i];
+			if (f == nullptr || f->kind != Entity_Constant) continue;
+			i64   val = exact_value_to_i64(f->Constant.value);
+			isize esz = 4 + x64_cv_enum_value_size(val) + f->token.string.len + 1; // leaf+attr+value+name+nul
+			esz = (esz + 3) & ~(isize)3;
+			// Split when this enumerate plus a closing LF_INDEX would overflow the current record.
+			if ((isize)coff_section_len(T) - (isize)lp > 4 &&
+			    (isize)coff_section_len(T) - (isize)lp + esz + 8 > X64_FL_CAP) {
+				u32 next_fl = m->cv_next_type++;
+				coff_section_write_u16(T, 0x1404u); // LF_INDEX → continuation field list
+				coff_section_write_u16(T, 0);       // pad0
+				coff_section_write_u32(T, next_fl);
+				x64_cv_finish_type(T, lp);
+				lp = (u32)coff_section_len(T); coff_section_write_u16(T, 0);
+				coff_section_write_u16(T, 0x1203u);
+			}
+			coff_section_write_u16(T, 0x1502u); // LF_ENUMERATE
+			coff_section_write_u16(T, 0x0003u); // access: public
+			x64_cv_enum_value(T, val);
+			coff_section_write(T, f->token.string.text, f->token.string.len); coff_section_write_u8(T, 0);
+			x64_cv_align4_pad(T);
+			ne++;
+		}
+		x64_cv_finish_type(T, lp); // close the final chunk
+
+		u32 idx = m->cv_next_type++;
+		{
+			u32 lp2 = (u32)coff_section_len(T); coff_section_write_u16(T, 0);
+			coff_section_write_u16(T, 0x1507u); // LF_ENUM
+			coff_section_write_u16(T, ne);      // count of enumerates
+			coff_section_write_u16(T, 0);       // property
+			coff_section_write_u32(T, utype);   // underlying type
+			coff_section_write_u32(T, first_fl);// field list (first chunk)
+			String en = x64_cv_type_name(t);
+			coff_section_write(T, en.text, en.len); coff_section_write_u8(T, 0);
+			x64_cv_finish_type(T, lp2);
+		}
+		map_set(&m->cv_types, t, idx);
+		return idx;
+	}
 
 	if (bt->kind == Type_Pointer || bt->kind == Type_MultiPointer) {
 		Type *elem = (bt->kind == Type_Pointer) ? bt->Pointer.elem : bt->MultiPointer.elem;
