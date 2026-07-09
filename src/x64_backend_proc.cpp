@@ -171,6 +171,14 @@ gb_internal void x64_cv_add_using_members(X64CVMember *mem, int *nmem, Type *ut,
 	}
 }
 
+// Odin's own textual name for `t` (e.g. "[]u32", "[dynamic]u32", "[dynamic; 16]u8"), copied into the
+// permanent arena so it survives to the .debug$T write. Used as the CodeView LF_STRUCTURE name so the
+// debugger's Type column carries the element type instead of a generic "slice"/"dynamic_array".
+gb_internal String x64_cv_type_name(Type *t) {
+	gbString gs = type_to_string(t);
+	return copy_string(permanent_allocator(), make_string((u8 const *)gs, gb_string_length(gs)));
+}
+
 // Emit (or look up) a CodeView .debug$T type record for `t` and return its index.
 gb_internal u32 x64_cv_type(x64Module *m, Type *t) {
 	if (m->debug_t == nullptr) return 0; // no type records outside -debug
@@ -241,21 +249,20 @@ gb_internal u32 x64_cv_type(x64Module *m, Type *t) {
 			// `base`'s bytes; the checker guarantees no name collision with a direct field.
 			if (f->flags & EntityFlag_Using) x64_cv_add_using_members(mem, &nmem, f->type, bt->Struct.offsets[i]);
 		}
-		gbString gs = type_to_string(t);
-		tname = copy_string(permanent_allocator(), make_string((u8 const *)gs, gb_string_length(gs)));
+		tname = x64_cv_type_name(t);
 	} else if (bt->kind == Type_Slice) {
 		mem[0].type = alloc_type_pointer(bt->Slice.elem); mem[0].off = 0;  mem[0].name = str_lit("data");
 		mem[1].type = t_int;                              mem[1].off = 8;  mem[1].name = str_lit("len");
-		nmem = 2; tname = str_lit("slice");
+		nmem = 2; tname = x64_cv_type_name(t); // "[]u32" — element type in the debugger's Type column
 	} else if (bt->kind == Type_DynamicArray) {
 		mem[0].type = alloc_type_pointer(bt->DynamicArray.elem); mem[0].off = 0;  mem[0].name = str_lit("data");
 		mem[1].type = t_int;                                     mem[1].off = 8;  mem[1].name = str_lit("len");
 		mem[2].type = t_int;                                     mem[2].off = 16; mem[2].name = str_lit("cap");
-		nmem = 3; tname = str_lit("dynamic_array");
+		nmem = 3; tname = x64_cv_type_name(t); // "[dynamic]u32"
 	} else if (is_type_string(t)) {
 		mem[0].type = alloc_type_pointer(t_u8); mem[0].off = 0; mem[0].name = str_lit("data");
 		mem[1].type = t_int;                    mem[1].off = 8; mem[1].name = str_lit("len");
-		nmem = 2; tname = str_lit("string");
+		nmem = 2; tname = str_lit("string"); // no element type
 	} else if (is_type_any(t)) {
 		mem[0].type = t_rawptr; mem[0].off = 0; mem[0].name = str_lit("data");
 		mem[1].type = t_typeid; mem[1].off = 8; mem[1].name = str_lit("id");
@@ -264,7 +271,7 @@ gb_internal u32 x64_cv_type(x64Module *m, Type *t) {
 		mem[0].type = alloc_type_array(bt->FixedCapacityDynamicArray.elem, bt->FixedCapacityDynamicArray.capacity);
 		mem[0].off  = 0; mem[0].name = str_lit("data");
 		mem[1].type = t_int; mem[1].off = x64_fca_len_offset(t); mem[1].name = str_lit("len");
-		nmem = 2; tname = str_lit("fixed_capacity_dynamic_array");
+		nmem = 2; tname = x64_cv_type_name(t); // "[dynamic; 16]u32" (capacity + element type)
 	} else {
 		return 0x0023u; // unmodelled aggregate: show first 8 bytes
 	}
