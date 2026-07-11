@@ -11,6 +11,7 @@
 #include "x64_backend_expr.cpp"
 #include "x64_backend_map.cpp"
 #include "x64_backend_stmt.cpp"
+#include "x64_backend_objc.cpp"
 
 // Pad .debug$S to a 4-byte boundary using CodeView LF_PAD bytes (the convention
 // real CV emitters use inside symbol records).
@@ -1005,7 +1006,7 @@ gb_internal CoffSection *x64_module_tls_section(x64Module *m) {
 // becomes the template (copied to every thread); else zero-fill (a runtime initializer sets
 // only the running thread, matching LLVM/Odin). EXTERNAL symbol (cross-module via SECREL).
 // Define or upgrade (UNDEF→defined) an EXTERNAL data symbol at `off` in section `secnum`.
-static void x64_define_data_sym(x64Module *m, String name, i16 secnum, u32 off, u8 storage_class) {
+gb_internal void x64_define_data_sym(x64Module *m, String name, i16 secnum, u32 off, u8 storage_class) {
 	u32 *existing = string_map_get(&m->coff.sym_map, name);
 	if (existing != nullptr) {
 		CoffSymEntry &se = m->coff.syms[*existing];
@@ -1287,6 +1288,11 @@ gb_internal void x64_emit_startup_runtime(x64Module *m, x64Generator *gen, PtrSe
 		x64_startup_init_global(p, &inited, e, decl_info_of_entity(e));
 	}
 	p->is_startup = false;
+
+	// Objective-C selectors/classes: resolve every referenced name once here (before any
+	// @(init) proc or main runs). Defines the globals in THIS (runtime) module. No-op
+	// unless objc was used. Must run after all procs are compiled (names all collected).
+	if (!x64_abi_win64) x64_objc_emit_registration(p, gen);
 
 	x64_run_deferred(p);
 	x64_emit_named_returns(p);
@@ -2333,6 +2339,8 @@ gb_internal x64Generator *x64_generate_code(Checker *c) {
 	linker_data_init(gen, info, c->parser->init_fullpath);
 
 	map_init(&gen->modules, (isize)info->packages.count * 2);
+	string_set_init(&gen->objc_selectors, 64);
+	string_set_init(&gen->objc_classes, 16);
 
 	// One x64Module per package, plus per-file modules for base:runtime (and
 	// -module-per-file) so the large runtime parallelizes. Mirrors lb_init_generator.

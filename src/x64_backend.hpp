@@ -106,6 +106,7 @@ struct x64Module {
 	CoffSection   *tbss;    // .tbss  — zero-initialized thread-local storage
 	CoffSection   *tlv;     // .tlv   — TLVDescriptor {getter, key, &init} per variable
 	i16            tdata_secnum, tbss_secnum, tlv_secnum;
+	u32            objc_block_id; // per-module counter for objc_block invoker/descriptor names
 
 	// darwin DWARF (-debug): per-proc source-line records collected at proc_end and
 	// serialized by x64_dwarf_finalize into .dwabb/.dwinf/.dwlin (mapped by the
@@ -495,6 +496,13 @@ struct x64Generator : LinkerData {
 	// per package, plus per-file modules for base:runtime (and -module-per-file)
 	// so the big runtime package parallelizes. Entity→module is file-first.
 	PtrMap<void *, x64Module *> modules;
+
+	// Objective-C interop (darwin): unique selector / class names referenced anywhere.
+	// A single global (`__$objc_SEL::name` / `__$objc_CLASS::name`) is defined for each
+	// in the runtime module and initialized at startup via sel_registerName /
+	// objc_lookUpClass; access sites just load it. Collected under foreign_mutex.
+	StringSet objc_selectors;
+	StringSet objc_classes;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -582,11 +590,20 @@ gb_internal int       x64_num_partial_returns(Type *proc_type);
 gb_internal Type     *x64_last_result_type(Type *proc_type);
 gb_internal i32       x64_param_home_off(x64Procedure *p, int slot); // incoming slot's RBP home
 gb_internal void      x64_abi_home_params(x64Procedure *p);          // slot assignment + homing
-gb_internal void      x64_abi_emit_call_args(x64Procedure *p, x64Value *args, int arg_count, bool c_vararg);
+gb_internal void      x64_abi_emit_call_args(x64Procedure *p, x64Value *args, int arg_count, bool c_vararg, bool odin_cc);
 gb_internal x64Value  x64_abi_direct_result(x64Procedure *p, Type *callee_type_raw); // value left in return reg(s); SysV pairs spilled to a local
 gb_internal void      x64_abi_emit_return_value(x64Procedure *p, x64Value v, Type *rt);
 gb_internal void      x64_abi_emit_return_from_local(x64Procedure *p, Type *rt, i32 off);
 gb_internal void      x64_abi_spill_direct_result(x64Procedure *p, Type *rt, i32 dst_off);
+
+// ── Objective-C interop (x64_backend_objc.cpp; darwin) ──────────────────────
+gb_internal void      x64_define_data_sym(x64Module *m, String name, i16 secnum, u32 off, u8 storage_class); // (x64_backend.cpp)
+gb_internal x64Value  x64_build_objc_send(x64Procedure *p, Ast *expr);              // intrinsics.objc_send
+gb_internal x64Value  x64_build_objc_block(x64Procedure *p, Ast *expr);             // intrinsics.objc_block
+gb_internal x64Value  x64_build_objc_auto_send(x64Procedure *p, Ast *expr, Entity *method); // obj->method()
+gb_internal x64Value  x64_objc_selector(x64Procedure *p, String name);             // intrinsics.objc_find_selector
+gb_internal x64Value  x64_objc_class(x64Procedure *p, String name);                // intrinsics.objc_find_class
+gb_internal void      x64_objc_emit_registration(x64Procedure *p, x64Generator *gen);
 
 // Loop/switch break+continue target lookup (defined in stmt.cpp, used by
 // OrBranchExpr in expr.cpp which is compiled earlier in the unity build).

@@ -1051,7 +1051,7 @@ gb_internal x64Value x64_emit_call(x64Procedure *p,
 	Type *ct = base_type(callee_type_raw);
 	GB_ASSERT(ct->kind == Type_Proc);
 
-	x64_abi_emit_call_args(p, args, arg_count, ct->Proc.c_vararg);
+	x64_abi_emit_call_args(p, args, arg_count, ct->Proc.c_vararg, is_calling_convention_odin(ct->Proc.calling_convention));
 	x64_emit_call_sym(&p->asm_, callee_name);
 	return x64_abi_direct_result(p, callee_type_raw);
 }

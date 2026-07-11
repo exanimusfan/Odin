@@ -7334,6 +7334,14 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 			return x64v_none();
 		}
 	}
+	// Objective-C method call `obj->method()` / `Class.method()` → objc_msgSend (darwin).
+	{
+		Entity *objc_ent = entity_of_node(unparen_expr(ce->proc));
+		if (objc_ent != nullptr && objc_ent->kind == Entity_Procedure &&
+		    objc_ent->Procedure.is_objc_impl_or_import) {
+			return x64_build_objc_auto_send(p, expr, objc_ent);
+		}
+	}
 		// Type-conversion call form (int(x), f64(x), etc.) — actually convert, same as
 		// cast(T)x (mirrors lb_emit_conv via x64_emit_conv).
 		if (ce->proc->tav.mode == Addressing_Type) {
@@ -7425,6 +7433,16 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 			}
 			if (be != nullptr && be->kind == Entity_Builtin && be->Builtin.id == BuiltinProc_soa_unzip) {
 				return x64_soa_unzip(p, expr);
+			}
+			// Objective-C interop (darwin).
+			if (be != nullptr && be->kind == Entity_Builtin) {
+				switch (be->Builtin.id) {
+				case BuiltinProc_objc_send:          return x64_build_objc_send(p, expr);
+				case BuiltinProc_objc_find_selector: return x64_objc_selector(p, ce->args[0]->tav.value.value_string);
+				case BuiltinProc_objc_find_class:    return x64_objc_class(p, ce->args[0]->tav.value.value_string);
+					case BuiltinProc_objc_block:         return x64_build_objc_block(p, expr);
+				default: break;
+				}
 			}
 			// intrinsics.__entry_point() -> run @(init) procs (mirrors LLVM's
 			// _startup_runtime body) then call info->entry_point (user main).
@@ -8375,10 +8393,10 @@ gb_internal x64Value x64_build_call_expr(x64Procedure *p, Ast *expr) {
 			// placement only scratches RAX/XMM0, so R10 survives there.
 			i32 callee_off = x64_alloc_local(p, 8, 8);
 			x64_emit_mov_mr(&p->asm_, X64OpSize_64, x64_rbp_mem(callee_off), X64Reg_R10);
-			x64_abi_emit_call_args(p, args, slot, ct->Proc.c_vararg);
+			x64_abi_emit_call_args(p, args, slot, ct->Proc.c_vararg, is_calling_convention_odin(ct->Proc.calling_convention));
 			x64_emit_mov_rm(&p->asm_, X64OpSize_64, X64Reg_R10, x64_rbp_mem(callee_off));
 		} else {
-			x64_abi_emit_call_args(p, args, slot, ct->Proc.c_vararg);
+			x64_abi_emit_call_args(p, args, slot, ct->Proc.c_vararg, is_calling_convention_odin(ct->Proc.calling_convention));
 		}
 		x64_emit_call_r(&p->asm_, X64Reg_R10);
 

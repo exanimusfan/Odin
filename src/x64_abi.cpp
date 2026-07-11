@@ -151,6 +151,19 @@ static i32 x64_sysv_take_stack(x64SysVCursor *cur, i64 sz, i64 al) {
 	return off;
 }
 
+// SysV: is this arg passed as a hidden POINTER (one INTEGER eightbyte) rather than
+// by value? True for a MEMORY-class aggregate under the ODIN calling convention —
+// mirrors LLVM's lb_arg_type_indirect for is_calling_convention_odin, which passes a
+// pointer instead of copying huge by-value structs onto the stack. A `proc "c"`
+// MEMORY-class arg still byval-copies (real SysV, matches the C callee). Handled on
+// the callee side exactly like a Win64 indirect param (copy-into-local if small,
+// deref-through-pointer if huge — see X64_INDIRECT_PARAM_COPY_MAX).
+static bool x64_sysv_indirect(Type *t, bool odin_cc) {
+	if (!odin_cc || t == nullptr || x64_is_scalar(t)) return false;
+	u8 cls[2];
+	return type_size_of(t) > 0 && x64_sysv_classify(t, cls) == 0; // MEMORY class
+}
+
 // Caller-reserved spill area for the register slots (Win64 shadow space).
 #define X64_ABI_SHADOW_SPACE 32
 // Backend floor for the outgoing stack-arg area — the alloca fast path assumes a
@@ -299,8 +312,10 @@ static i32 x64_sysv_home_slot(x64Procedure *p, x64SysVCursor *cur, Type *t) {
 // which x64_param_home_off serves lookups from. Slot-count fields were already set
 // by x64_abi_home_params' shared counting pass.
 static void x64_abi_home_params_sysv(x64Procedure *p) {
+	X64Assembler *a  = &p->asm_;
 	Type         *pt = p->type;
 	x64SysVCursor cur = {};
+	bool odin_cc = is_calling_convention_odin(pt->Proc.calling_convention);
 
 	p->abi_slot_home = gb_alloc_array(p->alloc, i32, gb_max(p->total_param_slots, 1));
 
@@ -322,9 +337,28 @@ static void x64_abi_home_params_sysv(x64Procedure *p) {
 				continue;
 			}
 
-			// SysV has NO by-pointer params: register values were spilled into a frame
-			// local, MEMORY-class values sit in the caller's by-value stack copy (owned
-			// by the callee per SysV) — either way `off` addresses the DATA directly.
+			// Odin-cc MEMORY-class aggregate: arrives as a POINTER (one INTEGER slot),
+			// not a byval copy. Home the pointer, then mirror Win64: copy small pointees
+			// into a mutable local, deref huge ones through the pointer (indirect_params).
+			if (x64_sysv_indirect(e->type, odin_cc)) {
+				i32 poff = x64_sysv_home_slot(p, &cur, nullptr); // pointer home
+				p->abi_slot_home[slot++] = poff;
+				i64 esz = x64_type_size(e->type);
+				if (esz > X64_INDIRECT_PARAM_COPY_MAX) {
+					x64_var_set(&p->var_offsets, e, poff); // slot holds the pointer
+					array_add(&p->indirect_params, e);
+				} else {
+					i64 eal = type_align_of(e->type);
+					i32 data_off = x64_alloc_local(p, esz, eal);
+					x64_emit_mov_rm(a, X64OpSize_64, X64Reg_RAX, x64_rbp_mem(poff));
+					x64_copy_fixed(p, x64_rbp_mem(data_off), x64_mem(X64Reg_RAX, 0), esz);
+					x64_var_set(&p->var_offsets, e, data_off);
+				}
+				continue;
+			}
+
+			// Otherwise: register values were spilled into a frame local, C-cc MEMORY
+			// values sit in the caller's byval stack copy — either way `off` is the DATA.
 			i32 off = x64_sysv_home_slot(p, &cur, e->type);
 			p->abi_slot_home[slot++] = off;
 			x64_var_set(&p->var_offsets, e, off);
@@ -490,7 +524,7 @@ gb_internal void x64_abi_home_params(x64Procedure *p) {
 // space), then fill registers in reverse — including 2-eightbyte GP/XMM pairs.
 // `c_vararg`: SysV variadic ABI wants AL = number of XMM registers used — set LAST so
 // no later value load can scratch RAX.
-static void x64_abi_emit_call_args_sysv(x64Procedure *p, x64Value *args, int arg_count, bool c_vararg) {
+static void x64_abi_emit_call_args_sysv(x64Procedure *p, x64Value *args, int arg_count, bool c_vararg, bool odin_cc) {
 	X64Assembler *a = &p->asm_;
 
 	struct Loc {
@@ -499,6 +533,7 @@ static void x64_abi_emit_call_args_sysv(x64Procedure *p, x64Value *args, int arg
 		u8  cls[2];
 		i8  ridx[2];
 		bool in_reg;
+		bool indirect; // Odin-cc MEMORY aggregate → pass a pointer, not a byval copy
 		i32 stack_off;
 	};
 	Loc *L = gb_alloc_array(temporary_allocator(), Loc, gb_max(arg_count, 1));
@@ -513,17 +548,23 @@ static void x64_abi_emit_call_args_sysv(x64Procedure *p, x64Value *args, int arg
 		L[i].sz = sz;
 		if (sz <= 0) continue; // zero-sized: no placement (callee skips it too)
 
+		// Odin-cc MEMORY aggregate: passed as a single INTEGER pointer, not a byval copy
+		// (see x64_sysv_indirect). Force the single-INTEGER-eightbyte classification; the
+		// pointer itself is materialized in the placement passes.
+		L[i].indirect = x64_sysv_indirect(t, odin_cc);
+
 		u8  cls[2] = { X64_SYSV_INT, X64_SYSV_NONE };
 		int n8 = 1;
-		if (t != nullptr) n8 = x64_sysv_classify(t, cls);
+		if (t != nullptr && !L[i].indirect) n8 = x64_sysv_classify(t, cls);
 
-		// A multi-eightbyte or MEMORY-class value that isn't in memory (e.g. an Imm
-		// default) must be materialized NOW — passes 2/3 need a memory source for it,
-		// and store_value's scratch registers must not run once argument registers are
-		// loaded. Single-eightbyte non-Mem values (incl. ENUM/bit_set immediates, which
-		// are not x64_is_scalar) stay as-is: the register/stack passes load them with
-		// the ordinary value loaders, preserving the immediate's value.
-		if (n8 != 1 && args[i].kind != x64Value_Mem) {
+		// A multi-eightbyte / MEMORY-class / indirect value that isn't in memory (e.g. an
+		// aggregate Imm/None default) must be materialized NOW — passes 2/3 need a memory
+		// source (indirect passes its ADDRESS; byval/register loads read its bytes), and
+		// store_value's scratch registers must not run once argument registers are loaded.
+		// Single-eightbyte non-Mem values (incl. ENUM/bit_set immediates, which are not
+		// x64_is_scalar) stay as-is: the register/stack passes load them with the ordinary
+		// value loaders, preserving the immediate's value.
+		if (args[i].kind != x64Value_Mem && (L[i].indirect || n8 != 1)) {
 			i32 mo = x64_alloc_local(p, sz, gb_max(al, (i64)8));
 			x64_store_value(p, x64addr(x64_rbp_mem(mo), t), args[i]);
 			args[i] = x64v_mem(t, x64_rbp_mem(mo));
@@ -538,7 +579,7 @@ static void x64_abi_emit_call_args_sysv(x64Procedure *p, x64Value *args, int arg
 			L[i].ridx[0] = (i8)ridx[0];
 			L[i].ridx[1] = (i8)ridx[1];
 		} else {
-			L[i].stack_off = x64_sysv_take_stack(&cur, sz, al);
+			L[i].stack_off = x64_sysv_take_stack(&cur, L[i].indirect ? 8 : sz, L[i].indirect ? 8 : al);
 		}
 	}
 	if (cur.stack_off > p->max_outgoing_bytes) p->max_outgoing_bytes = cur.stack_off;
@@ -548,6 +589,13 @@ static void x64_abi_emit_call_args_sysv(x64Procedure *p, x64Value *args, int arg
 		if (L[i].sz <= 0 || L[i].in_reg) continue;
 		x64Value v = args[i];
 		X64Mem stack_slot = x64_mem(X64Reg_RSP, L[i].stack_off);
+		if (L[i].indirect) {
+			// pass the POINTER to the value (address), not a byval copy
+			if (v.by_ref) x64_emit_mov_rm(a, X64OpSize_64, X64Reg_RAX, v.mem);
+			else          x64_emit_lea(a, X64Reg_RAX, v.mem);
+			x64_emit_mov_mr(a, X64OpSize_64, stack_slot, X64Reg_RAX);
+			continue;
+		}
 		if (v.kind == x64Value_Mem) {
 			X64Mem src = v.mem;
 			if (v.by_ref) { // slot holds a POINTER to the value — copy from behind it
@@ -571,6 +619,14 @@ static void x64_abi_emit_call_args_sysv(x64Procedure *p, x64Value *args, int arg
 	for (int i = arg_count - 1; i >= 0; i--) {
 		if (L[i].sz <= 0 || !L[i].in_reg) continue;
 		x64Value v = args[i];
+
+		if (L[i].indirect) {
+			// pass the POINTER to the value in the (single INTEGER) arg register
+			X64Reg r = X64_SYSV_INT_ARG_REGS[L[i].ridx[0]];
+			if (v.by_ref) x64_emit_mov_rm(a, X64OpSize_64, r, v.mem);
+			else          x64_emit_lea(a, r, v.mem);
+			continue;
+		}
 
 		// Single-eightbyte scalars — and ANY single-eightbyte non-memory value (enum /
 		// bit_set immediates are not x64_is_scalar but are plain integer payloads):
@@ -607,11 +663,11 @@ static void x64_abi_emit_call_args_sysv(x64Procedure *p, x64Value *args, int arg
 // call (registers + outgoing stack area) and reserve the frame's outgoing bytes.
 // `c_vararg`: Win64 variadic ABI — an FP arg in a register slot of a c_vararg callee
 // must ALSO be placed in the corresponding GP register (the callee reads `...` from GP).
-gb_internal void x64_abi_emit_call_args(x64Procedure *p, x64Value *args, int arg_count, bool c_vararg) {
+gb_internal void x64_abi_emit_call_args(x64Procedure *p, x64Value *args, int arg_count, bool c_vararg, bool odin_cc) {
 	X64Assembler *a = &p->asm_;
 
 	if (!x64_abi_win64) {
-		x64_abi_emit_call_args_sysv(p, args, arg_count, c_vararg);
+		x64_abi_emit_call_args_sysv(p, args, arg_count, c_vararg, odin_cc);
 		return;
 	}
 
